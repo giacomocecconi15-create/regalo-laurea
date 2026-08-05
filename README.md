@@ -13,14 +13,15 @@ cartella su GitHub Pages).
 | --- | --- |
 | `index.html` | le cinque sezioni e tutti i testi |
 | `styles.css` | tipografia, colori, animazioni |
-| `script.js` | player YouTube, effetti allo scroll, coriandoli, riscatto |
+| `script.js` | riproduzione video, effetti allo scroll, coriandoli, riscatto |
+| `video/barca.mp4` | il video della giornata (1 agosto 2026, 21 secondi) |
 
 ## Le cinque sezioni
 
 1. **Hero** — il nome entra una lettera alla volta, data e luogo sotto,
    e l'invito «Scorri per iniziare».
-2. **Video** — lo short di YouTube a schermo intero, muto in automatico,
-   si tocca per l'audio.
+2. **Video** — il filmato della giornata, muto in automatico, si tocca
+   per l'audio.
 3. **Grazie** — la frase si illumina parola per parola mentre scorri.
 4. **Congratulazioni** — sezione chiara, con il giro del mondo
    (Indonesia → Portogallo → chissà) che entra una riga alla volta.
@@ -78,9 +79,18 @@ scartare. Utile per provarlo quante volte si vuole prima di mandarlo.
 
 ## Note
 
-- Il video è il short YouTube `45bXmwsr5h8`: parte muto e in automatico
-  quando la sezione entra in vista. L'autoplay muto è l'unico permesso
-  dai browser su mobile.
+- Il video è un file del repo (`video/barca.mp4`), non un embed: niente
+  YouTube, niente player esterno che può rifiutarsi di partire. Parte
+  muto e in automatico quando la sezione entra in vista — l'avvio
+  automatico muto è l'unico permesso dai browser su telefono — e se
+  anche quello viene bloccato (per esempio in risparmio energetico)
+  compare «Tocca per avviare il video» e parte al primo tocco.
+- Il filmato è orizzontale (848×478), quindi resta intero e centrato sul
+  nero: su desktop riempie quasi tutto, su telefono è una fascia al
+  centro. Per sostituirlo basta mettere un altro file in `video/` e
+  cambiare `data-src` sul tag `<video>` in `index.html`.
+- Il `.mov` nella cartella principale è il file originale caricato a
+  mano, tenuto come copia: il sito non lo usa e si può cancellare.
 - Le animazioni partono con Intersection Observer e si fermano quando la
   sezione esce dallo schermo, video compreso.
 - I coriandoli sono un canvas che si cancella da solo dopo ~3 secondi.

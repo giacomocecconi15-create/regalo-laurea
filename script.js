@@ -10,7 +10,6 @@
 
   /* ---------------------------- config ---------------------------- */
 
-  var YT_VIDEO_ID = '45bXmwsr5h8';
   var NTFY_URL    = 'https://ntfy.sh/barca-laurea-9k3xq7';
   var STORE_KEY   = 'regalo-sofia:riscattato:v2';
 
@@ -82,101 +81,77 @@
 
   var videoSection = document.getElementById('video');
   var videoFrame   = document.querySelector('.video__frame');
+  var videoEl      = document.querySelector('[data-video]');
   var caption      = document.querySelector('[data-caption]');
   var soundBtn     = document.querySelector('[data-sound-toggle]');
   var soundLabel   = document.querySelector('[data-sound-label]');
-  var fallback     = document.querySelector('[data-fallback]');
+  var tapPrompt    = document.querySelector('[data-tap-prompt]');
 
-  var player = null;
-  var playerReady = false;
-  var muted = true;
-  var apiRequested = false;
-  var videoInView = false;
-  var fallbackTimer = null;
+  var srcLoaded = false;
 
-  function loadYouTubeApi() {
-    if (apiRequested) return;
-    apiRequested = true;
-
-    window.onYouTubeIframeAPIReady = createPlayer;
-
-    var s = document.createElement('script');
-    s.src = 'https://www.youtube.com/iframe_api';
-    s.async = true;
-    document.head.appendChild(s);
+  /* il file pesa qualche mega: lo carichiamo solo quando serve */
+  function loadVideo() {
+    if (srcLoaded || !videoEl) return;
+    srcLoaded = true;
+    videoEl.src = videoEl.getAttribute('data-src');
+    videoEl.load();
   }
 
-  function createPlayer() {
-    player = new YT.Player('yt-player', {
-      videoId: YT_VIDEO_ID,
-      playerVars: {
-        autoplay: 1,
-        mute: 1,
-        controls: 0,
-        playsinline: 1,
-        loop: 1,
-        playlist: YT_VIDEO_ID,   // necessario perché loop funzioni su un video singolo
-        rel: 0,
-        modestbranding: 1,
-        disablekb: 1,
-        fs: 0,
-        iv_load_policy: 3
-      },
-      events: {
-        onReady: function (e) {
-          playerReady = true;
-          e.target.mute();
-          if (videoInView) e.target.playVideo();
-        },
-        onStateChange: function (e) {
-          if (e.data === YT.PlayerState.PLAYING) {
-            videoFrame.classList.add('is-playing');
-            if (fallback) { fallback.classList.remove('is-in'); fallback.hidden = true; }
-          }
-        }
-      }
+  function showTapPrompt(show) {
+    if (!tapPrompt) return;
+    if (show) {
+      tapPrompt.hidden = false;
+      requestAnimationFrame(function () { tapPrompt.classList.add('is-in'); });
+    } else {
+      tapPrompt.classList.remove('is-in');
+      tapPrompt.hidden = true;
+    }
+  }
+
+  /* L'avvio automatico muto è permesso quasi ovunque, ma non sempre
+     (risparmio energetico su iPhone, impostazioni restrittive): se viene
+     rifiutato il video parte al primo tocco, restando dentro al sito. */
+  function playVideo() {
+    if (!videoEl) return;
+    loadVideo();
+    var p = videoEl.play();
+    if (p && p.then) {
+      p.then(function () { showTapPrompt(false); })
+       .catch(function () { showTapPrompt(true); });
+    }
+  }
+
+  if (videoSection && videoEl) {
+    videoEl.muted = true;
+
+    videoEl.addEventListener('playing', function () {
+      videoFrame.classList.add('is-playing');
+      showTapPrompt(false);
     });
-  }
 
-  if (videoSection && videoFrame) {
-    /* prepara il player poco prima che la sezione entri in vista */
+    videoEl.addEventListener('error', function () { showTapPrompt(true); });
+
+    /* scarica il file poco prima che la sezione entri in vista */
     new IntersectionObserver(function (entries, obs) {
       if (entries[0].isIntersecting) {
-        loadYouTubeApi();
+        loadVideo();
         obs.disconnect();
       }
     }, { rootMargin: '150% 0px' }).observe(videoSection);
 
     /* riproduce solo mentre è davvero visibile: batteria e fluidità */
     new IntersectionObserver(function (entries) {
-      videoInView = entries[0].isIntersecting;
-
-      /* se l'embed non parte (rete, blocchi del browser) offriamo il link */
-      if (videoInView && fallback && !fallbackTimer) {
-        fallbackTimer = window.setTimeout(function () {
-          if (videoFrame.classList.contains('is-playing')) return;
-          fallback.hidden = false;
-          requestAnimationFrame(function () { fallback.classList.add('is-in'); });
-        }, 6000);
-      }
-
-      if (!playerReady) return;
-      if (videoInView) { player.playVideo(); }
-      else { player.pauseVideo(); }
+      if (entries[0].isIntersecting) { playVideo(); }
+      else { videoEl.pause(); }
     }, { threshold: 0.15 }).observe(videoSection);
 
+    /* un tocco sullo schermo: avvia se è fermo, altrimenti audio on/off */
     soundBtn.addEventListener('click', function () {
-      if (!playerReady) return;
-      if (muted) {
-        player.unMute();
-        player.setVolume(100);
-        muted = false;
-        soundLabel.textContent = 'Tocca di nuovo per silenziare';
-      } else {
-        player.mute();
-        muted = true;
-        soundLabel.textContent = "Tocca lo schermo per l'audio";
-      }
+      if (videoEl.paused) { playVideo(); return; }
+      videoEl.muted = !videoEl.muted;
+      soundLabel.textContent = videoEl.muted
+        ? "Tocca lo schermo per l'audio"
+        : 'Tocca di nuovo per silenziare';
     });
   }
 

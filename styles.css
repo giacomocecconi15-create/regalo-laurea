@@ -292,26 +292,19 @@ body {
 
 .video__frame.is-playing { opacity: 1; }
 
-/* Il video è verticale (9:16): lo dimensioniamo sull'altezza. */
-.video__frame iframe {
+/* Il video è orizzontale: lo teniamo intero e centrato sul nero,
+   così su desktop riempie quasi tutto e su telefono resta una fascia
+   cinematografica al centro, senza tagliare mezza inquadratura. */
+.video__el {
   position: absolute;
-  top: 50%;
-  left: 50%;
-  height: 100vh;
-  height: 100svh;
-  width: 56.25vh;
-  width: 56.25svh;
-  transform: translate(-50%, -50%);
-  border: 0;
+  inset: 0;
+  margin: auto;
+  width: 100%;
+  height: 100%;
+  max-width: 1180px;      /* la sorgente è 848px: non la gonfiamo oltre */
+  object-fit: contain;
+  background: #000;
   pointer-events: none;
-}
-
-/* schermi verticali (telefoni): il video copre sempre tutto */
-@media (max-aspect-ratio: 1/1) {
-  .video__frame iframe {
-    min-width: 100vw;
-    min-height: 177.78vw;
-  }
 }
 
 .video__scrim {
@@ -377,26 +370,23 @@ body {
 
 .video__frame.is-playing ~ .video__sound .hint { opacity: 1; }
 
-.video__fallback {
+/* invito a toccare, solo se l'avvio automatico viene bloccato */
+.video__tap {
   position: absolute;
-  z-index: 3;
+  z-index: 1;
   left: 50%;
   top: 50%;
   transform: translate(-50%, -50%);
-  font-size: 0.72rem;
-  font-weight: 400;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  color: rgba(242, 244, 247, 0.7);
-  text-decoration: none;
-  border-bottom: 1px solid var(--accent-dim);
-  padding-bottom: 0.4rem;
+  padding: 0.8rem 1.3rem;
+  border: 1px solid var(--accent-dim);
+  border-radius: 999px;
+  pointer-events: none;
   opacity: 0;
-  transition: opacity 1s var(--ease-soft), color 0.5s var(--ease);
+  transition: opacity 0.8s var(--ease-soft);
 }
 
-.video__fallback.is-in { opacity: 1; }
-.video__fallback:hover { color: var(--accent); }
+.video__tap.is-in { opacity: 1; }
+.video__tap .hint { color: rgba(242, 244, 247, 0.9); }
 
 
 /* ─────────────────────────── 3. GRAZIE ───────────────────────── */

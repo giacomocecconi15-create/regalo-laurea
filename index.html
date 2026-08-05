@@ -36,8 +36,12 @@
 <section class="video" id="video">
   <div class="video__stage">
     <div class="video__frame">
-      <!-- l'iframe di YouTube viene creato da script.js quando la sezione si avvicina -->
-      <div id="yt-player"></div>
+      <!-- il file sta nel repo: niente YouTube, niente embed che può non partire.
+           La sorgente viene messa da script.js quando la sezione si avvicina. -->
+      <video class="video__el" data-video
+             data-src="video/barca.mp4"
+             muted playsinline loop preload="auto"
+             disablepictureinpicture disableremoteplayback></video>
     </div>
     <div class="video__scrim" aria-hidden="true"></div>
 
@@ -53,10 +57,11 @@
       </span>
     </button>
 
-    <!-- mostrato solo se l'embed non riesce a partire -->
-    <a class="video__fallback" data-fallback hidden
-       href="https://youtube.com/shorts/45bXmwsr5h8"
-       target="_blank" rel="noopener">Guarda il video su YouTube</a>
+    <!-- se il browser blocca l'avvio automatico (es. risparmio energetico)
+         il video parte comunque al primo tocco, senza uscire dal sito -->
+    <p class="video__tap" data-tap-prompt hidden>
+      <span class="hint">Tocca per avviare il video</span>
+    </p>
   </div>
 </section>
 
