@@ -24,7 +24,9 @@ cartella su GitHub Pages).
 3. **Grazie** — la frase si illumina parola per parola mentre scorri.
 4. **Congratulazioni** — sezione chiara, con il giro del mondo
    (Indonesia → Portogallo → chissà) che entra una riga alla volta.
-5. **Regalo** — il bottone manda la notifica, poi coriandoli e regalo.
+5. **Regalo** — il bottone manda la notifica, poi partono i coriandoli,
+   le lettere del regalo si compongono una alla volta e un'onda calda
+   le attraversa.
 
 In ogni sezione c'è un'indicazione su cosa fare («Scorri per iniziare»,
 «Tocca lo schermo per l'audio», «Continua a scorrere», «Tocca il
@@ -37,7 +39,11 @@ Nel file `index.html` sono marcati con `PLACEHOLDER`:
 1. **didascalia del video** — `.video__caption`
 2. **il grazie parola per parola** — `.thanks__text`
 3. **messaggio prima del regalo** — `.finale__message`
-4. **il regalo vero** — `.gift__text` e `.gift__note`
+4. **il regalo** — `.gift__text` (la riga grande) e `.gift__note` (sotto)
+
+La riga di `.gift__text` si compone lettera per lettera, quindi va
+tenuta corta: fino a ~30 caratteri l'effetto resta bello, più lunga
+diventa lenta. Il resto si scrive in `.gift__note`.
 
 Il testo del punto 2 viene diviso in parole automaticamente: si scrive
 come una frase normale, senza tag. Va bene fino a ~25 parole; oltre,

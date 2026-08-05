@@ -277,6 +277,7 @@
   var giftHint  = document.querySelector('[data-gift-hint]');
   var claimBtn  = document.querySelector('[data-claim]');
   var giftText  = document.querySelector('[data-reveal]');
+  var giftLine  = document.querySelector('[data-gift-letters]');
 
   var fadeObserver = new IntersectionObserver(function (entries, obs) {
     entries.forEach(function (entry) {
@@ -298,6 +299,51 @@
       claimBtn.classList.add('is-in');
       if (giftHint) giftHint.classList.add('is-in');
     }, { threshold: 0.35 }).observe(giftBox);
+  }
+
+
+  /* ------------- lettere del regalo: sparse e poi a posto ---------- */
+
+  /* Ogni lettera parte da una posizione casuale vicina e scivola al suo
+     posto, una dopo l'altra. Le parole restano intere (.cw) così il testo
+     va a capo come si deve. Solo transform e opacity: gira liscio. */
+  var letterCount = 0;
+
+  if (giftLine) {
+    var line = giftLine.textContent.trim();
+    giftLine.textContent = '';
+    giftLine.setAttribute('aria-label', line);
+
+    line.split(' ').forEach(function (word, wi, all) {
+      var wrap = document.createElement('span');
+      wrap.className = 'cw';
+
+      word.split('').forEach(function (ch) {
+        var c = document.createElement('span');
+        c.className = 'c';
+        c.textContent = ch;
+        c.setAttribute('aria-hidden', 'true');
+        c.style.setProperty('--dx', (Math.random() * 40 - 20).toFixed(1) + 'px');
+        c.style.setProperty('--dy', (Math.random() * 34 - 6).toFixed(1) + 'px');
+        c.style.setProperty('--r', (Math.random() * 24 - 12).toFixed(1) + 'deg');
+        c.style.setProperty('--d', (0.12 + letterCount * 0.028).toFixed(3) + 's');
+        c.style.setProperty('--i', letterCount);
+        wrap.appendChild(c);
+        letterCount++;
+      });
+
+      giftLine.appendChild(wrap);
+      if (wi < all.length - 1) {
+        giftLine.appendChild(document.createTextNode(' '));
+      }
+    });
+  }
+
+  /* l'onda calda parte quando l'ultima lettera è arrivata */
+  function waveWhenSettled() {
+    if (!giftLine || reduceMotion) return;
+    var settled = (0.12 + letterCount * 0.028 + 0.95) * 1000;
+    window.setTimeout(function () { giftLine.classList.add('is-wave'); }, settled);
   }
 
 
@@ -374,6 +420,7 @@
     if (!animated) {
       claimBtn.hidden = true;
       if (giftHint) giftHint.hidden = true;
+      giftText.classList.add('is-instant');
       requestAnimationFrame(function () {
         giftText.classList.add('is-in');
       });
@@ -390,6 +437,7 @@
       requestAnimationFrame(function () {
         giftText.classList.add('is-in');
         confetti();
+        waveWhenSettled();
       });
     }, reduceMotion ? 0 : 650);
   }
