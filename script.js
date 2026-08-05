@@ -12,7 +12,7 @@
 
   var YT_VIDEO_ID = '45bXmwsr5h8';
   var NTFY_URL    = 'https://ntfy.sh/barca-laurea-9k3xq7';
-  var STORE_KEY   = 'regalo-sofia:riscattato';
+  var STORE_KEY   = 'regalo-sofia:riscattato:v2';
 
   var reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
@@ -21,8 +21,18 @@
   /* memoria locale: se lo storage è bloccato non deve rompere nulla */
   var store = {
     get: function (k) { try { return window.localStorage.getItem(k); } catch (e) { return null; } },
-    set: function (k, v) { try { window.localStorage.setItem(k, v); } catch (e) {} }
+    set: function (k, v) { try { window.localStorage.setItem(k, v); } catch (e) {} },
+    del: function (k) { try { window.localStorage.removeItem(k); } catch (e) {} }
   };
+
+  /* aprendo il sito con ?reset (o #reset) il bottone torna da cliccare:
+     serve per provarlo senza dover svuotare i dati del browser */
+  if (/(^|[?&#])reset\b/.test(window.location.search + window.location.hash)) {
+    store.del(STORE_KEY);
+    if (window.history.replaceState) {
+      window.history.replaceState(null, '', window.location.pathname);
+    }
+  }
 
 
   /* ---------------------------- 1. hero --------------------------- */
@@ -47,6 +57,18 @@
     document.body.classList.add('is-loaded');
   });
 
+  /* indicazione fissa «scorri verso il basso» */
+  var cue      = document.querySelector('[data-scrollcue]');
+  var congrats = document.getElementById('congratulazioni');
+  var finale   = document.getElementById('finale');
+
+  /* compare al primo scroll e sparisce quando si arriva al regalo */
+  if (finale) {
+    new IntersectionObserver(function (entries) {
+      document.body.classList.toggle('at-end', entries[0].isIntersecting);
+    }, { threshold: 0.3 }).observe(finale);
+  }
+
   var scrolled = false;
   window.addEventListener('scroll', function onFirstScroll() {
     if (scrolled || window.scrollY < 24) return;
@@ -59,7 +81,6 @@
   /* --------------------------- 2. video --------------------------- */
 
   var videoSection = document.getElementById('video');
-  var videoStage   = document.querySelector('.video__stage');
   var videoFrame   = document.querySelector('.video__frame');
   var caption      = document.querySelector('[data-caption]');
   var soundBtn     = document.querySelector('[data-sound-toggle]');
@@ -164,7 +185,6 @@
 
   var thanksSection = document.getElementById('grazie');
   var thanksText    = document.querySelector('[data-reveal-text]');
-  var thanksHint    = document.querySelector('[data-thanks-hint]');
   var words = [];
   var lastOpacity = [];
 
@@ -199,12 +219,18 @@
     ticking = false;
     var vh = window.innerHeight;
 
-    /* video: didascalia che entra ed esce, poi l'invito a proseguire */
+    /* video: la didascalia entra e poi esce seguendo lo scroll */
     if (videoSection && caption) {
       var vr = videoSection.getBoundingClientRect();
       var vp = clamp(-vr.top / (vr.height - vh), 0, 1);
-      caption.classList.toggle('is-in', vp > 0.08 && vp < 0.70);
-      if (videoStage) videoStage.classList.toggle('is-ending', vp > 0.74);
+      caption.classList.toggle('is-in', vp > 0.08 && vp < 0.72);
+    }
+
+    /* sopra la sezione chiara l'indicazione fissa si inverte */
+    if (cue && congrats) {
+      var cr = congrats.getBoundingClientRect();
+      var cueY = vh - 52;
+      cue.classList.toggle('is-light', cr.top < cueY && cr.bottom > cueY);
     }
 
     /* parole: da grigio scuro a bianco pieno, una alla volta */
@@ -225,9 +251,6 @@
         lastOpacity[i] = o;
         words[i].style.opacity = o.toFixed(3);
       }
-
-      /* quando la frase è tutta accesa, diciamo di andare avanti */
-      if (thanksHint) thanksHint.classList.toggle('is-in', p > 0.97);
     }
   }
 
@@ -247,14 +270,13 @@
 
   watchForScroll(videoSection);
   watchForScroll(thanksSection);
+  watchForScroll(congrats);
 
   window.addEventListener('scroll', onScroll, { passive: true });
   window.addEventListener('resize', onScroll, { passive: true });
 
 
   /* --------------- 4. congratulazioni, a scaglioni ---------------- */
-
-  var congrats = document.getElementById('congratulazioni');
 
   if (congrats) {
     var pieces = congrats.querySelectorAll('[data-stagger], .trip__row');

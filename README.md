@@ -28,9 +28,11 @@ cartella su GitHub Pages).
    le lettere del regalo si compongono una alla volta e un'onda calda
    le attraversa.
 
-In ogni sezione c'è un'indicazione su cosa fare («Scorri per iniziare»,
-«Tocca lo schermo per l'audio», «Continua a scorrere», «Tocca il
-bottone»), così anche chi non conosce il sito capisce subito.
+L'indicazione **«Scorri verso il basso ↓»** resta fissa in basso per
+tutta la pagina: compare al primo scroll, si schiarisce sopra la
+sezione chiara e sparisce solo sul finale, dove lascia il posto a
+«Tocca il bottone». Sul video, sopra di essa, c'è anche «Tocca lo
+schermo per l'audio».
 
 ## Testi da sostituire
 
@@ -61,8 +63,18 @@ Senza iscrizione il messaggio non viene recapitato a nessuno.
 Se la rete fallisce il regalo viene mostrato lo stesso.
 
 Lo stato «riscattato» resta in `localStorage` (chiave
-`regalo-sofia:riscattato`): riaprendo il sito il regalo è già visibile.
-Per rivedere l'animazione dall'inizio basta svuotare i dati del sito.
+`regalo-sofia:riscattato:v2`): riaprendo il sito il regalo è già
+visibile, senza rifare l'animazione.
+
+**Per rimettere il bottone da cliccare** basta aprire il sito con
+`?reset` in fondo all'indirizzo:
+
+```
+https://.../regalo-laurea/?reset
+```
+
+Lo stato si azzera, l'indirizzo torna pulito e il regalo è di nuovo da
+scartare. Utile per provarlo quante volte si vuole prima di mandarlo.
 
 ## Note
 

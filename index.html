@@ -53,10 +53,6 @@
       </span>
     </button>
 
-    <p class="hint video__next" data-video-next>
-      Continua a scorrere <span class="hint__arrow" aria-hidden="true">↓</span>
-    </p>
-
     <!-- mostrato solo se l'embed non riesce a partire -->
     <a class="video__fallback" data-fallback hidden
        href="https://youtube.com/shorts/45bXmwsr5h8"
@@ -71,10 +67,6 @@
     <!-- PLACEHOLDER — testo che si illumina parola per parola -->
     <p class="thanks__text" data-reveal-text>
       Grazie per questi sei mesi a casa tua. Spero ti sia divertita almeno la metà di me. E comunque non ti liberi così facilmente.
-    </p>
-
-    <p class="hint thanks__hint" data-thanks-hint>
-      Ancora un po' <span class="hint__arrow" aria-hidden="true">↓</span>
     </p>
   </div>
 </section>
@@ -110,7 +102,7 @@
     </p>
 
     <p class="hint congrats__hint" data-stagger>
-      Manca solo una cosa <span class="hint__arrow" aria-hidden="true">↓</span>
+      Scorri, manca l'ultima cosa <span class="hint__arrow" aria-hidden="true">↓</span>
     </p>
   </div>
 </section>
@@ -152,6 +144,11 @@
     </div>
   </div>
 </section>
+
+<!-- indicazione fissa: resta in basso finché non si arriva al regalo -->
+<div class="scrollcue" data-scrollcue aria-hidden="true">
+  <span class="hint">Scorri verso il basso <span class="hint__arrow">↓</span></span>
+</div>
 
 <script src="script.js"></script>
 </body>
