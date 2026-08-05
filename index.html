@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>Sofia — 1 agosto 2026</title>
+<meta name="description" content="Un regalo di laurea per Sofia.">
+<link rel="icon" href="data:,">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@200;300;400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- ─────────────────────────── 1. HERO ─────────────────────────── -->
+<section class="hero" id="hero">
+  <div class="hero__inner">
+    <h1 class="hero__name">Sofia</h1>
+    <p class="hero__meta">1 agosto 2026 &nbsp;·&nbsp; Messina</p>
+  </div>
+  <div class="scroll-hint" aria-hidden="true"><span class="scroll-hint__line"></span></div>
+</section>
+
+
+<!-- ────────────────────────── 2. VIDEO ─────────────────────────── -->
+<section class="video" id="video">
+  <div class="video__stage">
+    <div class="video__frame">
+      <!-- l'iframe di YouTube viene creato da script.js quando la sezione si avvicina -->
+      <div id="yt-player"></div>
+    </div>
+    <div class="video__scrim" aria-hidden="true"></div>
+
+    <!-- PLACEHOLDER — didascalia del video -->
+    <p class="video__caption" data-caption>
+      Quel giorno, in mezzo al mare.
+    </p>
+
+    <button class="video__sound" type="button" data-sound-toggle>
+      <span data-sound-label>Tocca per l'audio</span>
+    </button>
+
+    <!-- mostrato solo se l'embed non riesce a partire -->
+    <a class="video__fallback" data-fallback hidden
+       href="https://youtube.com/shorts/45bXmwsr5h8"
+       target="_blank" rel="noopener">Guarda il video</a>
+  </div>
+</section>
+
+
+<!-- ───────────────────── 3. SEZIONE DI PASSAGGIO ────────────────── -->
+<section class="reveal" id="passaggio">
+  <div class="reveal__sticky">
+    <!-- PLACEHOLDER — testo che si illumina parola per parola -->
+    <p class="reveal__text" data-reveal-text>
+      Ci sono giorni che non finiscono quando cala il sole. Restano. Diventano il modo in cui ci ricorderemo di questa estate.
+    </p>
+  </div>
+</section>
+
+
+<!-- ────────────────────────── 4. FINALE ────────────────────────── -->
+<section class="finale" id="finale">
+  <div class="finale__inner">
+
+    <!-- PLACEHOLDER — messaggio lungo che introduce il regalo -->
+    <p class="finale__message" data-fade>
+      Hai passato anni a studiare per arrivare fin qui, e ce l'hai fatta nel modo in cui fai tutto: senza fare rumore, semplicemente facendolo. Quel giorno in barca non era la fine dei festeggiamenti. Era l'inizio. Perché una laurea si festeggia una volta sola, e allora tanto vale festeggiarla come si deve.
+    </p>
+
+    <div class="gift" data-gift>
+      <button class="gift__button" type="button" data-claim>
+        <span>Accetta il regalo</span>
+      </button>
+
+      <div class="gift__reveal" data-reveal hidden>
+        <!-- PLACEHOLDER — il testo vero del regalo -->
+        <p class="gift__eyebrow">Il tuo regalo</p>
+        <p class="gift__text">
+          Un weekend alle Eolie, due notti, quando vuoi tu.
+          Devi solo dirmi quando.
+        </p>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<script src="script.js"></script>
+</body>
+</html>
