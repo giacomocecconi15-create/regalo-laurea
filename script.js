@@ -1,7 +1,7 @@
 /* ============================================================
    Regalo di laurea — Sofia
    Vanilla JS. Intersection Observer per far scattare le
-   animazioni solo quando serve, un solo loop rAF per gli
+   animazioni solo quando servono, un solo loop rAF per gli
    effetti legati allo scroll.
    ============================================================ */
 
@@ -27,6 +27,22 @@
 
   /* ---------------------------- 1. hero --------------------------- */
 
+  /* il nome entra una lettera alla volta */
+  var nameEl = document.querySelector('[data-split]');
+  if (nameEl) {
+    var name = nameEl.textContent.trim();
+    nameEl.setAttribute('aria-label', name);
+    nameEl.textContent = '';
+    name.split('').forEach(function (ch, i) {
+      var span = document.createElement('span');
+      span.className = 'l';
+      span.textContent = ch;
+      span.setAttribute('aria-hidden', 'true');
+      span.style.transitionDelay = (0.35 + i * 0.075) + 's';
+      nameEl.appendChild(span);
+    });
+  }
+
   requestAnimationFrame(function () {
     document.body.classList.add('is-loaded');
   });
@@ -43,6 +59,7 @@
   /* --------------------------- 2. video --------------------------- */
 
   var videoSection = document.getElementById('video');
+  var videoStage   = document.querySelector('.video__stage');
   var videoFrame   = document.querySelector('.video__frame');
   var caption      = document.querySelector('[data-caption]');
   var soundBtn     = document.querySelector('[data-sound-toggle]');
@@ -53,6 +70,8 @@
   var playerReady = false;
   var muted = true;
   var apiRequested = false;
+  var videoInView = false;
+  var fallbackTimer = null;
 
   function loadYouTubeApi() {
     if (apiRequested) return;
@@ -98,9 +117,6 @@
     });
   }
 
-  var videoInView = false;
-  var fallbackTimer = null;
-
   if (videoSection && videoFrame) {
     /* prepara il player poco prima che la sezione entri in vista */
     new IntersectionObserver(function (entries, obs) {
@@ -134,11 +150,11 @@
         player.unMute();
         player.setVolume(100);
         muted = false;
-        soundLabel.textContent = 'Tocca per silenziare';
+        soundLabel.textContent = 'Tocca di nuovo per silenziare';
       } else {
         player.mute();
         muted = true;
-        soundLabel.textContent = "Tocca per l'audio";
+        soundLabel.textContent = "Tocca lo schermo per l'audio";
       }
     });
   }
@@ -146,21 +162,22 @@
 
   /* ------------------ 3. testo che si illumina -------------------- */
 
-  var revealSection = document.getElementById('passaggio');
-  var revealText    = document.querySelector('[data-reveal-text]');
+  var thanksSection = document.getElementById('grazie');
+  var thanksText    = document.querySelector('[data-reveal-text]');
+  var thanksHint    = document.querySelector('[data-thanks-hint]');
   var words = [];
   var lastOpacity = [];
 
-  if (revealText) {
-    var source = revealText.textContent.trim().split(/\s+/);
-    revealText.textContent = '';
+  if (thanksText) {
+    var source = thanksText.textContent.trim().split(/\s+/);
+    thanksText.textContent = '';
     source.forEach(function (word, i) {
       var span = document.createElement('span');
       span.className = 'w';
       span.textContent = word;
-      revealText.appendChild(span);
+      thanksText.appendChild(span);
       if (i < source.length - 1) {
-        revealText.appendChild(document.createTextNode(' '));
+        thanksText.appendChild(document.createTextNode(' '));
       }
       words.push(span);
       lastOpacity.push(-1);
@@ -182,20 +199,21 @@
     ticking = false;
     var vh = window.innerHeight;
 
-    /* didascalia del video: entra e poi esce, seguendo lo scroll */
+    /* video: didascalia che entra ed esce, poi l'invito a proseguire */
     if (videoSection && caption) {
       var vr = videoSection.getBoundingClientRect();
       var vp = clamp(-vr.top / (vr.height - vh), 0, 1);
-      caption.classList.toggle('is-in', vp > 0.10 && vp < 0.72);
+      caption.classList.toggle('is-in', vp > 0.08 && vp < 0.70);
+      if (videoStage) videoStage.classList.toggle('is-ending', vp > 0.74);
     }
 
     /* parole: da grigio scuro a bianco pieno, una alla volta */
-    if (revealSection && words.length && !reduceMotion) {
-      var rr = revealSection.getBoundingClientRect();
+    if (thanksSection && words.length && !reduceMotion) {
+      var rr = thanksSection.getBoundingClientRect();
       var rp = clamp(-rr.top / (rr.height - vh), 0, 1);
 
       /* la finestra utile parte dopo un po' e finisce prima della fine */
-      var p = clamp((rp - 0.12) / 0.62, 0, 1);
+      var p = clamp((rp - 0.12) / 0.58, 0, 1);
       var span = 2.2;                                  // quante parole sfumano insieme
       var head = p * (words.length + span);
 
@@ -207,29 +225,56 @@
         lastOpacity[i] = o;
         words[i].style.opacity = o.toFixed(3);
       }
+
+      /* quando la frase è tutta accesa, diciamo di andare avanti */
+      if (thanksHint) thanksHint.classList.toggle('is-in', p > 0.97);
     }
   }
 
+  /* Teniamo il conto delle sezioni in vista con uno stato per sezione:
+     un contatore condiviso si sfaserebbe alla prima callback "non visibile". */
   function watchForScroll(el) {
     if (!el) return;
+    var wasIn = false;
     new IntersectionObserver(function (entries) {
-      activeSections += entries[0].isIntersecting ? 1 : -1;
-      activeSections = Math.max(0, activeSections);
-      if (entries[0].isIntersecting) onScroll();
+      var isIn = entries[entries.length - 1].isIntersecting;
+      if (isIn === wasIn) return;
+      wasIn = isIn;
+      activeSections += isIn ? 1 : -1;
+      if (isIn) onScroll();
     }, { rootMargin: '10% 0px' }).observe(el);
   }
 
   watchForScroll(videoSection);
-  watchForScroll(revealSection);
+  watchForScroll(thanksSection);
 
   window.addEventListener('scroll', onScroll, { passive: true });
   window.addEventListener('resize', onScroll, { passive: true });
 
 
-  /* --------------------------- 4. finale -------------------------- */
+  /* --------------- 4. congratulazioni, a scaglioni ---------------- */
+
+  var congrats = document.getElementById('congratulazioni');
+
+  if (congrats) {
+    var pieces = congrats.querySelectorAll('[data-stagger], .trip__row');
+
+    new IntersectionObserver(function (entries, obs) {
+      if (!entries[0].isIntersecting) return;
+      obs.disconnect();
+      Array.prototype.forEach.call(pieces, function (el, i) {
+        el.style.transitionDelay = (i * 0.13) + 's';
+        el.classList.add('is-in');
+      });
+    }, { threshold: 0.2 }).observe(congrats);
+  }
+
+
+  /* --------------------------- 5. finale -------------------------- */
 
   var fadeItems = document.querySelectorAll('[data-fade]');
   var giftBox   = document.querySelector('[data-gift]');
+  var giftHint  = document.querySelector('[data-gift-hint]');
   var claimBtn  = document.querySelector('[data-claim]');
   var giftText  = document.querySelector('[data-reveal]');
 
@@ -241,24 +286,94 @@
     });
   }, { threshold: 0.25 });
 
-  fadeItems.forEach(function (el) { fadeObserver.observe(el); });
+  Array.prototype.forEach.call(fadeItems, function (el) { fadeObserver.observe(el); });
+
+  var redeemed = store.get(STORE_KEY) === '1';
 
   if (giftBox && claimBtn) {
     new IntersectionObserver(function (entries, obs) {
       if (!entries[0].isIntersecting) return;
-      claimBtn.classList.add('is-in');
       obs.disconnect();
-    }, { threshold: 0.4 }).observe(giftBox);
+      if (redeemed) return;
+      claimBtn.classList.add('is-in');
+      if (giftHint) giftHint.classList.add('is-in');
+    }, { threshold: 0.35 }).observe(giftBox);
   }
 
 
-  /* ------------------- 5. riscatto del regalo --------------------- */
+  /* ---------------------- coriandoli (breve) ---------------------- */
+
+  function confetti() {
+    if (reduceMotion) return;
+
+    var canvas = document.createElement('canvas');
+    canvas.className = 'confetti';
+    document.body.appendChild(canvas);
+
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    var w = canvas.width  = window.innerWidth * dpr;
+    var h = canvas.height = window.innerHeight * dpr;
+    var ctx = canvas.getContext('2d');
+
+    var colors = ['#ff9a5a', '#f6f0e7', '#ffd0a8', '#ffffff'];
+    var bits = [];
+    var n = window.innerWidth < 500 ? 60 : 90;
+
+    for (var i = 0; i < n; i++) {
+      bits.push({
+        x: w * (0.2 + Math.random() * 0.6),
+        y: h * (0.55 + Math.random() * 0.15),
+        vx: (Math.random() - 0.5) * 9 * dpr,
+        vy: (-9 - Math.random() * 9) * dpr,
+        s: (4 + Math.random() * 5) * dpr,
+        rot: Math.random() * Math.PI,
+        vr: (Math.random() - 0.5) * 0.3,
+        c: colors[(Math.random() * colors.length) | 0]
+      });
+    }
+
+    var start = performance.now();
+
+    function frame(now) {
+      var life = now - start;
+      ctx.clearRect(0, 0, w, h);
+
+      for (var i = 0; i < bits.length; i++) {
+        var b = bits[i];
+        b.vy += 0.34 * dpr;          // gravità
+        b.vx *= 0.995;
+        b.x += b.vx;
+        b.y += b.vy;
+        b.rot += b.vr;
+
+        ctx.save();
+        ctx.translate(b.x, b.y);
+        ctx.rotate(b.rot);
+        ctx.globalAlpha = clamp(1 - (life - 1600) / 1200, 0, 1);
+        ctx.fillStyle = b.c;
+        ctx.fillRect(-b.s / 2, -b.s / 2, b.s, b.s * 0.6);
+        ctx.restore();
+      }
+
+      if (life < 2800) {
+        requestAnimationFrame(frame);
+      } else {
+        canvas.remove();
+      }
+    }
+
+    requestAnimationFrame(frame);
+  }
+
+
+  /* ------------------- 6. riscatto del regalo --------------------- */
 
   function showGift(animated) {
     giftText.hidden = false;
 
     if (!animated) {
       claimBtn.hidden = true;
+      if (giftHint) giftHint.hidden = true;
       requestAnimationFrame(function () {
         giftText.classList.add('is-in');
       });
@@ -267,19 +382,22 @@
 
     claimBtn.disabled = true;
     claimBtn.classList.add('is-out');
+    if (giftHint) giftHint.classList.add('is-out');
 
     window.setTimeout(function () {
       claimBtn.hidden = true;
+      if (giftHint) giftHint.hidden = true;
       requestAnimationFrame(function () {
         giftText.classList.add('is-in');
+        confetti();
       });
-    }, reduceMotion ? 0 : 700);
+    }, reduceMotion ? 0 : 650);
   }
 
   function notify() {
     /* corpo testuale semplice: niente header custom, niente preflight */
     var body =
-      'Sofia ha accettato il regalo\n' +
+      'Sofia ha accettato il regalo 🎁\n' +
       'Giornata in barca — Messina, 1 agosto 2026\n' +
       new Date().toLocaleString('it-IT');
 
@@ -287,9 +405,7 @@
   }
 
   if (claimBtn && giftText) {
-    if (store.get(STORE_KEY) === '1') {
-      showGift(false);
-    }
+    if (redeemed) showGift(false);
 
     claimBtn.addEventListener('click', function () {
       if (claimBtn.disabled) return;
