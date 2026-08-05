@@ -1,0 +1,444 @@
+/* ============================================================
+   Regalo di laurea — Sofia
+   Palette quasi monocromatica, un solo accento.
+   ============================================================ */
+
+:root {
+  --bg:        #000000;
+  --bg-soft:   #060607;
+  --text:      #f5f5f7;
+  --text-dim:  #86868b;
+  --text-mute: rgba(245, 245, 247, 0.18);
+  --line:      rgba(245, 245, 247, 0.28);
+  --accent:    #8ab4c8;
+
+  --ease:      cubic-bezier(0.22, 0.61, 0.36, 1);
+  --ease-soft: cubic-bezier(0.33, 0, 0.20, 1);
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+[hidden] { display: none !important; }
+
+html {
+  background: var(--bg);
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text",
+               "Helvetica Neue", Arial, sans-serif;
+  font-weight: 300;
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow-x: hidden;
+}
+
+::selection { background: var(--text); color: var(--bg); }
+
+
+/* ─────────────────────────── 1. HERO ─────────────────────────── */
+
+.hero {
+  position: relative;
+  min-height: 100vh;
+  min-height: 100svh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 6vw;
+  background: var(--bg);
+}
+
+.hero__inner { text-align: center; }
+
+.hero__name {
+  font-size: clamp(4.5rem, 19vw, 15rem);
+  font-weight: 200;
+  letter-spacing: -0.045em;
+  line-height: 0.95;
+  color: var(--text);
+
+  opacity: 0;
+  transform: translate3d(0, 28px, 0);
+  transition: opacity 1.6s var(--ease-soft), transform 1.6s var(--ease-soft);
+}
+
+.hero__meta {
+  margin-top: clamp(1.4rem, 3.5vw, 2.6rem);
+  font-size: clamp(0.72rem, 1.5vw, 0.85rem);
+  font-weight: 400;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+
+  opacity: 0;
+  transform: translate3d(0, 16px, 0);
+  transition: opacity 1.4s var(--ease-soft) 0.55s,
+              transform 1.4s var(--ease-soft) 0.55s;
+}
+
+.is-loaded .hero__name,
+.is-loaded .hero__meta {
+  opacity: 1;
+  transform: translate3d(0, 0, 0);
+}
+
+/* indicatore di scroll: una linea verticale che pulsa piano */
+.scroll-hint {
+  position: absolute;
+  left: 50%;
+  bottom: max(3.2vh, env(safe-area-inset-bottom, 0px));
+  width: 1px;
+  height: 62px;
+  transform: translateX(-50%);
+  overflow: hidden;
+  opacity: 0;
+  transition: opacity 1.2s var(--ease-soft) 1.4s;
+}
+
+.is-loaded .scroll-hint { opacity: 1; }
+.has-scrolled .scroll-hint { opacity: 0; transition-delay: 0s; }
+
+.scroll-hint__line {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: var(--line);
+  transform-origin: top center;
+  animation: hint 2.9s var(--ease-soft) infinite;
+}
+
+@keyframes hint {
+  0%   { transform: scaleY(0);   opacity: 0; }
+  28%  { transform: scaleY(1);   opacity: 1; }
+  70%  { transform: scaleY(1);   opacity: 1; }
+  100% { transform: scaleY(1);   opacity: 0; }
+}
+
+
+/* ────────────────────────── 2. VIDEO ─────────────────────────── */
+
+.video {
+  position: relative;
+  height: 260vh;
+  background: var(--bg);
+}
+
+.video__stage {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  height: 100svh;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.video__frame {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  transition: opacity 1.8s var(--ease-soft);
+  will-change: opacity;
+}
+
+.video__frame.is-playing { opacity: 1; }
+
+/* Il video è verticale (9:16): lo dimensioniamo sull'altezza.
+   Su un telefono in verticale riempie tutto lo schermo; su desktop
+   resta centrato sul nero, senza tagliare l'inquadratura. */
+.video__frame iframe {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  height: 100vh;
+  height: 100svh;
+  width: 56.25vh;
+  width: 56.25svh;
+  transform: translate(-50%, -50%);
+  border: 0;
+  pointer-events: none;
+}
+
+/* schermi verticali (telefoni): il video copre sempre tutto */
+@media (max-aspect-ratio: 1/1) {
+  .video__frame iframe {
+    min-width: 100vw;
+    min-height: 177.78vw;
+  }
+}
+
+.video__scrim {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(
+    to bottom,
+    rgba(0, 0, 0, 0.55) 0%,
+    rgba(0, 0, 0, 0) 32%,
+    rgba(0, 0, 0, 0) 58%,
+    rgba(0, 0, 0, 0.62) 100%
+  );
+}
+
+.video__caption {
+  position: absolute;
+  left: 50%;
+  top: clamp(3.5rem, 12vh, 7rem);
+  width: min(78vw, 20ch);
+  transform: translate3d(-50%, 20px, 0);
+  text-align: center;
+  font-size: clamp(1.6rem, 4.6vw, 3.2rem);
+  font-weight: 200;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+  color: var(--text);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 1.4s var(--ease-soft), transform 1.4s var(--ease-soft);
+}
+
+.video__caption.is-in {
+  opacity: 1;
+  transform: translate3d(-50%, 0, 0);
+}
+
+.video__sound {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  width: 100%;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.video__sound span {
+  position: absolute;
+  left: 50%;
+  bottom: calc(max(4vh, env(safe-area-inset-bottom, 0px)) + 1rem);
+  transform: translateX(-50%);
+  white-space: nowrap;
+  font-size: 0.68rem;
+  font-weight: 400;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: rgba(245, 245, 247, 0.62);
+  opacity: 0;
+  transition: opacity 1s var(--ease-soft), color 0.6s var(--ease);
+}
+
+.video__frame.is-playing ~ .video__sound span { opacity: 1; }
+
+.video__fallback {
+  position: absolute;
+  z-index: 3;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 0.72rem;
+  font-weight: 400;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: rgba(245, 245, 247, 0.62);
+  text-decoration: none;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 0.4rem;
+  opacity: 0;
+  transition: opacity 1s var(--ease-soft), color 0.5s var(--ease);
+}
+
+.video__fallback.is-in { opacity: 1; }
+.video__fallback:hover { color: var(--text); }
+
+
+/* ───────────────────── 3. SEZIONE DI PASSAGGIO ────────────────── */
+
+.reveal {
+  position: relative;
+  height: 320vh;
+  background: var(--bg);
+}
+
+.reveal__sticky {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  height: 100svh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 7vw;
+}
+
+.reveal__text {
+  max-width: 16ch;
+  text-align: center;
+  font-size: clamp(2rem, 7.2vw, 5rem);
+  font-weight: 200;
+  letter-spacing: -0.03em;
+  line-height: 1.18;
+  color: var(--text);
+}
+
+.reveal__text .w {
+  display: inline-block;
+  color: var(--text);
+  opacity: 0.16;
+  transition: opacity 0.45s linear;
+  will-change: opacity;
+}
+
+
+/* ────────────────────────── 4. FINALE ────────────────────────── */
+
+.finale {
+  position: relative;
+  min-height: 100vh;
+  min-height: 100svh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: clamp(6rem, 18vh, 12rem) 7vw;
+  background: var(--bg-soft);
+}
+
+.finale__inner {
+  width: 100%;
+  max-width: 42ch;
+  text-align: center;
+}
+
+.finale__message {
+  font-size: clamp(1.15rem, 2.9vw, 1.7rem);
+  font-weight: 200;
+  letter-spacing: -0.012em;
+  line-height: 1.55;
+  color: var(--text);
+
+  opacity: 0;
+  transform: translate3d(0, 22px, 0);
+  transition: opacity 1.5s var(--ease-soft), transform 1.5s var(--ease-soft);
+}
+
+.finale__message.is-in {
+  opacity: 1;
+  transform: translate3d(0, 0, 0);
+}
+
+.gift {
+  margin-top: clamp(3.5rem, 9vh, 6rem);
+  position: relative;
+  min-height: 4.2rem;
+  text-align: center;
+}
+
+/* — bottone minimale: solo bordo, si riempie di bianco al tocco — */
+.gift__button {
+  position: relative;
+  display: inline-block;
+  padding: 1.15rem 2.6rem;
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.82rem;
+  font-weight: 400;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+
+  opacity: 0;
+  transform: translate3d(0, 16px, 0);
+  transition: opacity 1.2s var(--ease-soft) 0.35s,
+              transform 1.2s var(--ease-soft) 0.35s,
+              background-color 0.55s var(--ease),
+              color 0.55s var(--ease),
+              border-color 0.55s var(--ease);
+}
+
+.gift__button.is-in {
+  opacity: 1;
+  transform: translate3d(0, 0, 0);
+}
+
+.gift__button:hover,
+.gift__button:focus-visible {
+  background: var(--text);
+  border-color: var(--text);
+  color: #000;
+  outline: none;
+}
+
+.gift__button:active {
+  background: var(--text);
+  border-color: var(--text);
+  color: #000;
+  transform: scale(0.985);
+}
+
+.gift__button[disabled] { cursor: default; }
+
+/* uscita in dissolvenza del bottone */
+.gift__button.is-out {
+  opacity: 0;
+  transform: translate3d(0, -10px, 0);
+  transition: opacity 0.7s var(--ease-soft), transform 0.7s var(--ease-soft);
+  pointer-events: none;
+}
+
+/* — il regalo vero — */
+.gift__reveal {
+  opacity: 0;
+  transform: translate3d(0, 14px, 0);
+  transition: opacity 1.2s var(--ease-soft), transform 1.2s var(--ease-soft);
+}
+
+.gift__reveal.is-in {
+  opacity: 1;
+  transform: translate3d(0, 0, 0);
+}
+
+.gift__eyebrow {
+  font-size: 0.68rem;
+  font-weight: 400;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 1.4rem;
+}
+
+.gift__text {
+  font-size: clamp(1.5rem, 4.4vw, 2.6rem);
+  font-weight: 200;
+  letter-spacing: -0.025em;
+  line-height: 1.25;
+  color: var(--text);
+  max-width: 20ch;
+  margin: 0 auto;
+}
+
+
+/* ──────────────────── preferenze di movimento ────────────────── */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+  .reveal { height: 100vh; height: 100svh; }
+  .video { height: 100vh; height: 100svh; }
+  .reveal__text .w { opacity: 1 !important; }
+}
