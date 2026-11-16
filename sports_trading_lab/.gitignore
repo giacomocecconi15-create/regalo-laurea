@@ -8,3 +8,5 @@ data/trading_db.duckdb
 data/gestionale.duckdb
 data/*.wal
 strategies.json
+data/*
+!data/.gitkeep
