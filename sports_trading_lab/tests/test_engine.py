@@ -609,3 +609,146 @@ def test_roadmap_state_is_saved_and_merged(tmp_path):
     assert mine not in {i["id"] for i in rm.items(p)}
     p.write_text("{rotto", encoding="utf-8")       # file danneggiato: si riparte dalle voci predefinite
     assert len(rm.items(p)) == len(rm.DEFAULT_ITEMS)
+
+
+# ------------------------------------------------------------------ partite in programma e aggiornamento
+from src import fixtures as fx  # noqa: E402
+from src import strategies as sv  # noqa: E402
+
+
+def test_fixtures_parser_and_book_fallback():
+    raw = ("﻿Div,Date,Time,HomeTeam,AwayTeam,AvgH,AvgD,AvgA,MaxH,MaxD,MaxA,Avg>2.5,Avg<2.5,Max>2.5,Max<2.5,AHh\n"
+           "I1,21/11/2026,20:45,Inter,Genoa,1.38,4.9,8.5,1.42,5.1,,1.62,2.3,1.66,2.36,-1.5\n"
+           "EC,22/11/2026,15:00,Woking,Altrincham,2.1,3.4,3.3,2.2,3.5,3.5,1.9,1.9,1.95,1.95,-0.25\n"
+           ",,,,,,,,,,,,,,,\n").encode()
+    avg, mx = fx.parse_football_fixtures(raw, "avg"), fx.parse_football_fixtures(raw, "max")
+    assert avg["home_team"].tolist() == ["Inter", "Woking"] and avg["date"].tolist() == ["2026-11-21", "2026-11-22"]
+    assert avg.loc[0, "league"] == "Serie A" and avg.loc[1, "league"] == "EC"      # campionato fuori database: resta il codice
+    assert avg.loc[0, "odds_home"] == 1.38 and mx.loc[0, "odds_home"] == 1.42
+    assert mx.loc[0, "odds_away"] == 8.5                                             # massimo assente -> media mercato
+    assert mx.loc[0, "odds_over25"] == 1.66 and avg.loc[0, "ah_line"] == -1.5
+    assert sv.detect_sport(avg) == "football"
+    assert fx.parse_football_fixtures(b"niente", "avg").empty
+
+
+def test_odds_api_parser_and_fetch_without_network():
+    events = [{"commence_time": "2026-11-17T13:00:00Z", "home_team": "Jannik Sinner", "away_team": "Alex de Minaur", "bookmakers": [
+        {"key": "pinnacle", "markets": [{"key": "h2h", "outcomes": [{"name": "Jannik Sinner", "price": 1.25}, {"name": "Alex de Minaur", "price": 4.4}]}]},
+        {"key": "other", "markets": [{"key": "h2h", "outcomes": [{"name": "Alex de Minaur", "price": 4.0}, {"name": "Jannik Sinner", "price": 1.21}]},
+                                     {"key": "spreads", "outcomes": [{"name": "Jannik Sinner", "price": 9.9}]}]},
+        {"key": "broken", "markets": [{"key": "h2h", "outcomes": [{"name": "Jannik Sinner", "price": 1.3}]}]}]},
+        {"commence_time": "x", "home_team": "A", "away_team": "B", "bookmakers": []}]
+    rows = fx.parse_odds_api_events(events, "Paris Masters")
+    assert len(rows) == 1 and rows[0]["bookmakers"] == 2
+    assert rows[0]["odds1"] == pytest.approx(1.23) and rows[0]["max2"] == 4.4 and rows[0]["ps1"] == 1.25
+    assert rows[0]["date"] == "2026-11-17" and rows[0]["time"] == "14:00"            # ora italiana
+
+    class Resp:
+        def __init__(self, data, status=200):
+            self._d, self.status_code, self.headers = data, status, {"x-requests-remaining": "480"}
+        def json(self):
+            return self._d
+        def raise_for_status(self):
+            pass
+
+    class Fake:
+        calls = []
+        def get(self, url, params=None, timeout=None):
+            Fake.calls.append(url)
+            if url.endswith("/sports/"):
+                return Resp([{"key": "tennis_atp_paris_masters", "title": "ATP Paris Masters", "active": True},
+                             {"key": "tennis_wta_x", "title": "WTA X", "active": True},
+                             {"key": "tennis_atp_old", "title": "ATP Old", "active": False}])
+            return Resp(events)
+
+    df, msg = fx.fetch_tennis_odds("chiave", "max", session=Fake())
+    assert len(Fake.calls) == 2 and "tennis_atp_paris_masters" in Fake.calls[1]      # solo tornei ATP attivi: 1 credito
+    assert df.loc[0, "tournament"] == "Paris Masters" and df.loc[0, "odds2"] == 4.4 and "480" in msg
+    assert sv.detect_sport(df) == "tennis"
+    assert fx.fetch_tennis_odds("", "avg")[0].empty
+
+    class Denied(Fake):
+        def get(self, url, params=None, timeout=None):
+            return Resp([], 401)
+    assert "Chiave" in fx.fetch_tennis_odds("sbagliata", session=Denied())[1]
+
+
+def test_settings_roundtrip(tmp_path):
+    p = tmp_path / "settings.json"
+    assert fx.load_settings(p) == fx.DEFAULT_SETTINGS
+    fx.save_settings({"auto_update_hours": 24}, p)
+    assert fx.load_settings(p)["auto_update_hours"] == 24 and fx.load_settings(p)["auto_update"] is True
+    p.write_text("rotto")
+    assert fx.load_settings(p) == fx.DEFAULT_SETTINGS
+
+
+def test_fetch_reports_unchanged_files(tmp_path, monkeypatch):
+    cache = tmp_path / "f.csv"
+    served = {"body": b"Div,Date\nI1,01/01/2026\n"}
+    monkeypatch.setattr(ud, "http_get", lambda url, retries=3: served["body"])
+    ok = lambda b: b"Date" in b
+    assert ud.fetch(cache, ["u"], True, ok) == (served["body"], "u", True)       # primo download
+    assert ud.fetch(cache, ["u"], True, ok)[2] is False                          # identico: niente da ricaricare
+    assert ud.fetch(cache, ["u"], False, ok)[1] == "cache"
+    served["body"] += b"I1,02/01/2026\n"
+    assert ud.fetch(cache, ["u"], True, ok)[2] is True and cache.read_bytes() == served["body"]
+    served["body"] = None                                                         # sito irraggiungibile: resta la cache
+    raw, origin, changed = ud.fetch(cache, ["u"], True, ok)
+    assert raw is not None and "fallito" in origin and changed is False
+    assert ud.parallel({i: (lambda i=i: i * 2) for i in range(5)}) == {i: i * 2 for i in range(5)}
+    from datetime import date
+    assert ud.refresh_window(date(2026, 11, 16)) == (1, 1) and ud.refresh_window(date(2027, 1, 10)) == (1, 2)
+    assert ud.refresh_window(date(2027, 7, 1)) == (2, 1)
+
+
+def test_player_spellings_are_unified(tmp_path):
+    import duckdb
+    con = duckdb.connect(str(tmp_path / "n.duckdb"))
+    ud.init_db(con)
+    rows = [("a", "ATP", "Felix Auger-Aliassime", "X Y"), ("b", "ATP", "Felix Auger-Aliassime", "X Y"),
+            ("c", "CHALLENGER", "Felix Auger Aliassime", "X Y"), ("d", "CHALLENGER", "X Y", "Felix Auger Aliassime"),
+            ("e", "CHALLENGER", "X Y", "Felix Auger Aliassime")]
+    for mid, circuit, w, l in rows:
+        con.execute("INSERT INTO tennis_matches (match_id, circuit, winner_name, loser_name, match_date) VALUES (?, ?, ?, ?, DATE '2026-01-01')", [mid, circuit, w, l])
+    assert ud.canonicalize_tennis_names(con) == 1
+    names = {r[0] for r in con.execute("SELECT winner_name FROM tennis_matches UNION SELECT loser_name FROM tennis_matches").fetchall()}
+    assert names == {"Felix Auger-Aliassime", "X Y"}                                # vince la grafia del circuito ATP
+    assert ud.canonicalize_tennis_names(con) == 0
+    con.close()
+
+
+@needs_db
+def test_upcoming_match_features_equal_backtest_features(con):
+    """Le variabili calcolate per una partita 'in programma' devono coincidere con quelle usate dal backtest."""
+    h = con.execute("SELECT * FROM football_matches WHERE home_pos IS NOT NULL ORDER BY match_date DESC LIMIT 200").df().iloc[60:90]
+    up = h.rename(columns={"match_date": "date", "avg_h": "odds_home", "avg_d": "odds_draw", "avg_a": "odds_away"})[
+        ["date", "div", "home_team", "away_team", "odds_home", "odds_draw", "odds_away"]]
+    s = sv.football_upload_selections(up, "1x2", con)
+    a = s[s["selection"] == "home"].reset_index(drop=True)
+    for k in ("home_ppg5", "away_pos", "home_sppg", "away_venue_ppg5", "home_sot5", "away_rest_days"):
+        assert np.allclose(a[k].to_numpy(dtype=float), h[k].to_numpy(dtype=float), equal_nan=True), k
+    assert np.allclose(a["pos_diff"], (h["away_pos"] - h["home_pos"]).to_numpy(), equal_nan=True)
+
+    t = con.execute("SELECT * FROM tennis_matches WHERE has_odds AND match_id NOT LIKE 'TD:%' ORDER BY match_date DESC LIMIT 20").df()
+    tup = pd.DataFrame({"date": t["match_date"], "tournament": t["tourney_name"], "player1": t["loser_name"].str.upper(),
+                        "player2": t["winner_name"], "odds1": t["avg_l"], "odds2": t["avg_w"]})
+    ts = sv.tennis_upload_selections(tup, con).iloc[:len(t)].reset_index(drop=True)
+    assert (ts["player"] == t["loser_name"]).all()                                   # nomi riallineati al database
+    assert (ts["surface"] == t["surface"]).all()                                     # superficie ricavata dal torneo
+    for k, col, mult in (("form10", "loser_form10", 100), ("h2h_wins", "loser_h2h_wins", 1), ("h2h_losses", "winner_h2h_wins", 1),
+                         ("srv_won10", "loser_srv_won10", 100), ("opp_form_surf", "winner_form_surf", 100)):
+        assert np.allclose(ts[k].to_numpy(dtype=float), t[col].to_numpy(dtype=float) * mult, equal_nan=True), k
+
+
+@needs_db
+def test_future_fixture_does_not_count_as_played(con):
+    last = con.execute("SELECT home_team, away_team, div, max(match_date) AS d FROM football_matches WHERE div = 'I1' GROUP BY ALL ORDER BY d DESC LIMIT 1").df()
+    home, away = last.loc[0, "home_team"], last.loc[0, "away_team"]
+    when = pd.Timestamp(last.loc[0, "d"]) + pd.Timedelta(days=7)
+    up = pd.DataFrame({"date": [when, when + pd.Timedelta(days=4)], "div": "I1", "home_team": [home, away], "away_team": [away, home],
+                       "odds_home": 2.0, "odds_draw": 3.3, "odds_away": 3.8})
+    s = sv.football_upload_selections(up, "1x2", con)
+    a = s[s["selection"] == "home"].reset_index(drop=True)
+    assert a.loc[0, "home_rest_days"] == 7 and a.loc[1, "away_rest_days"] == 4       # la seconda vede la prima come impegno precedente
+    assert a.loc[0, "home_sppg"] == pytest.approx(a.loc[1, "away_sppg"])            # ma non come partita giocata: punti invariati
+    assert a.loc[0, "home_pos"] == a.loc[1, "away_pos"]

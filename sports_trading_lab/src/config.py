@@ -10,7 +10,7 @@ RAW_DIR = DATA_DIR / "raw"
 DB_PATH = DATA_DIR / "trading_db.duckdb"
 STRATEGIES_PATH = ROOT / "strategies.json"
 
-SCHEMA_VERSION = "2"  # da incrementare quando cambiano le feature calcolate
+SCHEMA_VERSION = "3"  # da incrementare quando cambiano le feature calcolate
 FIRST_YEAR = 2019  # primo anno / stagione scaricata (>= 5 anni di storico)
 
 # --------------------------------------------------------------------------- calcio

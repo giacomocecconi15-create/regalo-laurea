@@ -66,5 +66,10 @@ APPLESCRIPT
 rm -rf "$DEST"
 osacompile -o "$DEST" "$SRC"
 rm -f "$SRC"
+if [ -f assets/icon.icns ]; then   # icona personalizzata al posto di quella generica degli script
+  cp assets/icon.icns "$DEST/Contents/Resources/applet.icns"
+  rm -f "$DEST/Contents/Resources/Assets.car"
+  touch "$DEST"
+fi
 echo "Creata: $DEST"
 echo "Doppio clic per aprire. Se è già aperta, il doppio clic chiede se riaprire la finestra o spegnerla."

@@ -14,6 +14,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
+import shutil
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import io
 import re
@@ -55,20 +58,32 @@ def http_get(url: str, retries: int = 3) -> bytes | None:
     return None
 
 
-def fetch(cache: Path, urls: list[str], refresh: bool, validate) -> tuple[bytes | None, str]:
-    """Ritorna (contenuto, origine). Usa la cache se presente e non serve il refresh;
-    se il download fallisce ripiega sulla cache."""
-    if cache.exists() and not refresh:
-        return cache.read_bytes(), "cache"
+def fetch(cache: Path, urls: list[str], refresh: bool, validate) -> tuple[bytes | None, str, bool]:
+    """Ritorna (contenuto, origine, cambiato). Usa la cache se presente e non serve il refresh;
+    se il download fallisce ripiega sulla cache. `cambiato` e' False quando il file scaricato
+    e' identico a quello gia' in cache (niente da ricaricare nel database)."""
+    old = cache.read_bytes() if cache.exists() else None
+    if old is not None and not refresh:
+        return old, "cache", False
     for url in urls:
         raw = http_get(url)
         if raw is not None and validate(raw):
-            cache.parent.mkdir(parents=True, exist_ok=True)
-            cache.write_bytes(raw)
-            return raw, url
-    if cache.exists():
-        return cache.read_bytes(), "cache (download fallito)"
-    return None, "non disponibile"
+            if raw != old:
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                cache.write_bytes(raw)
+            return raw, url, raw != old
+    if old is not None:
+        return old, "cache (download fallito)", False
+    return None, "non disponibile", False
+
+
+def parallel(jobs: dict, workers: int = 8) -> dict:
+    """Esegue in parallelo {chiave: funzione senza argomenti} e ritorna {chiave: risultato}."""
+    if not jobs:
+        return {}
+    with ThreadPoolExecutor(max_workers=min(workers, len(jobs))) as pool:
+        futures = {k: pool.submit(fn) for k, fn in jobs.items()}
+        return {k: f.result() for k, f in futures.items()}
 
 
 def decode(raw: bytes) -> str:
@@ -96,7 +111,7 @@ def read_csv_loose(raw: bytes) -> pd.DataFrame:
         data.append([r[i].strip() for i in keep])
     df = pd.DataFrame(data, columns=names, dtype=object)
     df = df.loc[:, ~df.columns.duplicated()]
-    return df.replace("", np.nan)
+    return df.mask(df == "", np.nan)
 
 
 def num(s: pd.Series) -> pd.Series:
@@ -213,6 +228,8 @@ def _table_positions(long: pd.DataFrame) -> pd.Series:
                 if state[team][3] >= 3:
                     pos[idx] = rank[team]
             for team, pts, gf, ga in zip(day["team"], day["pts"], day["gf"], day["ga"]):
+                if gf != gf or ga != ga:  # NaN: partita non ancora giocata
+                    continue
                 st = state[team]
                 st[0] += pts
                 st[1] += gf - ga
@@ -232,7 +249,7 @@ def football_features(df: pd.DataFrame) -> pd.DataFrame:
         sides.append(pd.DataFrame({
             "match_id": df["match_id"], "side": side, "team": df[f"{side}_team"], "date": pd.to_datetime(df["match_date"]),
             "div": _col(df, "div"), "season": _col(df, "season_start"),
-            "pts": np.select([df["ftr"] == win, df["ftr"] == "D"], [3.0, 1.0], 0.0),
+            "pts": np.where(df["ftr"].isna(), np.nan, np.select([df["ftr"] == win, df["ftr"] == "D"], [3.0, 1.0], 0.0)),
             "gf": df[gf].astype(float), "ga": df[ga].astype(float),
             "sot": _col(df, f"{side}_sot"), "sota": _col(df, f"{opp}_sot"), "corners": _col(df, f"{side}_corners"),
         }))
@@ -243,8 +260,10 @@ def football_features(df: pd.DataFrame) -> pd.DataFrame:
     long["venue_ppg5"] = _roll_mean(long, ["team", "side"], ["pts"], 5, 5)["pts"].to_numpy()
     long["rest_days"] = long.groupby("team", sort=False)["date"].diff().dt.days.clip(upper=30)
     season = long.groupby(["team", "div", "season"], sort=False)
-    played = season.cumcount()
-    long["sppg"] = ((season["pts"].cumsum() - long["pts"]) / played).where(played >= 3)
+    done = long["pts"].notna().astype(float)
+    tot = long.assign(_d=done, _p=long["pts"].fillna(0)).groupby(["team", "div", "season"], sort=False)[["_d", "_p"]].cumsum()
+    played = tot["_d"] - done
+    long["sppg"] = ((tot["_p"] - long["pts"].fillna(0)) / played).where(played >= 3)
     long["pos"] = _table_positions(long)
     out = pd.DataFrame({"match_id": df["match_id"]})
     for side in ("home", "away"):
@@ -456,7 +475,8 @@ def tennis_features(df: pd.DataFrame) -> pd.DataFrame:
         sides.append(pd.DataFrame({
             "match_id": df["match_id"], "side": a, "player": df[f"{a}_name"], "opponent": df[f"{b}_name"],
             "date": pd.to_datetime(df["match_date"]), "round_order": _col(df, "round_order"),
-            "surface": df["surface"].fillna("-") if "surface" in df.columns else "-", "won": won,
+            "surface": df["surface"].fillna("-") if "surface" in df.columns else "-",
+            "won": np.where(df["is_future"].fillna(False).astype(bool), np.nan, won) if "is_future" in df.columns else won,
             "svpt": _col(df, f"{x}_svpt"), "sv_won": _col(df, f"{x}_1stWon") + _col(df, f"{x}_2ndWon"),
             "ace": _col(df, f"{x}_ace"), "dfault": _col(df, f"{x}_df"),
             "o_svpt": _col(df, f"{y}_svpt"), "o_sv_won": _col(df, f"{y}_1stWon") + _col(df, f"{y}_2ndWon"),
@@ -473,8 +493,7 @@ def tennis_features(df: pd.DataFrame) -> pd.DataFrame:
     long["rest_days"] = rest.where(rest > 0).clip(upper=60)  # 0 = data del match non nota (solo data torneo)
     recent = long.set_index("date").groupby("player", sort=False)["won"].rolling("14D", closed="left", min_periods=0).count()
     long["matches14"] = recent.to_numpy()
-    pair = long.groupby(["player", "opponent"], sort=False)["won"]
-    long["h2h_wins"] = pair.cumsum() - long["won"]
+    long["h2h_wins"] = long.assign(_w=long["won"].fillna(0)).groupby(["player", "opponent"], sort=False)["_w"].cumsum() - long["won"].fillna(0)
     sums = _roll_mean(long, "player", stat_cols, 10, 5)  # medie: i rapporti tra medie equivalgono ai rapporti tra somme
     long["srv_won10"] = (sums["sv_won"] / sums["svpt"]).to_numpy()
     long["ret_won10"] = (1 - sums["o_sv_won"] / sums["o_svpt"]).to_numpy()
@@ -525,6 +544,30 @@ def init_db(con: duckdb.DuckDBPyConnection) -> None:
     con.execute("CREATE TABLE IF NOT EXISTS meta (key VARCHAR PRIMARY KEY, value VARCHAR)")
 
 
+def canonicalize_tennis_names(con) -> int:
+    """Le fonti scrivono alcuni nomi in modi diversi ('Auger-Aliassime' / 'Auger Aliassime'): senza
+    unificarli lo stesso giocatore avrebbe form e precedenti spezzati. Per ogni giocatore vince la grafia
+    piu' usata nel circuito ATP (poi la piu' frequente in assoluto). Ritorna quanti nomi sono stati corretti."""
+    names = con.execute("""
+        SELECT name, sum((circuit = 'ATP')::int) AS atp, count(*) AS n FROM (
+            SELECT winner_name AS name, circuit FROM tennis_matches UNION ALL
+            SELECT loser_name, circuit FROM tennis_matches) GROUP BY 1""").df()
+    names = names[names["name"].notna()]
+    if names.empty:
+        return 0
+    names["key"] = names["name"].map(norm_key)
+    best = names.sort_values(["atp", "n", "name"], ascending=[False, False, True]).drop_duplicates("key").set_index("key")["name"]
+    names["canon"] = names["key"].map(best)
+    fix = names.loc[(names["name"] != names["canon"]) & (names["key"] != ""), ["name", "canon"]]
+    if fix.empty:
+        return 0
+    con.register("_fix", fix)
+    for col in ("winner_name", "loser_name"):
+        con.execute(f"UPDATE tennis_matches t SET {col} = f.canon FROM _fix f WHERE t.{col} = f.name")
+    con.unregister("_fix")
+    return len(fix)
+
+
 def refresh_features(con, sport: str = "all") -> None:
     """Ricalcola da zero tutte le feature pre-partita (non richiede download)."""
     if sport in ("all", "football"):
@@ -533,6 +576,7 @@ def refresh_features(con, sport: str = "all") -> None:
         if not df.empty:
             write_features(con, "football_matches", football_features(df))
     if sport in ("all", "tennis"):
+        canonicalize_tennis_names(con)
         df = con.execute("""SELECT match_id, match_date, round_order, surface, winner_name, loser_name,
                                    w_svpt, w_1stWon, w_2ndWon, w_ace, w_df, l_svpt, l_1stWon, l_2ndWon, l_ace, l_df
                             FROM tennis_matches""").df()
@@ -573,47 +617,70 @@ def write_features(con, table: str, feats: pd.DataFrame) -> None:
 
 
 # --------------------------------------------------------------------------- orchestrazione
+def refresh_window(today: date | None = None) -> tuple[int, int]:
+    """Quante stagioni calcio e quanti anni tennis riscaricare: di norma solo quelli in corso;
+    anche i precedenti nei mesi in cui possono ancora ricevere rettifiche."""
+    today = today or date.today()
+    return (2 if today.month in (6, 7, 8, 9) else 1), (2 if today.month in (1, 2) else 1)
+
+
 def update_football(con, full: bool, progress) -> dict:
     seasons = C.football_seasons()
-    current = set(seasons[-2:])  # stagione in corso + precedente (eventuali rettifiche)
+    current = set(seasons[-refresh_window()[0]:])
     have = {(d, s) for d, s in con.execute("SELECT DISTINCT div, season_start FROM football_matches").fetchall()}
-    stats = {"files": 0, "rows": 0, "dropped": 0, "outliers": 0, "missing": []}
+    stats = {"files": 0, "rows": 0, "dropped": 0, "outliers": 0, "missing": [], "changed": False}
+    ok = lambda b: b"Date" in b[:400] or b"Div" in b[:400]
+    todo = []
     for season in seasons:
         start = 2000 + int(season[:2])
         for div in C.FOOTBALL_LEAGUES:
-            progress(f"calcio {div} {season}")
             cache = C.RAW_DIR / "football" / f"{div}_{season}.csv"
             refresh = full or season in current
             if not refresh and cache.exists() and (div, start) in have:
                 continue  # stagione conclusa gia' caricata
-            raw, origin = fetch(cache, [C.FOOTBALL_URL.format(season=season, div=div)], refresh,
-                                lambda b: b"Date" in b[:400] or b"Div" in b[:400])
-            if raw is None:
-                stats["missing"].append(f"{div}_{season}")
-                continue
-            df, dropped = parse_football(raw, div, season)
-            replace_rows(con, "football_matches", df, "div = ? AND season_start = ?", [div, start])
-            stats["files"] += 1
-            stats["rows"] += len(df)
-            stats["dropped"] += dropped
-            stats["outliers"] += df.attrs.get("outliers", 0)
-    refresh_features(con, "football")
+            todo.append((div, season, start, cache, refresh))
+    fetched = parallel({(d, s): (lambda d=d, s=s, c=c, r=r: fetch(c, [C.FOOTBALL_URL.format(season=s, div=d)], r, ok))
+                        for d, s, _, c, r in todo})
+    for i, (div, season, start, cache, refresh) in enumerate(todo, 1):
+        progress(f"calcio {div} {season}", i, len(todo))
+        raw, origin, changed = fetched[(div, season)]
+        if raw is None:
+            stats["missing"].append(f"{div}_{season}")
+            continue
+        if not changed and not full and (div, start) in have:
+            continue  # file identico a quello gia' caricato
+        df, dropped = parse_football(raw, div, season)
+        replace_rows(con, "football_matches", df, "div = ? AND season_start = ?", [div, start])
+        stats["changed"] = True
+        stats["files"] += 1
+        stats["rows"] += len(df)
+        stats["dropped"] += dropped
+        stats["outliers"] += df.attrs.get("outliers", 0)
+    if stats["changed"] or needs_feature_refresh(con):
+        refresh_features(con, "football")
     return stats
 
 
-def _best_odds_file(year: int, refresh: bool) -> tuple[pd.DataFrame, str]:
+def _best_odds_file(year: int, refresh: bool) -> tuple[pd.DataFrame, str, bool]:
+    """Ritorna (quote, origine, cambiato)."""
     cache = C.RAW_DIR / "tennis" / f"odds_{year}.bin"
     ok = lambda b: len(b) > 2000 and (b[:2] == b"PK" or b[:4] == b"\xd0\xcf\x11\xe0" or b"Winner" in b[:400])
-    if cache.exists() and not refresh:
-        return parse_tennis_odds(cache.read_bytes()), "cache"
+    old = cache.read_bytes() if cache.exists() else None
+    if old is not None and not refresh:
+        return parse_tennis_odds(old), "cache", False
+
+    def keep(raw: bytes) -> bool:
+        if raw != old:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_bytes(raw)
+        return raw != old
+
     for url in C.TENNIS_ODDS_OFFICIAL:
         raw = http_get(url.format(year=year), retries=1)
         if raw is not None and ok(raw):
             df = parse_tennis_odds(raw)
             if not df.empty:
-                cache.parent.mkdir(parents=True, exist_ok=True)
-                cache.write_bytes(raw)
-                return df, "tennis-data.co.uk"
+                return df, "tennis-data.co.uk", keep(raw)
     best, best_raw, src = pd.DataFrame(), None, "non disponibile"
     for url in C.TENNIS_ODDS_MIRRORS:  # tra i mirror vince il file piu' completo
         raw = http_get(url.format(year=year))
@@ -621,31 +688,36 @@ def _best_odds_file(year: int, refresh: bool) -> tuple[pd.DataFrame, str]:
             df = parse_tennis_odds(raw)
             if len(df) > len(best):
                 best, best_raw, src = df, raw, "mirror " + url.split("/")[3]
-    if cache.exists():
-        cached = parse_tennis_odds(cache.read_bytes())
+    if old is not None:
+        cached = parse_tennis_odds(old)
         if len(cached) >= len(best):
-            return cached, "cache"
+            return cached, "cache", False
     if best_raw is not None:
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        cache.write_bytes(best_raw)
-    return best, src
+        return best, src, keep(best_raw)
+    return best, src, False
 
 
 def update_tennis(con, full: bool, progress) -> dict:
     years = C.tennis_years()
-    current = set(years[-2:])
+    current = set(years[-refresh_window()[1]:])
     have = {r[0] for r in con.execute("SELECT DISTINCT season FROM tennis_matches").fetchall()}
-    stats = {"years": 0, "rows": 0, "odds_rows": 0, "matched": 0, "notes": []}
+    stats = {"years": 0, "rows": 0, "odds_rows": 0, "matched": 0, "notes": [], "changed": False}
     is_csv = lambda b: b"winner_name" in b[:1500]
-    for year in years:
-        progress(f"tennis {year}")
-        refresh = full or year in current
-        raw_dir = C.RAW_DIR / "tennis"
-        if not refresh and year in have and (raw_dir / f"tour_{year}.csv").exists():
-            continue
-        t_raw, t_src = fetch(raw_dir / f"tour_{year}.csv", [u.format(year=year) for u in C.TENNIS_TOUR_SOURCES], refresh, is_csv)
-        c_raw, c_src = fetch(raw_dir / f"chall_{year}.csv", [u.format(year=year) for u in C.TENNIS_CHALL_SOURCES], refresh, is_csv)
-        odds, o_src = _best_odds_file(year, refresh)
+    raw_dir = C.RAW_DIR / "tennis"
+    todo = [(y, full or y in current) for y in years
+            if full or y in current or y not in have or not (raw_dir / f"tour_{y}.csv").exists()]
+
+    def download(year: int, refresh: bool):
+        return (fetch(raw_dir / f"tour_{year}.csv", [u.format(year=year) for u in C.TENNIS_TOUR_SOURCES], refresh, is_csv),
+                fetch(raw_dir / f"chall_{year}.csv", [u.format(year=year) for u in C.TENNIS_CHALL_SOURCES], refresh, is_csv),
+                _best_odds_file(year, refresh))
+
+    fetched = parallel({y: (lambda y=y, r=r: download(y, r)) for y, r in todo}, workers=4)
+    for i, (year, refresh) in enumerate(todo, 1):
+        progress(f"tennis {year}", i, len(todo))
+        (t_raw, t_src, t_new), (c_raw, c_src, c_new), (odds, o_src, o_new) = fetched[year]
+        if not (t_new or c_new or o_new) and not full and year in have:
+            continue  # nessun file cambiato
         tour = parse_sackmann(t_raw, "ATP") if t_raw else pd.DataFrame()
         chall = parse_sackmann(c_raw, "CHALLENGER") if c_raw else pd.DataFrame()
         df, info = build_tennis_year(year, tour, chall, odds)
@@ -653,6 +725,7 @@ def update_tennis(con, full: bool, progress) -> dict:
             stats["notes"].append(f"{year}: nessun dato disponibile")
             continue
         replace_rows(con, "tennis_matches", df, "season = ?", [year])
+        stats["changed"] = True
         stats["years"] += 1
         stats["rows"] += len(df)
         stats["odds_rows"] += info["odds"]
@@ -662,7 +735,8 @@ def update_tennis(con, full: bool, progress) -> dict:
             f"Challenger/quali {info['chall']} ({c_src.split('/')[3] if '/' in c_src else c_src}), "
             f"quote {info['odds']} ({o_src}), abbinate {info['matched']}"
         )
-    refresh_features(con, "tennis")
+    if stats["changed"] or needs_feature_refresh(con):
+        refresh_features(con, "tennis")
     return stats
 
 
@@ -687,20 +761,22 @@ def validate(con) -> list[str]:
 
 
 def run(sport: str = "all", full: bool = False, db_path: Path | None = None) -> dict:
+    """Aggiorna il database lavorando su una copia e sostituendo il file solo alla fine:
+    l'app puo' continuare a leggere i dati mentre l'aggiornamento e' in corso, e un
+    aggiornamento interrotto non lascia mai il database a meta'."""
     db_path = Path(db_path or C.DB_PATH)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    total = 0
-    if sport in ("all", "football"):
-        total += len(C.football_seasons()) * len(C.FOOTBALL_LEAGUES)
-    if sport in ("all", "tennis"):
-        total += len(C.tennis_years())
-    step = {"i": 0}
+    work = db_path.with_name(db_path.stem + ".aggiornamento.duckdb")
+    for leftover in (work, Path(str(work) + ".wal")):
+        if leftover.exists():
+            leftover.unlink()
+    if db_path.exists():
+        shutil.copy2(db_path, work)
 
-    def progress(label: str) -> None:
-        step["i"] += 1
-        log(f"PROGRESS {step['i']}/{total} {label}")
+    def progress(label: str, i: int, n: int) -> None:
+        log(f"PROGRESS {i}/{max(n, 1)} {label}")
 
-    con = duckdb.connect(str(db_path))
+    con = duckdb.connect(str(work))
     try:
         init_db(con)
         summary = {}
@@ -708,16 +784,28 @@ def run(sport: str = "all", full: bool = False, db_path: Path | None = None) -> 
             summary["football"] = update_football(con, full, progress)
         if sport in ("all", "tennis"):
             summary["tennis"] = update_tennis(con, full, progress)
+        if needs_feature_refresh(con):
+            refresh_features(con)
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         con.execute("INSERT OR REPLACE INTO meta VALUES ('last_update', ?)", [now])
+        summary["changed"] = any(summary.get(k, {}).get("changed") for k in ("football", "tennis"))
         summary["problems"] = validate(con)
         summary["counts"] = {
             "football": con.execute("SELECT count(*) FROM football_matches").fetchone()[0],
             "tennis": dict(con.execute("SELECT circuit, count(*) FROM tennis_matches GROUP BY 1").fetchall()),
             "tennis_with_odds": con.execute("SELECT count(*) FROM tennis_matches WHERE has_odds").fetchone()[0],
         }
+        con.execute("CHECKPOINT")
     finally:
         con.close()
+    for attempt in range(20):  # su Windows il file puo' essere momentaneamente aperto in lettura dall'app
+        try:
+            os.replace(work, db_path)
+            break
+        except PermissionError:
+            time.sleep(0.5)
+    else:
+        raise RuntimeError("impossibile sostituire il database: chiudi le altre finestre dell'app e riprova")
     return summary
 
 
@@ -731,15 +819,16 @@ def main() -> int:
     log("")
     if "football" in s:
         f = s["football"]
-        log(f"CALCIO  file elaborati: {f['files']}, righe caricate: {f['rows']}, righe scartate: {f['dropped']}, "
+        log(f"CALCIO  file aggiornati: {f['files']}, righe caricate: {f['rows']}, righe scartate: {f['dropped']}, "
             f"quote anomale annullate: {f['outliers']}")
         if f["missing"]:
             log(f"        non disponibili: {', '.join(f['missing'])}")
     if "tennis" in s:
         t = s["tennis"]
-        log(f"TENNIS  anni elaborati: {t['years']}, righe caricate: {t['rows']}, quote abbinate: {t['matched']}/{t['odds_rows']}")
+        log(f"TENNIS  anni aggiornati: {t['years']}, righe caricate: {t['rows']}, quote abbinate: {t['matched']}/{t['odds_rows']}")
         for n in t["notes"]:
             log("        " + n)
+    log("NOVITA' " + ("nuovi dati caricati" if s["changed"] else "nessuna: i dati erano gia' aggiornati"))
     log(f"TOTALI  {s['counts']}")
     log("VALIDAZIONE " + ("OK" if not s["problems"] else "PROBLEMI: " + "; ".join(s["problems"])))
     log(f"Completato in {time.time() - t0:.0f}s - {date.today()}")

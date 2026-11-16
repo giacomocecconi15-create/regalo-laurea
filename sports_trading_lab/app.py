@@ -4,8 +4,10 @@ Avvio:  streamlit run app.py   (oppure start_app.sh / start_app.bat)
 """
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
+import time
 from contextlib import closing
 from datetime import date
 from pathlib import Path
@@ -21,6 +23,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 from src import backtester as bt  # noqa: E402
 from src import config as C  # noqa: E402
+from src import fixtures as fx  # noqa: E402
 from src import ledger as lg  # noqa: E402
 from src import risk  # noqa: E402
 from src import roadmap as rm  # noqa: E402
@@ -60,25 +63,43 @@ PRESETS = {
         "filters": {"goals5": {"min": None, "max": 2.2}}},
 }
 
-st.set_page_config(page_title="Sports Trading Lab", page_icon=":material/monitoring:", layout="wide")
+ICON = ROOT / "assets" / "icon.png"
+st.set_page_config(page_title="Sports Trading Lab", page_icon=str(ICON) if ICON.exists() else ":material/monitoring:", layout="wide")
+if ICON.exists():
+    st.logo(str(ICON), size="large")
 st.markdown(f"""
 <style>
-.block-container {{padding-top:2.6rem; max-width:1500px;}}
-h1 {{font-size:1.55rem !important; font-weight:650 !important; margin-bottom:.1rem !important;}}
-h3 {{font-size:1.05rem !important; font-weight:600 !important;}}
-.brand {{font-size:.72rem; letter-spacing:.14em; text-transform:uppercase; color:{BLUE}; font-weight:600;}}
-.kpis {{display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin:.35rem 0 .6rem 0;}}
-.kpi {{background:{SURFACE}; border:1px solid {GRID}; border-left:3px solid var(--tone,{GRID}); border-radius:8px; padding:11px 14px 10px 14px;}}
-.kpi .l {{color:{MUTED}; font-size:.68rem; letter-spacing:.08em; text-transform:uppercase;}}
-.kpi .v {{color:{INK}; font-size:1.3rem; font-weight:600; font-variant-numeric:tabular-nums; line-height:1.5;}}
-.kpi .s {{color:{MUTED}; font-size:.72rem;}}
-.check {{display:flex; gap:10px; align-items:baseline; padding:7px 12px; border:1px solid {GRID}; border-radius:8px; margin-bottom:6px; background:{SURFACE};}}
-.check b {{color:{INK}; font-weight:600; min-width:230px; display:inline-block;}}
-.check span.d {{color:{INK2}; font-size:.86rem;}}
-.dot {{width:9px; height:9px; border-radius:50%; display:inline-block; flex:none; position:relative; top:-1px;}}
-.tag {{font-size:.68rem; letter-spacing:.06em; text-transform:uppercase; color:{MUTED}; min-width:74px;}}
-section[data-testid="stSidebar"] h3 {{margin-top:.6rem;}}
-div[data-testid="stExpander"] details {{border-color:{GRID};}}
+:root {{ --line:{GRID}; --surface:{SURFACE}; --ink:{INK}; --ink2:{INK2}; --muted:{MUTED}; --accent:{BLUE}; }}
+.stApp * {{ transition:none !important; }}
+html, body, .stApp {{ font-feature-settings:"tnum" 1; -webkit-font-smoothing:antialiased; }}
+.block-container {{ padding:2.4rem 2.6rem 4rem; max-width:1480px; }}
+header[data-testid="stHeader"] {{ background:transparent; }}
+section[data-testid="stSidebar"] {{ border-right:1px solid var(--line); }}
+section[data-testid="stSidebar"] [data-testid="stSidebarNav"] a {{ border-radius:8px; }}
+section[data-testid="stSidebar"] h3 {{ font-size:.7rem !important; letter-spacing:.12em; text-transform:uppercase; color:var(--muted);
+    font-weight:600 !important; margin:1.1rem 0 .2rem; padding-top:.9rem; border-top:1px solid var(--line); }}
+h1 {{ font-size:1.75rem !important; font-weight:680 !important; letter-spacing:-.022em; padding:0 0 .15rem !important; }}
+h3 {{ font-size:1.02rem !important; font-weight:620 !important; letter-spacing:-.01em; margin-top:1.1rem !important; }}
+.brand {{ font-size:.68rem; letter-spacing:.16em; text-transform:uppercase; color:var(--accent); font-weight:650; }}
+.kpis {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(158px,1fr)); gap:12px; margin:.5rem 0 .9rem; }}
+.kpi {{ position:relative; background:linear-gradient(180deg,#1e1e1d 0%,#181817 100%); border:1px solid var(--line); border-radius:12px;
+    padding:14px 16px 12px; }}
+.kpi::before {{ content:""; position:absolute; left:16px; right:16px; top:-1px; height:2px; border-radius:0 0 2px 2px; background:var(--tone,transparent); }}
+.kpi .l {{ color:var(--muted); font-size:.66rem; letter-spacing:.1em; text-transform:uppercase; font-weight:600; }}
+.kpi .v {{ color:var(--ink); font-size:1.5rem; font-weight:640; letter-spacing:-.02em; line-height:1.45; white-space:nowrap; }}
+.kpi .s {{ color:var(--muted); font-size:.74rem; line-height:1.3; }}
+.check {{ display:flex; gap:12px; align-items:baseline; padding:9px 14px; border:1px solid var(--line); border-radius:10px; margin-bottom:6px; background:var(--surface); }}
+.check b {{ color:var(--ink); font-weight:600; min-width:240px; display:inline-block; }}
+.check span.d {{ color:var(--ink2); font-size:.86rem; }}
+.dot {{ width:9px; height:9px; border-radius:50%; display:inline-block; flex:none; position:relative; top:-1px; }}
+.tag {{ font-size:.66rem; letter-spacing:.07em; text-transform:uppercase; color:var(--muted); min-width:82px; font-weight:600; }}
+.status {{ display:flex; gap:8px; align-items:center; color:var(--muted); font-size:.76rem; padding:.8rem 0 0; margin-top:1rem; border-top:1px solid var(--line); }}
+[data-testid="stPlotlyChart"] {{ border:1px solid var(--line); border-radius:12px; overflow:hidden; background:var(--surface); }}
+[data-testid="stDataFrame"] {{ border:1px solid var(--line); border-radius:10px; overflow:hidden; }}
+[data-testid="stExpander"] details {{ border-color:var(--line); border-radius:10px; }}
+[data-testid="stVerticalBlockBorderWrapper"] {{ border-radius:12px; }}
+[data-testid="stCaptionContainer"] {{ color:var(--muted); }}
+div[data-testid="stAlert"] {{ border-radius:10px; }}
 </style>
 """, unsafe_allow_html=True)
 ss = st.session_state
@@ -101,7 +122,7 @@ def apply_pending() -> None:
     cfg = ss.pop("_pending_cfg", None)
     if not cfg:
         return
-    for k in [k for k in ss.keys() if k.startswith("bt_") and k != "bt_bank"]:
+    for k in [k for k in ss.keys() if k.startswith("bt_") and k not in ("bt_bank", "bt_view")]:
         del ss[k]
     sport = cfg.get("sport", "tennis")
     market = cfg.get("market") or bt.MARKETS[sport][0]
@@ -190,6 +211,117 @@ def db_status(version: float) -> dict:
                              FROM football_matches GROUP BY 1, 2 ORDER BY 1, 2"""),
             "last": (con.execute("SELECT value FROM meta WHERE key = 'last_update'").fetchone() or ["mai"])[0],
         }
+
+
+UPDATE_LOG = C.DATA_DIR / "update.log"
+
+
+@st.cache_resource
+def _updater() -> dict:
+    """Stato condiviso dell'aggiornamento in background (uno solo per volta, per tutta l'app)."""
+    return {"proc": None, "handled": True, "code": None, "auto_checked_at": 0.0}
+
+
+def update_running() -> bool:
+    proc = _updater()["proc"]
+    return proc is not None and proc.poll() is None
+
+
+def start_update(full: bool = False) -> bool:
+    """Avvia l'aggiornamento senza bloccare l'app: lavora su una copia del database e la sostituisce alla fine."""
+    up = _updater()
+    if update_running():
+        return False
+    try:
+        C.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        out = open(UPDATE_LOG, "w", encoding="utf-8")
+        cmd = [sys.executable, str(ROOT / "src" / "update_data.py")] + (["--full"] if full else [])
+        up["proc"] = subprocess.Popen(cmd, cwd=ROOT, stdout=out, stderr=subprocess.STDOUT)
+        up["handled"], up["code"] = False, None
+        return True
+    except OSError:
+        return False
+
+
+def update_progress() -> tuple[float, str, list[str]]:
+    """(avanzamento 0-1, etichetta, ultime righe del log)."""
+    try:
+        lines = UPDATE_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return 0.0, "", []
+    frac, label = 0.0, "avvio..."
+    for line in reversed(lines):
+        if line.startswith("PROGRESS "):
+            try:
+                _, part, label = line.split(" ", 2)
+                i, n = (int(x) for x in part.split("/"))
+                frac = min(i / max(n, 1), 1.0)
+            except ValueError:
+                pass
+            break
+    return frac, label, [x for x in lines if x and not x.startswith("PROGRESS ")][-25:]
+
+
+def collect_update() -> None:
+    """Se un aggiornamento e' appena terminato, svuota le cache cosi' l'app legge i dati nuovi."""
+    up = _updater()
+    proc = up["proc"]
+    if proc is None or up["handled"] or proc.poll() is None:
+        return
+    up["handled"], up["code"] = True, proc.returncode
+    selections.clear()
+    db_status.clear()
+    ss.pop("_schema_ok", None)
+    ss.pop("_bt_key", None)
+    if proc.returncode == 0:
+        st.toast("Dati aggiornati.", icon=":material/check_circle:")
+    else:
+        st.toast("Aggiornamento dati non riuscito: dettagli nella pagina Dati.", icon=":material/error:")
+
+
+def last_update_time() -> pd.Timestamp | None:
+    if not db_ready():
+        return None
+    try:
+        raw = db_status(db_version())["last"]
+        return pd.to_datetime(raw.replace(" UTC", ""), errors="coerce", utc=True)
+    except Exception:
+        return None
+
+
+def auto_update() -> None:
+    """All'avvio (e poi al massimo una volta l'ora) aggiorna i dati se sono piu' vecchi della soglia scelta."""
+    up = _updater()
+    if time.time() - up["auto_checked_at"] < 3600 or update_running():
+        return
+    up["auto_checked_at"] = time.time()
+    cfg = fx.load_settings()
+    if not cfg.get("auto_update") or not db_ready():
+        return
+    last = last_update_time()
+    age_h = (pd.Timestamp.now(tz="UTC") - last).total_seconds() / 3600 if last is not None and pd.notna(last) else 1e9
+    if age_h >= float(cfg.get("auto_update_hours") or 12):
+        start_update()
+
+
+def data_badge() -> None:
+    """Riga di stato in fondo al pannello laterale; mentre l'aggiornamento gira si ricarica da sola."""
+    def body() -> None:
+        up = _updater()
+        if update_running():
+            frac, label, _ = update_progress()
+            st.markdown(f'<div class="status"><span class="dot" style="background:{BLUE}"></span>Aggiornamento dati... {frac * 100:.0f}%</div>',
+                        unsafe_allow_html=True)
+            return
+        if up["proc"] is not None and not up["handled"]:
+            st.rerun()
+        last = last_update_time()
+        when = last.tz_convert("Europe/Rome").strftime("%d/%m %H:%M") if last is not None and pd.notna(last) else "mai"
+        st.markdown(f'<div class="status"><span class="dot" style="background:{GOOD if when != "mai" else MUTED}"></span>Dati aggiornati: {when}</div>',
+                    unsafe_allow_html=True)
+
+    with st.sidebar:
+        st.fragment(body, run_every=3 if update_running() else None)()
 
 
 def need_db() -> bool:
@@ -341,7 +473,7 @@ def dd_hist_chart(results: list[tuple[str, dict, str]]) -> go.Figure:
 
 
 def show(fig: go.Figure) -> None:
-    st.plotly_chart(fig, width="stretch", theme=None, config={"displaylogo": False})
+    st.plotly_chart(fig, width="stretch", theme=None, config={"displayModeBar": False})
 
 
 # --------------------------------------------------------------------------- pagina: guida
@@ -369,9 +501,9 @@ i risultati si aggiornano da soli. *Azzera filtri* riporta tutto al punto di par
     with b:
         st.markdown("""
 ### 4 · Verifica che non sia fortuna
-- Scheda **Analisi**: il risultato scomposto per anno, fascia di quota, torneo, superficie... e l'elenco automatico
+- Vista **Analisi**: il risultato scomposto per anno, fascia di quota, torneo, superficie... e l'elenco automatico
   dei segmenti migliori e peggiori, che puoi aggiungere ai filtri con un clic.
-- Scheda **Robustezza**: sei controlli con esito *Superato / Incerto / Non superato* (campione, significatività,
+- Vista **Robustezza**: sei controlli con esito *Superato / Incerto / Non superato* (campione, significatività,
   intervallo di confidenza, CLV, tenuta sulle operazioni più recenti, costanza negli anni).
 
 Più filtri provi, più è facile trovare per caso una combinazione che ha reso bene in passato. Fidati di una
@@ -379,12 +511,12 @@ strategia solo se supera i controlli e ha una logica che sai spiegare.
 
 ### 5 · Dal test alla pratica
 - **Rischio**: simula 1.000 futuri possibili e confronta stake fisso e Kelly frazionario.
-- **Strategie**: salva le strategie valide, carica il CSV con le quote del giorno e ottieni i match che le
-  attivano con lo stake già calcolato sul tuo bankroll.
+- **Strategie**: salva le strategie valide, poi scarica con un clic le partite in programma (calcio) e ottieni
+  i match che le attivano, con lo stake già calcolato sul tuo bankroll.
 - **Registro**: annota le giocate reali (o importale dallo scanner), tieni i saldi dei conti e confronta
   ROI e CLV reali con quelli del backtest.
 - **Roadmap 2027**: il piano dell'anno per trimestri, con lo stato di ogni passo.
-- **Dati**: aggiorna il database quando vuoi (pulsante *Aggiorna Database*).
+- **Dati**: il database si aggiorna da solo all'apertura dell'app; puoi anche farlo a mano con *Aggiorna ora*.
 """)
     st.info("Limiti dei dati: le quote tennis esistono solo per il circuito ATP (non per i Challenger) e sono una sola "
             "rilevazione per match; le quote pre-match del calcio sono rilevate qualche giorno prima della partita. "
@@ -392,26 +524,68 @@ strategia solo se supera i controlli e ha una logica che sai spiegare.
 
 
 # --------------------------------------------------------------------------- pagina: dati
+def update_panel() -> None:
+    running = update_running()
+
+    def body() -> None:
+        up = _updater()
+        if update_running():
+            frac, label, _ = update_progress()
+            st.progress(frac, text=f"Aggiornamento in corso: {label}")
+            st.caption("Puoi continuare a usare l'app: i dati nuovi compaiono appena l'aggiornamento finisce.")
+            return
+        if up["proc"] is not None and not up["handled"]:
+            st.rerun()
+        if up["code"] is not None:
+            _, _, tail = update_progress()
+            news = next((x for x in tail if x.startswith("NOVITA'")), "")
+            if up["code"] == 0:
+                st.success("Aggiornamento completato" + (": " + news.replace("NOVITA' ", "") if news else "") + ".")
+            else:
+                st.error("L'aggiornamento ha segnalato problemi: controlla il dettaglio qui sotto.")
+            with st.expander("Dettaglio dell'ultimo aggiornamento"):
+                st.code("\n".join(tail) or "(nessun output)", language="text")
+
+    with st.container(border=True):
+        a, b, c = st.columns([1.2, 1.2, 3])
+        if a.button("Aggiorna ora", type="primary", icon=":material/sync:", disabled=running, width="stretch"):
+            start_update()
+            st.rerun()
+        if b.button("Riscarica tutto", icon=":material/cloud_download:", disabled=running, width="stretch",
+                    help="Ignora i file già scaricati e ricostruisce l'intero storico. Serve solo se sospetti dati corrotti."):
+            start_update(full=True)
+            st.rerun()
+        cfg = fx.load_settings()
+        hours = {6: "ogni 6 ore", 12: "ogni 12 ore", 24: "una volta al giorno"}
+        with c:
+            x, y = st.columns([1.3, 1])
+            auto = x.toggle("Aggiorna da solo all'apertura dell'app", value=bool(cfg.get("auto_update")))
+            freq = y.selectbox("Frequenza", list(hours), index=list(hours).index(int(cfg.get("auto_update_hours") or 12))
+                               if int(cfg.get("auto_update_hours") or 12) in hours else 1, format_func=hours.get,
+                               label_visibility="collapsed", disabled=not auto)
+        if auto != bool(cfg.get("auto_update")) or freq != int(cfg.get("auto_update_hours") or 12):
+            fx.save_settings({"auto_update": auto, "auto_update_hours": freq})
+        st.fragment(body, run_every=1 if running else None)()
+
+
 def page_data() -> None:
     header("Dati", "Stato del database e aggiornamento degli storici.")
     if db_ready():
         s = db_status(db_version())
         t = s["tennis"].set_index("circuit")
         n = lambda c: int(t["match"].get(c, 0))
-        kpis([("Match ATP", num_it(n("ATP")), f"{int(t['con_quote'].get('ATP', 0)):,} con quote".replace(",", "."), None),
-              ("Match Challenger", num_it(n("CHALLENGER")), "senza quote", None),
-              ("Qualificazioni ATP", num_it(n("ATP_QUALI")), "senza quote", None),
+        last = last_update_time()
+        when = last.tz_convert("Europe/Rome").strftime("%d/%m/%Y %H:%M") if last is not None and pd.notna(last) else "mai"
+        kpis([("Match ATP", num_it(n("ATP")), f"{num_it(int(t['con_quote'].get('ATP', 0)))} con quote", None),
+              ("Match Challenger", num_it(n("CHALLENGER")), "per form e precedenti", None),
+              ("Qualificazioni ATP", num_it(n("ATP_QUALI")), "per form e precedenti", None),
               ("Match Calcio", num_it(int(s["football"]["match"].sum())), f"{len(s['football'])} campionati", None),
-              ("Ultimo aggiornamento", s["last"].replace(" UTC", ""), f"{C.DB_PATH.stat().st_size / 1e6:.0f} MB su disco", None)])
+              ("Ultimo aggiornamento", when, f"{C.DB_PATH.stat().st_size / 1e6:.0f} MB su disco", None)])
     else:
-        st.info("Nessun database presente: premi il pulsante per scaricare gli storici.")
-
-    with st.container(border=True):
-        a, b = st.columns([1, 3])
-        full = b.checkbox("Riscarica tutto da zero (ignora la cache dei file già scaricati)", value=False)
-        if a.button("Aggiorna Database", type="primary", icon=":material/sync:"):
-            run_update(full)
-
+        st.info("Nessun database presente: premi *Aggiorna ora* per scaricare gli storici (un paio di minuti la prima volta).")
+    update_panel()
+    st.caption("L'aggiornamento scarica solo i file della stagione in corso, in parallelo, e ricarica nel database soltanto quelli "
+               "cambiati: di norma dura pochi secondi. Lavora su una copia e la sostituisce alla fine, quindi non blocca l'app.")
     if db_ready():
         s = db_status(db_version())
         st.subheader("Tennis")
@@ -422,35 +596,6 @@ def page_data() -> None:
         st.dataframe(pivot, width="stretch")
         st.subheader("Calcio")
         st.dataframe(s["football"], hide_index=True, width="stretch")
-
-
-def run_update(full: bool) -> None:
-    cmd = [sys.executable, str(ROOT / "src" / "update_data.py")] + (["--full"] if full else [])
-    bar = st.progress(0.0, text="Avvio aggiornamento...")
-    tail: list[str] = []
-    try:
-        proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-        for line in proc.stdout:
-            line = line.rstrip()
-            if line.startswith("PROGRESS "):
-                _, frac, label = line.split(" ", 2)
-                i, n = (int(x) for x in frac.split("/"))
-                bar.progress(min(i / n, 1.0), text=f"{label}  ({i}/{n})")
-            elif line:
-                tail.append(line)
-        code = proc.wait()
-    except OSError as exc:
-        st.error(f"Impossibile avviare l'aggiornamento: {exc}")
-        return
-    st.cache_resource.clear()
-    st.cache_data.clear()
-    ss.pop("_schema_ok", None)
-    if code == 0:
-        bar.progress(1.0, text="Aggiornamento completato")
-        st.success("Database aggiornato e validato.")
-    else:
-        st.error("L'aggiornamento ha segnalato problemi: controlla il log qui sotto.")
-    st.code("\n".join(tail[-40:]) or "(nessun output)", language="text")
 
 
 # --------------------------------------------------------------------------- pagina: backtester
@@ -666,7 +811,9 @@ def tab_analysis(cfg: dict, trades: pd.DataFrame) -> None:
                "Le due colonne finali mostrano se il risultato regge in entrambe le metà del periodo.")
     c1, c2 = st.columns([1, 3])
     min_n = c1.number_input("Operazioni minime per segmento", 20, 5000, 100, 10)
-    scan = bt.segment_scan(trades, sport, int(min_n))
+    if ss.get("_bt_scan", (None,))[0] != int(min_n):
+        ss["_bt_scan"] = (int(min_n), bt.segment_scan(trades, sport, int(min_n)))
+    scan = ss["_bt_scan"][1]
     if scan.empty:
         st.info("Nessun segmento con abbastanza operazioni: abbassa la soglia.")
         return
@@ -681,7 +828,7 @@ def tab_analysis(cfg: dict, trades: pd.DataFrame) -> None:
         queue_cfg(new)
         st.rerun()
     st.caption(":material/warning: Scegliere a posteriori il segmento migliore gonfia il risultato: dopo averlo applicato "
-               "controlla la scheda Robustezza, e diffida dei segmenti che vanno bene in una sola metà del periodo.")
+               "controlla la vista Robustezza, e diffida dei segmenti che vanno bene in una sola metà del periodo.")
 
 
 def tab_robustness(cfg: dict, res: bt.BacktestResult, sel_args: tuple, bank: float) -> None:
@@ -739,6 +886,9 @@ def tab_trades(cfg: dict, trades: pd.DataFrame) -> None:
                        file_name=f"operazioni_{cfg['sport']}_{date.today():%Y%m%d}.csv", mime="text/csv", icon=":material/download:")
 
 
+VIEWS = ["Riepilogo", "Analisi", "Robustezza", "Operazioni", "Salva"]
+
+
 def page_backtester() -> None:
     header("Backtester")
     if need_db():
@@ -746,23 +896,29 @@ def page_backtester() -> None:
     cfg = sidebar_config()
     args = (cfg["sport"], cfg["market"], cfg["price"], cfg["price_timing"])
     bank = float(ss.get("bt_bank", 100.0))
-    res = bt.backtest_selections(selections(*args, db_version()), cfg, bank)
+    key = json.dumps([cfg, bank, db_version()], sort_keys=True, default=str)
+    if ss.get("_bt_key") != key:  # ricalcola solo quando cambia la strategia, non a ogni cambio di vista
+        ss["_bt_res"] = bt.backtest_selections(selections(*args, db_version()), cfg, bank)
+        ss["_bt_key"] = key
+        ss.pop("_bt_scan", None)
+    res = ss["_bt_res"]
     ss["last"] = {"cfg": cfg, "metrics": res.metrics, "trades": res.trades}
     st.caption(describe(cfg))
     if res.metrics["trades"] == 0:
         st.warning("Nessun match soddisfa i filtri selezionati: allarga i criteri nel pannello laterale o premi *Azzera*.")
         return
-    t1, t2, t3, t4, t5 = st.tabs(["Riepilogo", "Analisi", "Robustezza", "Operazioni", "Salva"])
-    with t1:
+    ss.setdefault("bt_view", VIEWS[0])
+    view = st.segmented_control("Vista", VIEWS, key="bt_view", label_visibility="collapsed") or VIEWS[0]
+    if view == "Riepilogo":
         tab_summary(cfg, res, bank)
-    with t2:
+    elif view == "Analisi":
         tab_analysis(cfg, res.trades)
-    with t3:
+    elif view == "Robustezza":
         tab_robustness(cfg, res, args, bank)
-    with t4:
+    elif view == "Operazioni":
         tab_trades(cfg, res.trades)
-    with t5:
-        st.caption("Salva la strategia per ritrovarla nella pagina Strategie e usarla nello scanner delle quote del giorno.")
+    else:
+        st.caption("Salva la strategia per ritrovarla nella pagina Strategie e usarla nello scanner delle partite in programma.")
         save_form("save_bt")
 
 
@@ -842,39 +998,84 @@ def page_vault() -> None:
         chosen = a.selectbox("Strategia", list(vault), index=None, placeholder="scegli una strategia...", label_visibility="collapsed")
         if b.button("Apri nel Backtester", disabled=chosen is None, icon=":material/open_in_new:", width="stretch"):
             queue_cfg(vault[chosen].get("config", {}))
+            ss["bt_view"] = VIEWS[0]
             st.switch_page(PAGES["backtester"])
         if c.button("Elimina", disabled=chosen is None, icon=":material/delete:", width="stretch"):
             sv.delete_strategy(chosen)
             st.rerun()
     else:
-        st.info("Nessuna strategia salvata. Testa una strategia nel Backtester e salvala dalla scheda *Salva*.")
+        st.info("Nessuna strategia salvata. Testa una strategia nel Backtester e salvala dalla vista *Salva*.")
     with st.expander("Salva l'ultima strategia testata", expanded=False):
         if ss.get("last"):
             st.caption(describe(ss["last"]["cfg"]))
         save_form("save_vault")
 
-    st.subheader("Scanner delle quote del giorno")
-    c = st.columns([2, 1, 1, 1])
-    upload = c[0].file_uploader("CSV con le quote del giorno", type=["csv"])
-    bankroll = c[1].number_input("Bankroll", 1.0, 1e9, 1000.0, 100.0)
-    method = c[2].radio("Staking", ["flat", "kelly"], format_func={"flat": "Stake fisso", "kelly": "Kelly frazionario"}.get)
-    if method == "flat":
-        flat_pct, kf, cap = c[3].number_input("Stake (% banca)", 0.1, 25.0, 1.0, 0.1), 0.25, 5.0
+    st.subheader("Scanner delle partite in programma")
+    sources = {"football": "Calcio - partite in programma", "tennis": "Tennis - quote ATP", "csv": "File CSV"}
+    source = st.segmented_control("Sorgente", list(sources), format_func=sources.get, default="football",
+                                  label_visibility="collapsed") or "football"
+    df = None
+    if source == "football":
+        a, b, c = st.columns([1.4, 1.2, 3])
+        book = a.selectbox("Quote da usare", ["avg", "max", "b365", "bfe"], format_func=bt.BOOK_LABELS.get)
+        a.caption("Fonte: football-data.co.uk, gratuita e senza registrazione.")
+        b.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
+        if b.button("Scarica le partite", type="primary", icon=":material/download:", width="stretch"):
+            with st.spinner("Scarico le partite in programma..."):
+                got, msg = fx.fetch_football_fixtures(book)
+            ss["scan_football"] = (got, msg, book, pd.Timestamp.now().strftime("%d/%m %H:%M"))
+        if "scan_football" in ss:
+            got, msg, used, when = ss["scan_football"]
+            if msg:
+                st.warning(msg)
+            if len(got):
+                df = got
+                covered = int(got["div"].isin(C.FOOTBALL_LEAGUES).sum())
+                c.caption(f"{len(got)} partite scaricate alle {when} (quote: {bt.BOOK_LABELS[used]}), di cui {covered} nei campionati "
+                          "presenti nel database. Classifica, form, tiri e riposo vengono calcolati dallo storico.")
+    elif source == "tennis":
+        cfg = fx.load_settings()
+        a, b, c = st.columns([2, 1.2, 1.2])
+        api_key = a.text_input("Chiave di The Odds API", value=cfg.get("odds_api_key", ""), type="password",
+                               help="Piano gratuito: 500 crediti al mese, registrazione su the-odds-api.com. Ogni torneo scaricato costa 1 credito.")
+        book = b.selectbox("Quote da usare", ["avg", "max", "ps"], format_func=bt.BOOK_LABELS.get)
+        c.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
+        if c.button("Scarica le quote", type="primary", icon=":material/download:", width="stretch"):
+            if api_key != cfg.get("odds_api_key", ""):
+                fx.save_settings({"odds_api_key": api_key.strip()})
+            with st.spinner("Scarico le quote ATP..."):
+                got, msg = fx.fetch_tennis_odds(api_key, book)
+            ss["scan_tennis"] = (got, msg, pd.Timestamp.now().strftime("%d/%m %H:%M"))
+        st.caption("Per il tennis non esiste una fonte gratuita senza registrazione: questa richiede una chiave personale gratuita. "
+                   "In alternativa usa un file CSV.")
+        if "scan_tennis" in ss:
+            got, msg, when = ss["scan_tennis"]
+            if msg:
+                (st.caption if len(got) else st.warning)(msg)
+            if len(got):
+                df = got
     else:
-        kf = c[3].selectbox("Frazione", [0.125, 0.25, 0.5], index=1, format_func=lambda x: f"{x:g} Kelly")
-        flat_pct, cap = 1.0, c[3].number_input("Tetto (%)", 0.5, 25.0, 5.0, 0.5)
-    t1, t2, _ = st.columns([1, 1, 3])
-    t1.download_button("Modello CSV tennis", sv.TENNIS_TEMPLATE.to_csv(index=False).encode(), "quote_tennis_modello.csv", "text/csv")
-    t2.download_button("Modello CSV calcio", sv.FOOTBALL_TEMPLATE.to_csv(index=False).encode(), "quote_calcio_modello.csv", "text/csv")
-    if upload is None:
-        st.caption("Scarica un modello, compilalo con i match e le quote di oggi e caricalo qui. Colonne minime - tennis: player1, "
-                   "player2, odds1, odds2; calcio: home_team, away_team, odds_home, odds_draw, odds_away. Ranking e form mancanti "
-                   "vengono letti dal database se i nomi coincidono con quelli storici; i filtri su dati assenti vengono segnalati.")
-        return
-    try:
-        df = pd.read_csv(upload, sep=None, engine="python")
-    except Exception as exc:  # file malformato
-        st.error(f"Impossibile leggere il CSV: {exc}")
+        upload = st.file_uploader("CSV con le quote del giorno", type=["csv"])
+        t1, t2, _ = st.columns([1, 1, 3])
+        t1.download_button("Modello CSV tennis", sv.TENNIS_TEMPLATE.to_csv(index=False).encode(), "quote_tennis_modello.csv", "text/csv")
+        t2.download_button("Modello CSV calcio", sv.FOOTBALL_TEMPLATE.to_csv(index=False).encode(), "quote_calcio_modello.csv", "text/csv")
+        st.caption("Colonne minime - tennis: player1, player2, odds1, odds2; calcio: home_team, away_team, odds_home, odds_draw, odds_away. "
+                   "Le altre variabili vengono calcolate dallo storico se i nomi coincidono con quelli del database.")
+        if upload is not None:
+            try:
+                df = pd.read_csv(upload, sep=None, engine="python")
+            except Exception as exc:  # file malformato
+                st.error(f"Impossibile leggere il CSV: {exc}")
+                return
+    c = st.columns([1, 1, 1, 2])
+    bankroll = c[0].number_input("Bankroll", 1.0, 1e9, 1000.0, 100.0)
+    method = c[1].radio("Staking", ["flat", "kelly"], format_func={"flat": "Stake fisso", "kelly": "Kelly frazionario"}.get)
+    if method == "flat":
+        flat_pct, kf, cap = c[2].number_input("Stake (% banca)", 0.1, 25.0, 1.0, 0.1), 0.25, 5.0
+    else:
+        kf = c[2].selectbox("Frazione", [0.125, 0.25, 0.5], index=1, format_func=lambda x: f"{x:g} Kelly")
+        flat_pct, cap = 1.0, c[2].number_input("Tetto (%)", 0.5, 25.0, 5.0, 0.5)
+    if df is None:
         return
     if not vault:
         st.warning("Salva almeno una strategia per poter generare segnali.")
@@ -1211,7 +1412,9 @@ def page_roadmap() -> None:
 
 
 # --------------------------------------------------------------------------- navigazione
+collect_update()
 ensure_schema()
+auto_update()
 PAGES = {
     "backtester": st.Page(page_backtester, title="Backtester", icon=":material/query_stats:", url_path="backtester", default=True),
     "risk": st.Page(page_risk, title="Rischio", icon=":material/casino:", url_path="risk"),
@@ -1222,3 +1425,4 @@ PAGES = {
     "guide": st.Page(page_guide, title="Guida", icon=":material/help:", url_path="guide"),
 }
 st.navigation(list(PAGES.values())).run()
+data_badge()

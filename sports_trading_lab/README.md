@@ -26,7 +26,7 @@ Uso manuale:
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python src/update_data.py        # scarica / aggiorna il database
-.venv/bin/python -m pytest tests -q        # 41 test
+.venv/bin/python -m pytest tests -q        # 48 test
 .venv/bin/python -m streamlit run app.py   # dashboard
 ```
 
@@ -41,6 +41,8 @@ src/risk.py            Monte Carlo: stake fisso vs Kelly frazionario
 src/strategies.py      Strategy Vault (strategies.json) e Pre-Match Scanner
 src/ledger.py          gestionale: conti, movimenti e registro delle giocate reali
 src/roadmap.py         roadmap 2027 (voci predefinite e stato salvato)
+src/fixtures.py        partite in programma con quote (calcio gratis, tennis con chiave gratuita) e impostazioni
+assets/                icona dell'app
 crea_app_mac.sh        crea l'app da doppio clic per Mac
 tests/test_engine.py   test dei calcoli, dei parser e dell'integrità del database
 data/trading_db.duckdb database (generato, non versionato)   data/raw/  cache dei file scaricati
@@ -65,9 +67,22 @@ Variabili pre-partita calcolate senza look-ahead (usano solo i match precedenti)
 Se il database è stato creato da una versione precedente, l'app aggiunge le colonne nuove e ricalcola le
 variabili da sola al primo avvio, senza riscaricare nulla.
 
-**Aggiornamento incrementale.** Le stagioni concluse restano in cache e non vengono riscaricate; le ultime due vengono
-riscaricate e sostituite in modo atomico (delete + insert per stagione). Un indice `UNIQUE` su `match_id` impedisce i
-duplicati. `--full` forza il riscaricamento completo, `--sport tennis|football` limita lo sport.
+**Aggiornamento.** Automatico all'apertura dell'app quando i dati hanno più di 12 ore (regolabile o disattivabile
+nella pagina Dati), oppure a mano con *Aggiorna ora*. Gira in background senza bloccare l'app: lavora su una copia del
+database e la sostituisce solo a fine lavoro, quindi un aggiornamento interrotto non lascia mai i dati a metà.
+Scarica in parallelo soltanto la stagione in corso e ricarica nel database solo i file davvero cambiati: di norma
+pochi secondi. Un indice `UNIQUE` su `match_id` impedisce i duplicati. Da riga di comando: `--full` forza il
+riscaricamento completo, `--sport tennis|football` limita lo sport.
+
+**Partite in programma (gratis).** Lo scanner scarica con un clic `fixtures.csv` di football-data.co.uk: le partite
+dei prossimi giorni con quote 1X2, Over/Under 2.5 e handicap asiatico, senza registrazione. Classifica, form, tiri,
+angoli e riposo delle squadre vengono calcolati dallo storico con lo stesso codice del backtest, quindi i filtri di
+una strategia salvata si applicano alle partite future esattamente come nel test. Per il tennis non esiste una fonte
+gratuita senza registrazione: è integrata The Odds API (piano gratuito da 500 crediti al mese, chiave personale;
+un credito per torneo), oppure si carica un CSV.
+
+**Nomi dei giocatori.** Le fonti scrivono alcuni nomi in modo diverso ("Auger-Aliassime" / "Auger Aliassime"):
+vengono unificati al caricamento, altrimenti form e precedenti dello stesso giocatore risulterebbero spezzati.
 
 **Pulizia.** Encoding misti e BOM, date in due formati, righe malformate, quote ≤ 1 annullate, risultati incoerenti
 con i gol scartati. Le quote incoerenti col consenso degli altri bookmaker (refusi nei file originali, prezzi exchange
@@ -118,10 +133,12 @@ curve, rendimenti mensili. Ogni operazione rischia 1 unità.
    - *Robustezza*: sei controlli (campione, significatività, intervallo di confidenza del ROI, CLV, tenuta
      fuori campione, costanza negli anni), confronto studio/verifica, anno per anno, confronto tra bookmaker.
    - *Operazioni*: tabella esportabile in CSV.  *Salva*: archivia la strategia.
+
+   Ogni vista viene calcolata solo quando la apri, e il backtest si ricalcola solo se cambia la strategia.
 2. **Rischio** – 1.000 simulazioni bootstrap su 500/1.000 operazioni: stake fisso vs Kelly frazionario,
    risk of ruin, distribuzione del drawdown.
-3. **Strategie** – archivio in `strategies.json` (riapribili nel Backtester) e scanner: carica un CSV con le
-   quote del giorno e ottieni i segnali con lo stake calcolato sul bankroll. I modelli CSV si scaricano dalla pagina.
+3. **Strategie** – archivio in `strategies.json` (riapribili nel Backtester) e scanner delle partite in programma:
+   calcio scaricato con un clic, tennis con chiave gratuita o da CSV; segnali con lo stake calcolato sul bankroll.
 4. **Registro** – gestionale delle giocate reali: conti per bookmaker/exchange con depositi e prelievi, giocate
    aperte e chiuse (anche importate dai segnali dello scanner), saldo e disponibile, ROI e CLV reali confrontati
    con quelli del backtest per strategia. I dati stanno in `data/gestionale.duckdb`, separato dagli storici.

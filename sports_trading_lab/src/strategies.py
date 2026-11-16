@@ -20,6 +20,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src import backtester as bt  # noqa: E402
 from src import config as C  # noqa: E402
+from src import update_data as ud  # noqa: E402
 
 TENNIS_REQUIRED = ["player1", "player2", "odds1", "odds2"]
 FOOTBALL_REQUIRED = ["home_team", "away_team", "odds_home", "odds_draw", "odds_away"]
@@ -139,54 +140,193 @@ def _col(df: pd.DataFrame, name: str, numeric: bool = False) -> pd.Series:
     return pd.Series(np.nan, index=df.index, dtype="float64" if numeric else object)
 
 
+def _season_start(dates: pd.Series) -> pd.Series:
+    return (dates.dt.year - (dates.dt.month < 7).astype(int)).astype("Int64")
+
+
+def upcoming_football_features(con, home: pd.Series, away: pd.Series, div: pd.Series, dates: pd.Series) -> pd.DataFrame:
+    """Variabili pre-partita delle partite in programma, calcolate con lo stesso codice del backtest:
+    le partite future vengono accodate allo storico come righe senza risultato."""
+    start = _season_start(dates)
+    first = int(start.min()) - 1 if start.notna().any() else 0
+    hist = con.execute("""SELECT match_id, div, season_start, home_team, away_team, match_date, ftr, fthg, ftag,
+                                 home_sot, away_sot, home_corners, away_corners
+                          FROM football_matches WHERE season_start >= ?""", [first]).df()
+    future = pd.DataFrame({
+        "match_id": ["__up" + str(i) for i in range(len(home))], "div": div.to_numpy(), "season_start": start.to_numpy(),
+        "home_team": home.to_numpy(), "away_team": away.to_numpy(), "match_date": dates.to_numpy(),
+        "ftr": None, "fthg": np.nan, "ftag": np.nan, "home_sot": np.nan, "away_sot": np.nan,
+        "home_corners": np.nan, "away_corners": np.nan,
+    })
+    future = future[future["match_date"].notna() & future["div"].notna()]
+    if future.empty:
+        return pd.DataFrame(index=range(len(home)))
+    # una partita del file gia' presente nello storico (appena giocata) non va accodata: si usa la sua riga
+    key = lambda d: d["home_team"].astype(str) + "|" + d["away_team"].astype(str) + "|" + pd.to_datetime(d["match_date"]).dt.strftime("%Y%m%d")
+    known = dict(zip(key(hist), hist["match_id"]))
+    future["_known"] = key(future).map(known)
+    todo = future[future["_known"].isna()].drop(columns="_known")
+    feats = ud.football_features(pd.concat([hist, todo], ignore_index=True)).set_index("match_id")
+    ids = future.set_index("match_id")["_known"].fillna(pd.Series(future["match_id"].to_numpy(), index=future["match_id"].to_numpy()))
+    order = pd.Series(["__up" + str(i) for i in range(len(home))]).map(ids)
+    return feats.reindex(order.to_numpy()).reset_index(drop=True)
+
+
+def upcoming_tennis_features(con, p1: pd.Series, p2: pd.Series, surface: pd.Series, dates: pd.Series) -> pd.DataFrame:
+    """Come sopra per il tennis: player1 nel ruolo 'winner', player2 nel ruolo 'loser' (solo come etichette)."""
+    hist = con.execute("""SELECT match_id, match_date, round_order, surface, winner_name, loser_name,
+                                 w_svpt, w_1stWon, w_2ndWon, w_ace, w_df, l_svpt, l_1stWon, l_2ndWon, l_ace, l_df
+                          FROM tennis_matches""").df()
+    hist["is_future"] = False
+    ids = ["__up" + str(i) for i in range(len(p1))]
+    future = pd.DataFrame({"match_id": ids, "match_date": dates.to_numpy(), "round_order": 99.0,
+                           "surface": surface.to_numpy(), "winner_name": p1.to_numpy(), "loser_name": p2.to_numpy(),
+                           "is_future": True})
+    future = future[future["match_date"].notna()]
+    if future.empty:
+        return pd.DataFrame(index=range(len(p1)))
+    # un match del file gia' presente nello storico (appena giocato) non va accodato: si usa la sua riga,
+    # scambiando i ruoli se nel database il vincitore e' player2
+    h = hist.assign(_d=pd.to_datetime(hist["match_date"]))
+    f = future.assign(_d=pd.to_datetime(future["match_date"]))
+    straight = f.merge(h, on=["winner_name", "loser_name"], suffixes=("", "_h"))
+    swapped = f.merge(h, left_on=["winner_name", "loser_name"], right_on=["loser_name", "winner_name"], suffixes=("", "_h"))
+    near = lambda m: m[(m["_d"] - m["_d_h"]).dt.days.abs() <= 1].drop_duplicates("match_id")
+    straight, swapped = near(straight), near(swapped)
+    done = set(straight["match_id"]) | set(swapped["match_id"])
+    feats = ud.tennis_features(pd.concat([hist, future[~future["match_id"].isin(done)]], ignore_index=True)).set_index("match_id")
+    out = feats.reindex(ids)
+    if len(straight):
+        out.loc[straight["match_id"].to_numpy()] = feats.reindex(straight["match_id_h"].to_numpy()).to_numpy()
+    if len(swapped):
+        flip = [c.replace("winner_", "#").replace("loser_", "winner_").replace("#", "loser_") for c in feats.columns]
+        out.loc[swapped["match_id"].to_numpy()] = feats.reindex(swapped["match_id_h"].to_numpy())[flip].to_numpy()
+    return out.reset_index(drop=True)
+
+
+def tennis_player_profiles(con) -> pd.DataFrame:
+    """Ultimi dati anagrafici e di ranking noti per giocatore."""
+    return con.execute("""
+        WITH long AS (
+            SELECT winner_name AS player, winner_rank AS rnk, winner_rank_points AS pts, winner_hand AS hand,
+                   winner_ht AS ht, winner_ioc AS ioc, winner_age AS age, match_date, round_order FROM tennis_matches
+            UNION ALL
+            SELECT loser_name, loser_rank, loser_rank_points, loser_hand, loser_ht, loser_ioc, loser_age, match_date, round_order
+            FROM tennis_matches
+        )
+        SELECT player, arg_max(rnk, match_date) FILTER (WHERE rnk IS NOT NULL) AS rank,
+               arg_max(pts, match_date) FILTER (WHERE pts IS NOT NULL) AS rank_points,
+               max(hand) AS hand, max(ht) AS height, max(ioc) AS country,
+               max(age + date_diff('day', match_date, current_date) / 365.25) FILTER (WHERE age IS NOT NULL) AS age
+        FROM long GROUP BY player""").df().set_index("player")
+
+
+def tournament_profiles(con) -> pd.DataFrame:
+    """Superficie, livello e formato dell'ultima edizione di ogni torneo ATP (chiave: nome in minuscolo)."""
+    df = con.execute("""
+        SELECT lower(tourney_name) AS key, arg_max(surface, match_date) AS surface, arg_max(tourney_level, match_date) AS level,
+               arg_max(series, match_date) FILTER (WHERE series IS NOT NULL) AS series,
+               arg_max(indoor, match_date) FILTER (WHERE indoor IS NOT NULL) AS indoor, max(best_of) AS best_of
+        FROM tennis_matches WHERE circuit = 'ATP' GROUP BY 1""").df()
+    return df.set_index("key")
+
+
+TOURNAMENT_ALIASES = {"french open": "roland garros", "us open": "us open", "aus open": "australian open"}
+
+
 def tennis_upload_selections(df: pd.DataFrame, con=None) -> pd.DataFrame:
     df = _norm_columns(df).reset_index(drop=True)
-    prof = latest_tennis_profiles(con) if con is not None else pd.DataFrame(columns=["rank", "form10"])
+    dates = pd.to_datetime(_col(df, "date"), errors="coerce")
+    known = dates.fillna(pd.Timestamp.today().normalize())
+    name = {s: df[f"player{s}"].astype(str).str.strip() for s in "12"}
+    if con is not None:  # allinea i nomi a quelli del database (maiuscole, accenti e trattini non contano)
+        known_names = con.execute("SELECT DISTINCT winner_name FROM tennis_matches UNION SELECT DISTINCT loser_name FROM tennis_matches").df().iloc[:, 0].dropna()
+        canon = {ud.norm_key(n): n for n in known_names}
+        name = {s: v.map(lambda n: canon.get(ud.norm_key(n), n)) for s, v in name.items()}
+    tour = _col(df, "tournament")
+    surface = _col(df, "surface").astype(str).str.title()
+    surface = surface.where(~surface.isin(["Nan", "None", ""]))
+    level, series, best_of, court = _col(df, "level"), _col(df, "series"), _col(df, "best_of", True), _col(df, "court")
+    prof = pd.DataFrame(columns=["rank", "rank_points", "hand", "height", "country", "age"])
+    feats = pd.DataFrame(index=df.index)
+    if con is not None:
+        prof = tennis_player_profiles(con)
+        tp = tournament_profiles(con)
+        key = tour.astype(str).str.strip().str.lower().replace(TOURNAMENT_ALIASES)
+        names_db = list(tp.index)
+
+        def closest(k: str) -> str:  # 'paris' -> 'paris masters', 'rome masters 1000' -> 'rome masters'
+            if k in tp.index or not k or k == "nan":
+                return k
+            hits = [n for n in names_db if k in n or n in k]
+            return max(hits, key=len) if hits else k
+
+        key = key.map(closest)
+        fill = lambda a, b: a.astype(object).where(a.notna(), b.astype(object))  # il dato del file ha la precedenza
+        surface = fill(surface, key.map(tp["surface"]))
+        level, series = fill(level, key.map(tp["level"])), fill(series, key.map(tp["series"]))
+        best_of = best_of.fillna(key.map(tp["best_of"]))
+        court = fill(court, key.map(tp["indoor"]).map({True: "Indoor", False: "Outdoor"}))
+        feats = upcoming_tennis_features(con, name["1"], name["2"], surface, known)
+    role = {"1": "winner", "2": "loser"}
+    feat = lambda s, k: (feats[f"{role[s]}_{k}"] if f"{role[s]}_{k}" in feats.columns else pd.Series(np.nan, index=df.index))
     parts = []
     for a, b in (("1", "2"), ("2", "1")):
-        player, opp = df[f"player{a}"].astype(str).str.strip(), df[f"player{b}"].astype(str).str.strip()
+        player, opp = name[a], name[b]
         rank = _col(df, f"rank{a}", True).fillna(player.map(prof["rank"]))
         opp_rank = _col(df, f"rank{b}", True).fillna(opp.map(prof["rank"]))
         odds, opp_odds = _col(df, f"odds{a}", True), _col(df, f"odds{b}", True)
-        dates = pd.to_datetime(_col(df, "date"), errors="coerce")
+        form = _col(df, f"form{a}", True).fillna(feat(a, "form10") * 100)
+        opp_form = _col(df, f"form{b}", True).fillna(feat(b, "form10") * 100)
+        h2h_w, h2h_l = feat(a, "h2h_wins"), feat(b, "h2h_wins")
         parts.append(pd.DataFrame({
-            "match_id": "row" + df.index.astype(str), "date": dates, **bt._calendar(dates),
-            "circuit": _col(df, "circuit"), "competition": _col(df, "tournament"), "level": _col(df, "level"),
-            "series": _col(df, "series"), "surface": _col(df, "surface").astype(str).str.title().replace({"Nan": np.nan}),
-            "round": _col(df, "round"), "best_of": _col(df, "best_of", True),
+            "match_id": "row" + df.index.astype(str), "date": dates, **bt._calendar(known),
+            "circuit": _col(df, "circuit").fillna("ATP"), "competition": tour, "level": level, "series": series,
+            "surface": surface, "court": court, "round": _col(df, "round"), "best_of": best_of,
             "player": player, "opponent": opp, "rank": rank, "opp_rank": opp_rank, "rank_adv": opp_rank - rank,
-            "form10": _col(df, f"form{a}", True).fillna(player.map(prof["form10"])),
-            "opp_form10": _col(df, f"form{b}", True).fillna(opp.map(prof["form10"])),
-            "age": np.nan, "odds": odds, "opp_odds": opp_odds,
+            "rank_points": player.map(prof["rank_points"]), "age": player.map(prof["age"]), "height": player.map(prof["height"]),
+            "hand": player.map(prof["hand"]), "opp_hand": opp.map(prof["hand"]), "country": player.map(prof["country"]),
+            "form10": form, "opp_form10": opp_form, "form_adv": form - opp_form,
+            "form_surf": feat(a, "form_surf") * 100, "opp_form_surf": feat(b, "form_surf") * 100,
+            "rest_days": feat(a, "rest_days"), "opp_rest_days": feat(b, "rest_days"), "matches14": feat(a, "matches14"),
+            "h2h_wins": h2h_w, "h2h_losses": h2h_l, "h2h_diff": h2h_w - h2h_l,
+            "srv_won10": feat(a, "srv_won10") * 100, "ret_won10": feat(a, "ret_won10") * 100,
+            "ace10": feat(a, "ace10") * 100, "df10": feat(a, "df10") * 100,
+            "opp_srv_won10": feat(b, "srv_won10") * 100, "opp_ret_won10": feat(b, "ret_won10") * 100,
+            "odds": odds, "opp_odds": opp_odds,
             "selection": np.select([odds < opp_odds, odds > opp_odds], ["favourite", "underdog"], "pick"),
-            "event": player + " vs " + opp, "pick": player,
+            "event": name["1"] + " vs " + name["2"], "pick": player,
         }))
     return pd.concat(parts, ignore_index=True)
 
 
 def football_upload_selections(df: pd.DataFrame, market: str, con=None) -> pd.DataFrame:
     df = _norm_columns(df).reset_index(drop=True)
-    form = latest_football_form(con) if con is not None else pd.DataFrame(columns=["ppg5", "gf5", "ga5"])
     home, away = df["home_team"].astype(str).str.strip(), df["away_team"].astype(str).str.strip()
-    league = _col(df, "league")
     by_div = {k: v[1] for k, v in C.FOOTBALL_LEAGUES.items()}
-    if "div" in df.columns:
-        league = league.fillna(df["div"].map(by_div))
-    league = league.replace(by_div)
+    by_league = {v[1]: k for k, v in C.FOOTBALL_LEAGUES.items()}
+    league = _col(df, "league")
+    div = _col(df, "div")
+    league = league.fillna(div.map(by_div)).replace(by_div)
+    div = div.fillna(league.map(by_league))
     country = league.map({v[1]: v[0] for v in C.FOOTBALL_LEAGUES.values()})
-    feat = {}
-    for side, team in (("home", home), ("away", away)):
-        for k in ("ppg5", "gf5", "ga5"):
-            feat[f"{side}_{k}"] = _col(df, f"{side}_{k}", True).fillna(team.map(form[k]))
-    oh, od, oa = (_col(df, c, True) for c in ("odds_home", "odds_draw", "odds_away"))
     dates = pd.to_datetime(_col(df, "date"), errors="coerce")
+    known = dates.fillna(pd.Timestamp.today().normalize())
+    auto = upcoming_football_features(con, home, away, div, known) if con is not None else pd.DataFrame(index=df.index)
+    feat = {}
+    for side in ("home", "away"):
+        for k in C.FOOT_FEATURE_KEYS:
+            col = f"{side}_{k}"
+            feat[col] = _col(df, col, True).fillna(auto[col] if col in auto.columns else np.nan)
+    oh, od, oa = (_col(df, c, True) for c in ("odds_home", "odds_draw", "odds_away"))
     common = {
-        "match_id": "row" + df.index.astype(str), "date": dates, **bt._calendar(dates),
+        "match_id": "row" + df.index.astype(str), "date": dates, **bt._calendar(known),
         "country": country, "league": league, "competition": league, "season": np.nan,
         "home_team": home, "away_team": away, "event": home + " - " + away,
-        "odds_home": oh, "odds_draw": od, "odds_away": oa, "odds_over": _col(df, "odds_over25", True), **feat,
+        "odds_home": oh, "odds_draw": od, "odds_away": oa, "odds_over": _col(df, "odds_over25", True),
+        "ah_line": _col(df, "ah_line", True), **feat,
+        "ppg_diff": feat["home_ppg5"] - feat["away_ppg5"], "pos_diff": feat["away_pos"] - feat["home_pos"],
         "goals5": (feat["home_gf5"] + feat["home_ga5"] + feat["away_gf5"] + feat["away_ga5"]) / 2,
-        "ppg_diff": feat["home_ppg5"] - feat["away_ppg5"],
     }
     if market == "1x2":
         outcomes = [("home", oh, home), ("draw", od, "Pareggio"), ("away", oa, away)]
