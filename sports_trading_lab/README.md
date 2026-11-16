@@ -1,0 +1,102 @@
+# Sports Trading Lab
+
+Suite locale in Python per archiviare storici di **tennis (ATP / Challenger)** e **calcio (18 campionati europei)**,
+fare backtest di strategie senza scrivere codice, simulare il rischio sul bankroll e scansionare le quote del giorno.
+
+## Avvio rapido
+
+| Sistema | Comando |
+|---|---|
+| Windows | doppio clic su `start_app.bat` |
+| Mac / Linux | `./start_app.sh` |
+
+Al primo avvio lo script crea l'ambiente virtuale, installa le dipendenze, scarica i dati (1-2 minuti) e apre la
+dashboard su `http://localhost:8501`. Serve Python 3.10+.
+
+Uso manuale:
+
+```bash
+python -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python src/update_data.py        # scarica / aggiorna il database
+.venv/bin/python -m pytest tests -q        # 33 test
+.venv/bin/python -m streamlit run app.py   # dashboard
+```
+
+## Struttura
+
+```
+app.py                 dashboard Streamlit (4 pagine)
+src/config.py          percorsi, sorgenti dati, leghe, schema delle tabelle
+src/update_data.py     download, pulizia, caricamento incrementale in DuckDB
+src/backtester.py      motore di backtesting vettorizzato
+src/risk.py            Monte Carlo: stake fisso vs Kelly frazionario
+src/strategies.py      Strategy Vault (strategies.json) e Pre-Match Scanner
+tests/test_engine.py   test dei calcoli, dei parser e dell'integrità del database
+data/trading_db.duckdb database (generato, non versionato)   data/raw/  cache dei file scaricati
+```
+
+## Dati
+
+| Tabella | Contenuto | Fonte |
+|---|---|---|
+| `football_matches` | dal 2019/20: risultati, tiri, angoli, falli, cartellini, xG (dove presente), quote 1X2 e O/U 2.5 pre-match e di chiusura (Pinnacle, Bet365, massimo e media mercato, Betfair Exchange), linea asiatica | football-data.co.uk |
+| `tennis_matches` | dal 2019: ATP, qualificazioni e Challenger con ranking, punti, statistiche di servizio, punteggio; quote Pinnacle, Bet365, massimo e media mercato per l'ATP | TML-Database / formato Sackmann + tennis-data.co.uk |
+
+Colonne derivate senza look-ahead: `home_ppg5`, `away_ppg5`, gol fatti/subiti medi (ultime 5 partite) e
+`winner_form10` / `loser_form10` (% vittorie nelle ultime 10 partite).
+
+**Aggiornamento incrementale.** Le stagioni concluse restano in cache e non vengono riscaricate; le ultime due vengono
+riscaricate e sostituite in modo atomico (delete + insert per stagione). Un indice `UNIQUE` su `match_id` impedisce i
+duplicati. `--full` forza il riscaricamento completo, `--sport tennis|football` limita lo sport.
+
+**Pulizia.** Encoding misti e BOM, date in due formati, righe malformate, quote ≤ 1 annullate, risultati incoerenti
+con i gol scartati. Le quote incoerenti col consenso degli altri bookmaker (refusi nei file originali, prezzi exchange
+non liquidi come 1.01) vengono annullate. A fine caricamento gira una validazione che fallisce se trova anomalie.
+
+### Limiti dei dati da conoscere
+
+- **Challenger senza quote.** tennis-data.co.uk pubblica quote solo per l'ATP: i Challenger sono nel database con
+  ranking e statistiche, ma non sono backtestabili sul profitto.
+- **Tennis: una sola rilevazione di quote** (di chiusura). Il CLV tennis confronta la quota d'ingresso (es. massimo
+  mercato) con la chiusura Pinnacle; con ingresso Pinnacle è 0 per costruzione.
+- **Calcio "apertura".** Le quote pre-match di football-data sono rilevate qualche giorno prima del match, non
+  all'apertura vera del mercato. Pinnacle manca in parte del 2025/26 e nel 2026/27: il CLV ripiega su Betfair
+  Exchange e poi sulla media di chiusura (colonna `close_source`).
+- **Sorgenti tennis.** Il repository originale `JeffSackmann/tennis_atp` non è più pubblico: le statistiche ATP
+  arrivano da TML-Database (stesso formato) e i Challenger 2019-2024 da un mirror; i Challenger dal 2025 non sono
+  disponibili. tennis-data.co.uk è il primo tentativo per le quote, con mirror GitHub di riserva (coprono fino a
+  luglio 2025). Lo script riprova le fonti ufficiali a ogni esecuzione. I dati sono per uso personale e non commerciale.
+
+## Backtester
+
+```python
+from src.backtester import run_backtest
+res = run_backtest({
+    "sport": "tennis", "market": "h2h", "selection": ["favourite"], "side": "back", "price": "max",
+    "odds_min": 1.3, "odds_max": 1.8,
+    "filters": {"surface": {"in": ["Clay"]}, "rank": {"max": 30}, "form10": {"min": 0.6}},
+})
+res.metrics; res.trades; res.equity_curve; res.monthly
+```
+
+Mercati: tennis testa a testa; calcio 1X2 e Over/Under 2.5. Metriche: operazioni, win rate, profitto, yield/ROI,
+max drawdown (unità e %), serie perdente più lunga, CLV % medio, EV rispetto alla chiusura senza margine, equity
+curve, rendimenti mensili. Ogni operazione rischia 1 unità.
+
+- **Back**: vinta `+(quota-1)·(1-commissione)`, persa `-1`.
+- **Lay**: responsabilità fissa 1u (puntata del banco `1/(quota-1)`) oppure puntata fissa 1u. Il prezzo di banca è la
+  quota back scelta: il risultato reale sull'exchange è un po' peggiore (spread).
+- **CLV %**: back `quota/chiusura - 1`, lay `1 - quota/chiusura`.
+
+## Dashboard
+
+1. **Data Manager** – stato del database e pulsante di aggiornamento con barra di avanzamento.
+2. **Strategy Backtester** – filtri nel pannello laterale, KPI, equity curve, drawdown, rendimenti mensili, tabella
+   delle operazioni esportabile in CSV.
+3. **Risk & Monte Carlo** – 1.000 simulazioni bootstrap su 500/1.000 operazioni: stake fisso vs Kelly frazionario,
+   risk of ruin, distribuzione del drawdown.
+4. **Vault & Scanner** – salva le strategie in `strategies.json`, carica un CSV di quote del giorno e ottieni i
+   segnali con lo stake calcolato sul bankroll. I modelli CSV si scaricano dalla pagina.
+
+Un backtest positivo non garantisce risultati futuri: più filtri si provano, più è probabile trovare un risultato
+buono per caso. Guarda numero di operazioni, t-stat e CLV prima di fidarti di un ROI.
