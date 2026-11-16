@@ -13,19 +13,22 @@ fare backtest di strategie senza scrivere codice, simulare il rischio sul bankro
 Al primo avvio lo script crea l'ambiente virtuale, installa le dipendenze, scarica i dati (1-2 minuti) e apre la
 dashboard su `http://localhost:8501`. Serve Python 3.10+.
 
+**Mac Intel con macOS 11 o precedente:** serve Python **3.12** (non più recente) e si installa da
+`requirements-macos11.txt`; `start_app.sh` lo fa da solo.
+
 Uso manuale:
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python src/update_data.py        # scarica / aggiorna il database
-.venv/bin/python -m pytest tests -q        # 33 test
+.venv/bin/python -m pytest tests -q        # 38 test
 .venv/bin/python -m streamlit run app.py   # dashboard
 ```
 
 ## Struttura
 
 ```
-app.py                 dashboard Streamlit (4 pagine)
+app.py                 dashboard Streamlit (Backtester, Rischio, Strategie, Dati, Guida)
 src/config.py          percorsi, sorgenti dati, leghe, schema delle tabelle
 src/update_data.py     download, pulizia, caricamento incrementale in DuckDB
 src/backtester.py      motore di backtesting vettorizzato
@@ -42,8 +45,17 @@ data/trading_db.duckdb database (generato, non versionato)   data/raw/  cache de
 | `football_matches` | dal 2019/20: risultati, tiri, angoli, falli, cartellini, xG (dove presente), quote 1X2 e O/U 2.5 pre-match e di chiusura (Pinnacle, Bet365, massimo e media mercato, Betfair Exchange), linea asiatica | football-data.co.uk |
 | `tennis_matches` | dal 2019: ATP, qualificazioni e Challenger con ranking, punti, statistiche di servizio, punteggio; quote Pinnacle, Bet365, massimo e media mercato per l'ATP | TML-Database / formato Sackmann + tennis-data.co.uk |
 
-Colonne derivate senza look-ahead: `home_ppg5`, `away_ppg5`, gol fatti/subiti medi (ultime 5 partite) e
-`winner_form10` / `loser_form10` (% vittorie nelle ultime 10 partite).
+Variabili pre-partita calcolate senza look-ahead (usano solo i match precedenti):
+
+- **Calcio**, per casa e ospite: punti a partita nelle ultime 5 (totali e solo in casa / in trasferta), gol fatti e
+  subiti, tiri in porta fatti e subiti, calci d'angolo, posizione in classifica, punti a partita in stagione,
+  giorni di riposo.
+- **Tennis**, per ciascun giocatore: % vittorie nelle ultime 10 e nelle ultime 20 sulla superficie, giorni
+  dall'ultimo match, match negli ultimi 14 giorni, precedenti contro l'avversario (dal 2019), % punti vinti al
+  servizio e in risposta, % ace e doppi falli (ultimi 10 match). Lo storico Challenger entra in questi calcoli.
+
+Se il database è stato creato da una versione precedente, l'app aggiunge le colonne nuove e ricalcola le
+variabili da sola al primo avvio, senza riscaricare nulla.
 
 **Aggiornamento incrementale.** Le stagioni concluse restano in cache e non vengono riscaricate; le ultime due vengono
 riscaricate e sostituite in modo atomico (delete + insert per stagione). Un indice `UNIQUE` su `match_id` impedisce i
@@ -90,13 +102,20 @@ curve, rendimenti mensili. Ogni operazione rischia 1 unità.
 
 ## Dashboard
 
-1. **Data Manager** – stato del database e pulsante di aggiornamento con barra di avanzamento.
-2. **Strategy Backtester** – filtri nel pannello laterale, KPI, equity curve, drawdown, rendimenti mensili, tabella
-   delle operazioni esportabile in CSV.
-3. **Risk & Monte Carlo** – 1.000 simulazioni bootstrap su 500/1.000 operazioni: stake fisso vs Kelly frazionario,
+1. **Backtester** – pannello laterale con esempi pronti e filtri a gruppi (torneo/lega, calendario,
+   giocatore/squadra, avversario, confronto). Cinque schede:
+   - *Riepilogo*: KPI, equity curve, drawdown, rendimenti mensili.
+   - *Analisi*: risultato scomposto per anno, fascia di quota, torneo, superficie...; elenco automatico dei
+     segmenti migliori e peggiori, applicabili come filtro con un clic.
+   - *Robustezza*: sei controlli (campione, significatività, intervallo di confidenza del ROI, CLV, tenuta
+     fuori campione, costanza negli anni), confronto studio/verifica, anno per anno, confronto tra bookmaker.
+   - *Operazioni*: tabella esportabile in CSV.  *Salva*: archivia la strategia.
+2. **Rischio** – 1.000 simulazioni bootstrap su 500/1.000 operazioni: stake fisso vs Kelly frazionario,
    risk of ruin, distribuzione del drawdown.
-4. **Vault & Scanner** – salva le strategie in `strategies.json`, carica un CSV di quote del giorno e ottieni i
-   segnali con lo stake calcolato sul bankroll. I modelli CSV si scaricano dalla pagina.
+3. **Strategie** – archivio in `strategies.json` (riapribili nel Backtester) e scanner: carica un CSV con le
+   quote del giorno e ottieni i segnali con lo stake calcolato sul bankroll. I modelli CSV si scaricano dalla pagina.
+4. **Dati** – stato del database e pulsante di aggiornamento con barra di avanzamento.
+5. **Guida** – come si usa, in cinque passi.
 
 Un backtest positivo non garantisce risultati futuri: più filtri si provano, più è probabile trovare un risultato
 buono per caso. Guarda numero di operazioni, t-stat e CLV prima di fidarti di un ROI.

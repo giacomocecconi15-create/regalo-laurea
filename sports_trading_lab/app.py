@@ -10,6 +10,7 @@ from contextlib import closing
 from datetime import date
 from pathlib import Path
 
+import duckdb
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -22,31 +23,119 @@ from src import backtester as bt  # noqa: E402
 from src import config as C  # noqa: E402
 from src import risk  # noqa: E402
 from src import strategies as sv  # noqa: E402
+from src import update_data as ud  # noqa: E402
 
-# palette (tema scuro): superfici, inchiostri e serie validate per daltonismo
-SURFACE, GRID, INK, MUTED = "#1a1a19", "#2c2c2a", "#f0efec", "#898781"
+# palette (tema scuro): superfici, inchiostri e colori di serie verificati per daltonismo
+PAGE, SURFACE, GRID, INK, INK2, MUTED = "#0d0d0d", "#1a1a19", "#2c2c2a", "#f0efec", "#c3c2b7", "#898781"
 BLUE, ORANGE, RED = "#3987e5", "#d95926", "#e66767"
+GOOD, WARN, BAD = "#0ca30c", "#fab219", "#d03b3b"
+FONT = "Inter, -apple-system, 'Segoe UI', Roboto, sans-serif"
 
 SPORT_LABEL = {"tennis": "Tennis", "football": "Calcio"}
 MARKET_LABEL = {"h2h": "Testa a Testa", "1x2": "1X2", "ou25": "Over/Under 2.5"}
 SEL_LABEL = {"favourite": "Favorito", "underdog": "Sfavorito", "home": "1 (Casa)", "draw": "X (Pareggio)",
              "away": "2 (Ospite)", "over": "Over 2.5", "under": "Under 2.5"}
+MAX_TABLE_ROWS = 5000   # righe mostrate a schermo (l'esportazione CSV è sempre completa)
+MAX_CHART_POINTS = 3000
+
+# Esempi di partenza: mostrano come si combinano i filtri, non sono consigli di gioco.
+PRESETS = {
+    "Tennis - favoriti top 30 sulla terra": {
+        "sport": "tennis", "market": "h2h", "selection": ["favourite"], "side": "back", "price": "max",
+        "odds_min": 1.30, "odds_max": 1.80,
+        "filters": {"surface": {"in": ["Clay"]}, "rank": {"min": 1, "max": 30}}},
+    "Tennis - sfavoriti in forma": {
+        "sport": "tennis", "market": "h2h", "selection": ["underdog"], "side": "back", "price": "max",
+        "odds_min": 2.00, "odds_max": 3.50,
+        "filters": {"form10": {"min": 60, "max": None}, "opp_form10": {"min": None, "max": 50}}},
+    "Calcio - casa in forma contro ospite in crisi": {
+        "sport": "football", "market": "1x2", "selection": ["home"], "side": "back", "price": "max",
+        "odds_min": 1.50, "odds_max": 2.60,
+        "filters": {"ppg_diff": {"min": 1.0, "max": None}, "home_pos": {"min": 1, "max": 8}}},
+    "Calcio - Under 2.5 in partite da pochi gol": {
+        "sport": "football", "market": "ou25", "selection": ["under"], "side": "back", "price": "max",
+        "odds_min": 1.60, "odds_max": 2.40,
+        "filters": {"goals5": {"min": None, "max": 2.2}}},
+}
 
 st.set_page_config(page_title="Sports Trading Lab", page_icon=":material/monitoring:", layout="wide")
-st.markdown("""
+st.markdown(f"""
 <style>
-[data-testid="stMetric"] {background:#1a1a19;border:1px solid #2c2c2a;border-radius:6px;padding:12px 14px;}
-[data-testid="stMetricLabel"] p {color:#898781;font-size:0.72rem;letter-spacing:.08em;text-transform:uppercase;}
-[data-testid="stMetricValue"] {font-variant-numeric:tabular-nums;font-size:1.2rem;}
-.block-container {padding-top:2.2rem;}
-h1 {font-size:1.5rem !important;letter-spacing:.02em;}
+.block-container {{padding-top:2.6rem; max-width:1500px;}}
+h1 {{font-size:1.55rem !important; font-weight:650 !important; margin-bottom:.1rem !important;}}
+h3 {{font-size:1.05rem !important; font-weight:600 !important;}}
+.brand {{font-size:.72rem; letter-spacing:.14em; text-transform:uppercase; color:{BLUE}; font-weight:600;}}
+.kpis {{display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin:.35rem 0 .6rem 0;}}
+.kpi {{background:{SURFACE}; border:1px solid {GRID}; border-left:3px solid var(--tone,{GRID}); border-radius:8px; padding:11px 14px 10px 14px;}}
+.kpi .l {{color:{MUTED}; font-size:.68rem; letter-spacing:.08em; text-transform:uppercase;}}
+.kpi .v {{color:{INK}; font-size:1.3rem; font-weight:600; font-variant-numeric:tabular-nums; line-height:1.5;}}
+.kpi .s {{color:{MUTED}; font-size:.72rem;}}
+.check {{display:flex; gap:10px; align-items:baseline; padding:7px 12px; border:1px solid {GRID}; border-radius:8px; margin-bottom:6px; background:{SURFACE};}}
+.check b {{color:{INK}; font-weight:600; min-width:230px; display:inline-block;}}
+.check span.d {{color:{INK2}; font-size:.86rem;}}
+.dot {{width:9px; height:9px; border-radius:50%; display:inline-block; flex:none; position:relative; top:-1px;}}
+.tag {{font-size:.68rem; letter-spacing:.06em; text-transform:uppercase; color:{MUTED}; min-width:74px;}}
+section[data-testid="stSidebar"] h3 {{margin-top:.6rem;}}
+div[data-testid="stExpander"] details {{border-color:{GRID};}}
 </style>
 """, unsafe_allow_html=True)
+ss = st.session_state
 
-# i widget del backtester mantengono lo stato quando si cambia pagina
-for _k in list(st.session_state.keys()):
+
+# --------------------------------------------------------------------------- stato dei widget
+def slider_bounds(spec: tuple) -> tuple:
+    """Estremi e passo del cursore con un unico tipo numerico (Streamlit non accetta int e float mischiati)."""
+    lo, hi, step = spec[4], spec[5], spec[6]
+    cast = float if any(isinstance(v, float) for v in (lo, hi, step)) else int
+    return cast(lo), cast(hi), cast(step), cast
+
+
+def queue_cfg(cfg: dict) -> None:
+    """Chiede di caricare una configurazione nel pannello del backtester al prossimo giro."""
+    ss["_pending_cfg"] = cfg
+
+
+def apply_pending() -> None:
+    cfg = ss.pop("_pending_cfg", None)
+    if not cfg:
+        return
+    for k in [k for k in ss.keys() if k.startswith("bt_") and k != "bt_bank"]:
+        del ss[k]
+    sport = cfg.get("sport", "tennis")
+    market = cfg.get("market") or bt.MARKETS[sport][0]
+    ss["bt_sport"] = sport
+    ss[f"bt_{sport}_market"] = market
+    ss[f"bt_{sport}_{market}_sel"] = [s for s in (cfg.get("selection") or []) if s in bt.SELECTIONS[market]]
+    ss["bt_side"] = cfg.get("side", "back")
+    ss["bt_comm"] = float(cfg.get("commission") or 0.0) * 100
+    ss["bt_laymode"] = cfg.get("lay_mode", "liability")
+    ss[f"bt_{sport}_price"] = cfg.get("price", "avg") if cfg.get("price") in bt.PRICE_BOOKS[sport] else "avg"
+    ss["bt_timing"] = cfg.get("price_timing", "open")
+    ss["bt_omin"] = float(cfg.get("odds_min") or 1.01)
+    ss["bt_omax"] = float(cfg.get("odds_max") or 50.0)
+    ss["bt_excl"] = bool(cfg.get("exclude_retirements"))
+    specs = {f[0]: f for f in bt.FILTERS[sport]}
+    for col, rule in (cfg.get("filters") or {}).items():
+        spec = specs.get(col)
+        if not spec or not rule:
+            continue
+        key = f"bt_{sport}_f_{col}"
+        if spec[3] == "cat":
+            ss[key] = list(rule.get("in") or [])
+        elif spec[3] == "num":
+            ss[key + "_min"], ss[key + "_max"] = rule.get("min"), rule.get("max")
+        else:
+            lo, hi, step, cast = slider_bounds(spec)
+            a = lo if rule.get("min") is None else min(max(rule["min"], lo), hi)
+            b = hi if rule.get("max") is None else min(max(rule["max"], lo), hi)
+            a, b = round(a / step) * step, round(b / step) * step
+            ss[key + "_sl"] = (cast(a), cast(b))
+
+
+apply_pending()
+for _k in list(ss.keys()):  # i widget del backtester mantengono lo stato quando si cambia pagina
     if _k.startswith("bt_"):
-        st.session_state[_k] = st.session_state[_k]
+        ss[_k] = ss[_k]
 
 
 # --------------------------------------------------------------------------- dati
@@ -58,7 +147,27 @@ def db_version() -> float:
     return C.DB_PATH.stat().st_mtime if db_ready() else 0.0
 
 
-@st.cache_data(show_spinner="Carico i match dal database...")
+def ensure_schema() -> None:
+    """Se il database viene da una versione precedente, aggiunge le colonne nuove e ricalcola le variabili."""
+    if not db_ready() or ss.get("_schema_ok") == db_version():
+        return
+    try:
+        with closing(bt.connect()) as con:
+            need = ud.needs_feature_refresh(con)
+        if need:
+            with st.spinner("Aggiorno il database alla nuova versione (pochi secondi, solo la prima volta)..."):
+                with closing(duckdb.connect(str(C.DB_PATH))) as con:
+                    ud.init_db(con)
+                    ud.refresh_features(con)
+            st.cache_resource.clear()
+            st.cache_data.clear()
+    except duckdb.Error as exc:
+        st.error(f"Impossibile aprire il database: {exc}. Chiudi altre finestre dell'app e ricarica la pagina.")
+        st.stop()
+    ss["_schema_ok"] = db_version()
+
+
+@st.cache_resource(show_spinner="Carico i match dal database...", max_entries=3)
 def selections(sport: str, market: str, price: str, timing: str, version: float) -> pd.DataFrame:
     with closing(bt.connect()) as con:
         return bt.load_selections(sport, market, price, timing, con)
@@ -83,53 +192,105 @@ def db_status(version: float) -> dict:
 
 def need_db() -> bool:
     if not db_ready():
-        st.warning("Database non trovato. Apri **Data Manager** e premi *Aggiorna Database*.")
+        st.warning("Database non trovato. Apri **Dati** e premi *Aggiorna Database*.")
         return True
     return False
+
+
+# --------------------------------------------------------------------------- componenti
+def header(title: str, subtitle: str | None = None) -> None:
+    st.markdown('<div class="brand">Sports Trading Lab</div>', unsafe_allow_html=True)
+    st.title(title)
+    if subtitle:
+        st.caption(subtitle)
+
+
+def kpis(items: list[tuple]) -> None:
+    """items: (etichetta, valore, nota, tono) con tono 'good' | 'bad' | None."""
+    tones = {"good": GOOD, "bad": BAD}
+    cells = "".join(
+        f'<div class="kpi" style="--tone:{tones.get(tone, GRID)}"><div class="l">{label}</div>'
+        f'<div class="v">{value}</div><div class="s">{note or "&nbsp;"}</div></div>'
+        for label, value, note, tone in items)
+    st.markdown(f'<div class="kpis">{cells}</div>', unsafe_allow_html=True)
+
+
+def sign_tone(v: float) -> str | None:
+    return None if v is None or not np.isfinite(v) or v == 0 else ("good" if v > 0 else "bad")
+
+
+def num_it(v: float, dec: int = 0) -> str:
+    return f"{v:,.{dec}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def fmt(v: float, pattern: str = "{:+.2f}") -> str:
+    return "n/d" if v is None or (isinstance(v, float) and not np.isfinite(v)) else pattern.format(v)
+
+
+def checklist(checks: list[tuple[str, str, str]]) -> None:
+    color = {"ok": GOOD, "warn": WARN, "bad": BAD}
+    word = {"ok": "Superato", "warn": "Incerto", "bad": "Non superato"}
+    html = "".join(
+        f'<div class="check"><span class="dot" style="background:{color[s]}"></span><span class="tag">{word[s]}</span>'
+        f'<b>{name}</b><span class="d">{detail}</span></div>' for name, s, detail in checks)
+    st.markdown(html, unsafe_allow_html=True)
 
 
 # --------------------------------------------------------------------------- grafici
 def base_layout(fig: go.Figure, height: int, title: str | None = None) -> go.Figure:
     fig.update_layout(
-        height=height, paper_bgcolor=SURFACE, plot_bgcolor=SURFACE, font=dict(color=INK, size=12),
-        margin=dict(l=56, r=20, t=44 if title else 16, b=40), hovermode="x unified",
+        height=height, paper_bgcolor=SURFACE, plot_bgcolor=SURFACE, font=dict(color=INK, size=12, family=FONT),
+        margin=dict(l=56, r=20, t=46 if title else 16, b=40), hovermode="x unified",
         title=dict(text=title, font=dict(size=14), x=0.01) if title else None,
-        hoverlabel=dict(bgcolor="#0d0d0d", bordercolor=GRID, font=dict(color=INK)), showlegend=False,
+        hoverlabel=dict(bgcolor=PAGE, bordercolor=GRID, font=dict(color=INK, family=FONT)), showlegend=False,
     )
     fig.update_xaxes(gridcolor=GRID, linecolor=GRID, zeroline=False, tickfont=dict(color=MUTED))
     fig.update_yaxes(gridcolor=GRID, linecolor=GRID, zerolinecolor=MUTED, zerolinewidth=1, tickfont=dict(color=MUTED))
     return fig
 
 
-def equity_chart(trades: pd.DataFrame) -> go.Figure:
+def thin(trades: pd.DataFrame) -> pd.DataFrame:
+    """Riduce i punti disegnati (il grafico resta identico a occhio, il browser resta leggero)."""
+    n = len(trades)
+    if n <= MAX_CHART_POINTS:
+        return trades.assign(_n=np.arange(1, n + 1))
+    idx = np.unique(np.append(np.arange(0, n, int(np.ceil(n / MAX_CHART_POINTS))), n - 1))
+    return trades.iloc[idx].assign(_n=idx + 1)
+
+
+def equity_chart(trades: pd.DataFrame, cut: pd.Timestamp | None = None) -> go.Figure:
+    t = thin(trades)
     fig = go.Figure(go.Scatter(
-        x=trades["date"], y=trades["equity"], mode="lines", line=dict(color=BLUE, width=2, shape="hv"),
-        customdata=np.arange(1, len(trades) + 1), hovertemplate="%{y:+.2f} u  (trade n. %{customdata})<extra></extra>"))
+        x=t["date"], y=t["equity"], mode="lines", line=dict(color=BLUE, width=2, shape="hv"),
+        customdata=t["_n"], hovertemplate="%{y:+.2f} u  (operazione n. %{customdata})<extra></extra>"))
     base_layout(fig, 360, "Equity curve - profitto cumulato (unità)")
+    if cut is not None:
+        fig.add_vline(x=cut, line=dict(color=MUTED, width=1, dash="dot"))
+        fig.add_annotation(x=cut, y=1, yref="paper", text="inizio verifica", showarrow=False, xanchor="left",
+                           font=dict(color=INK2, size=11), xshift=6)
     fig.update_yaxes(ticksuffix=" u")
     return fig
 
 
 def drawdown_chart(trades: pd.DataFrame) -> go.Figure:
     eq = trades["equity"].to_numpy()
-    dd = eq - np.maximum.accumulate(np.maximum(eq, 0))
-    fig = go.Figure(go.Scatter(x=trades["date"], y=dd, mode="lines", line=dict(color=RED, width=1.5, shape="hv"),
-                               fill="tozeroy", fillcolor="rgba(230,103,103,0.25)",
-                               hovertemplate="%{y:.2f} u<extra></extra>"))
-    base_layout(fig, 220, "Drawdown dal massimo (unità)")
+    t = thin(trades.assign(_dd=eq - np.maximum.accumulate(np.maximum(eq, 0))))
+    fig = go.Figure(go.Scatter(x=t["date"], y=t["_dd"], mode="lines", line=dict(color=RED, width=1.5, shape="hv"),
+                               fill="tozeroy", fillcolor="rgba(230,103,103,0.25)", hovertemplate="%{y:.2f} u<extra></extra>"))
+    base_layout(fig, 210, "Drawdown dal massimo (unità)")
     fig.update_yaxes(ticksuffix=" u")
     return fig
 
 
-def monthly_chart(monthly: pd.DataFrame) -> go.Figure:
-    colors = np.where(monthly["profit"] >= 0, BLUE, RED)
+def bars_chart(x, y, hover: list[str], title: str, suffix: str, height: int = 290) -> go.Figure:
+    y = np.asarray(y, dtype=float)
     fig = go.Figure(go.Bar(
-        x=monthly["month"], y=monthly["profit"], marker=dict(color=colors, line=dict(color=SURFACE, width=1)),
-        customdata=np.stack([monthly["trades"], monthly["yield_pct"]], axis=1),
-        hovertemplate="%{y:+.2f} u<br>%{customdata[0]} trade, yield %{customdata[1]:+.1f}%<extra></extra>"))
-    base_layout(fig, 280, "Rendimenti mensili (unità) - blu positivo, rosso negativo")
-    fig.update_xaxes(type="category", nticks=14)
-    fig.update_yaxes(ticksuffix=" u")
+        x=x, y=y, marker=dict(color=np.where(y >= 0, BLUE, RED), line=dict(color=SURFACE, width=1)),
+        customdata=hover, hovertemplate="%{y:+.2f}" + suffix + "<br>%{customdata}<extra></extra>"))
+    base_layout(fig, height, title + " - blu positivo, rosso negativo")
+    fig.update_xaxes(type="category", tickangle=-30, automargin=True)
+    fig.update_yaxes(ticksuffix=suffix)
+    fig.update_layout(bargap=0.25)
     return fig
 
 
@@ -142,16 +303,16 @@ def fan_chart(results: list[tuple[str, dict, str]]) -> go.Figure:
     fig = make_subplots(rows=1, cols=len(results), subplot_titles=[r[0] for r in results], horizontal_spacing=0.08)
     for i, (_, res, color) in enumerate(results, start=1):
         b = res["bands"]
-        for lo, hi, alpha, name in (("p5", "p95", 0.15, "5°-95° percentile"), ("p25", "p75", 0.30, "25°-75° percentile")):
+        for lo, hi, alpha in (("p5", "p95", 0.15), ("p25", "p75", 0.30)):
             fig.add_trace(go.Scatter(x=b["trade"], y=b[hi], mode="lines", line=dict(width=0), hoverinfo="skip"), 1, i)
             fig.add_trace(go.Scatter(x=b["trade"], y=b[lo], mode="lines", line=dict(width=0), fill="tonexty",
-                                     fillcolor=_rgba(color, alpha), hoverinfo="skip", name=name), 1, i)
+                                     fillcolor=_rgba(color, alpha), hoverinfo="skip"), 1, i)
         fig.add_trace(go.Scatter(
             x=b["trade"], y=b["p50"], mode="lines", line=dict(color=color, width=2),
             customdata=np.stack([b["p5"], b["p95"]], axis=1),
             hovertemplate="mediana %{y:,.0f}<br>5°-95°: %{customdata[0]:,.0f} - %{customdata[1]:,.0f}<extra></extra>"), 1, i)
         fig.add_hline(y=res["bankroll"], line=dict(color=MUTED, width=1, dash="dot"), row=1, col=i)
-    base_layout(fig, 380)
+    base_layout(fig, 370)
     fig.update_layout(margin=dict(t=48))
     fig.update_xaxes(title_text="operazioni future", title_font=dict(color=MUTED, size=11))
     return fig
@@ -159,15 +320,15 @@ def fan_chart(results: list[tuple[str, dict, str]]) -> go.Figure:
 
 def dd_hist_chart(results: list[tuple[str, dict, str]]) -> go.Figure:
     fig = make_subplots(rows=1, cols=len(results), subplot_titles=[r[0] for r in results], horizontal_spacing=0.08)
-    top = max(float(np.percentile(r[1]["max_dd_pct"], 99.5)) for r in results)
+    top = max(max(float(np.percentile(r[1]["max_dd_pct"], 99.5)) for r in results), 5.0)
     for i, (_, res, color) in enumerate(results, start=1):
         fig.add_trace(go.Histogram(
-            x=res["max_dd_pct"], xbins=dict(start=0, end=max(top, 5), size=max(top, 5) / 40),
+            x=res["max_dd_pct"], xbins=dict(start=0, end=top, size=top / 40),
             marker=dict(color=color, line=dict(color=SURFACE, width=1)),
             hovertemplate="drawdown %{x}%<br>%{y} simulazioni<extra></extra>"), 1, i)
         fig.add_vline(x=res["p95_dd_pct"], line=dict(color=INK, width=1, dash="dot"), row=1, col=i,
                       annotation_text=f"95° pct: {res['p95_dd_pct']:.1f}%", annotation_font=dict(color=INK, size=11))
-    base_layout(fig, 320)
+    base_layout(fig, 310)
     fig.update_layout(margin=dict(t=48), hovermode="closest", bargap=0.05)
     fig.update_xaxes(title_text="max drawdown del percorso (%)", title_font=dict(color=MUTED, size=11), ticksuffix="%")
     return fig
@@ -177,28 +338,62 @@ def show(fig: go.Figure) -> None:
     st.plotly_chart(fig, width="stretch", theme=None, config={"displaylogo": False})
 
 
-def money(v: float) -> str:
-    return f"{v:,.0f}".replace(",", ".")
+# --------------------------------------------------------------------------- pagina: guida
+def page_guide() -> None:
+    header("Guida rapida", "Come si usa la piattaforma, in cinque passi.")
+    a, b = st.columns(2)
+    with a:
+        st.markdown("""
+### 1 · Scegli cosa puntare
+Nella pagina **Backtester**, nel pannello a sinistra: sport, mercato, selezione (es. *Favorito*, *1*, *Over 2.5*),
+se **punti** (Back) o **banchi** (Lay) e a quale quota entri (media mercato, massimo mercato, Pinnacle...).
+Per partire in fretta scegli un **esempio pronto** in cima al pannello.
+
+### 2 · Aggiungi i filtri
+I filtri sono raggruppati: torneo o lega, calendario, giocatore/squadra, avversario, confronto.
+Ogni cursore lasciato da un estremo all'altro **non filtra**. Sposta solo quelli che ti interessano:
+i risultati si aggiornano da soli. *Azzera filtri* riporta tutto al punto di partenza.
+
+### 3 · Leggi il risultato
+- **ROI / Yield**: profitto diviso per il totale rischiato. Ogni operazione rischia 1 unità.
+- **CLV**: di quanto la tua quota batte la quota di chiusura. Se è positivo con costanza, è il segnale più
+  affidabile che la strategia abbia un vantaggio reale.
+- **Max Drawdown**: la peggiore discesa dal massimo. Ti dice quanta banca serve per reggerla.
+""")
+    with b:
+        st.markdown("""
+### 4 · Verifica che non sia fortuna
+- Scheda **Analisi**: il risultato scomposto per anno, fascia di quota, torneo, superficie... e l'elenco automatico
+  dei segmenti migliori e peggiori, che puoi aggiungere ai filtri con un clic.
+- Scheda **Robustezza**: sei controlli con esito *Superato / Incerto / Non superato* (campione, significatività,
+  intervallo di confidenza, CLV, tenuta sulle operazioni più recenti, costanza negli anni).
+
+Più filtri provi, più è facile trovare per caso una combinazione che ha reso bene in passato. Fidati di una
+strategia solo se supera i controlli e ha una logica che sai spiegare.
+
+### 5 · Dal test alla pratica
+- **Rischio**: simula 1.000 futuri possibili e confronta stake fisso e Kelly frazionario.
+- **Strategie**: salva le strategie valide, carica il CSV con le quote del giorno e ottieni i match che le
+  attivano con lo stake già calcolato sul tuo bankroll.
+- **Dati**: aggiorna il database quando vuoi (pulsante *Aggiorna Database*).
+""")
+    st.info("Limiti dei dati: le quote tennis esistono solo per il circuito ATP (non per i Challenger) e sono una sola "
+            "rilevazione per match; le quote pre-match del calcio sono rilevate qualche giorno prima della partita. "
+            "Un backtest positivo non garantisce risultati futuri.", icon=":material/info:")
 
 
-def fmt(v: float, pattern: str = "{:+.2f}") -> str:
-    return "n/d" if v is None or (isinstance(v, float) and not np.isfinite(v)) else pattern.format(v)
-
-
-# --------------------------------------------------------------------------- pagina 1
+# --------------------------------------------------------------------------- pagina: dati
 def page_data() -> None:
-    st.title("Data Manager")
+    header("Dati", "Stato del database e aggiornamento degli storici.")
     if db_ready():
         s = db_status(db_version())
         t = s["tennis"].set_index("circuit")
         n = lambda c: int(t["match"].get(c, 0))
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Match ATP", f"{n('ATP'):,}".replace(",", "."))
-        c2.metric("Match Challenger", f"{n('CHALLENGER'):,}".replace(",", "."))
-        c3.metric("Qualificazioni ATP", f"{n('ATP_QUALI'):,}".replace(",", "."))
-        c4.metric("Match Calcio", f"{int(s['football']['match'].sum()):,}".replace(",", "."))
-        c5.metric("Ultimo aggiornamento", s["last"].replace(" UTC", ""))
-        st.caption(f"Database: `{C.DB_PATH.relative_to(ROOT)}` - {C.DB_PATH.stat().st_size / 1e6:.1f} MB")
+        kpis([("Match ATP", num_it(n("ATP")), f"{int(t['con_quote'].get('ATP', 0)):,} con quote".replace(",", "."), None),
+              ("Match Challenger", num_it(n("CHALLENGER")), "senza quote", None),
+              ("Qualificazioni ATP", num_it(n("ATP_QUALI")), "senza quote", None),
+              ("Match Calcio", num_it(int(s["football"]["match"].sum())), f"{len(s['football'])} campionati", None),
+              ("Ultimo aggiornamento", s["last"].replace(" UTC", ""), f"{C.DB_PATH.stat().st_size / 1e6:.0f} MB su disco", None)])
     else:
         st.info("Nessun database presente: premi il pulsante per scaricare gli storici.")
 
@@ -212,8 +407,8 @@ def page_data() -> None:
         s = db_status(db_version())
         st.subheader("Tennis")
         st.dataframe(s["tennis"].rename(columns={"circuit": "circuito"}), hide_index=True, width="stretch")
-        st.caption("Le quote (Pinnacle, Bet365, massimo e media mercato) esistono solo per il circuito ATP: "
-                   "tennis-data.co.uk non pubblica quote Challenger. I Challenger hanno risultati, ranking e statistiche di servizio.")
+        st.caption("Le quote (Pinnacle, Bet365, massimo e media mercato) esistono solo per il circuito ATP. "
+                   "I Challenger servono a calcolare form, riposo e precedenti dei giocatori.")
         pivot = s["tennis_year"].pivot(index="anno", columns="circuit", values="n").fillna(0).astype(int)
         st.dataframe(pivot, width="stretch")
         st.subheader("Calcio")
@@ -224,17 +419,23 @@ def run_update(full: bool) -> None:
     cmd = [sys.executable, str(ROOT / "src" / "update_data.py")] + (["--full"] if full else [])
     bar = st.progress(0.0, text="Avvio aggiornamento...")
     tail: list[str] = []
-    proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-    for line in proc.stdout:
-        line = line.rstrip()
-        if line.startswith("PROGRESS "):
-            _, frac, label = line.split(" ", 2)
-            i, n = (int(x) for x in frac.split("/"))
-            bar.progress(min(i / n, 1.0), text=f"{label}  ({i}/{n})")
-        elif line:
-            tail.append(line)
-    code = proc.wait()
+    try:
+        proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line.startswith("PROGRESS "):
+                _, frac, label = line.split(" ", 2)
+                i, n = (int(x) for x in frac.split("/"))
+                bar.progress(min(i / n, 1.0), text=f"{label}  ({i}/{n})")
+            elif line:
+                tail.append(line)
+        code = proc.wait()
+    except OSError as exc:
+        st.error(f"Impossibile avviare l'aggiornamento: {exc}")
+        return
+    st.cache_resource.clear()
     st.cache_data.clear()
+    ss.pop("_schema_ok", None)
     if code == 0:
         bar.progress(1.0, text="Aggiornamento completato")
         st.success("Database aggiornato e validato.")
@@ -243,68 +444,112 @@ def run_update(full: bool) -> None:
     st.code("\n".join(tail[-40:]) or "(nessun output)", language="text")
 
 
-# --------------------------------------------------------------------------- pagina 2
+# --------------------------------------------------------------------------- pagina: backtester
+def _load_preset() -> None:
+    name = ss.get("preset_pick")
+    if name:
+        queue_cfg(PRESETS[name])
+        ss["preset_pick"] = None
+
+
+def _reset_filters(sport: str) -> None:
+    for k in [k for k in ss.keys() if k.startswith(f"bt_{sport}_f_") or k in ("bt_omin", "bt_omax", f"bt_{sport}_period", "bt_excl")]:
+        del ss[k]
+
+
+def _filter_widget(sport: str, spec: tuple, sel: pd.DataFrame) -> dict | None:
+    col, label, _, kind = spec[:4]
+    key = f"bt_{sport}_f_{col}"
+    if kind == "cat":
+        values = sorted(sel[col].dropna().unique().tolist()) if col in sel.columns else []
+        if key in ss:
+            ss[key] = [v for v in ss[key] if v in values]
+        picked = st.multiselect(label, values, key=key, placeholder="tutti")
+        return {"in": picked} if picked else None
+    if kind == "num":
+        st.markdown(f"<small>{label}</small>", unsafe_allow_html=True)
+        a, b = st.columns(2)
+        lo = a.number_input("min", value=None, key=key + "_min", label_visibility="collapsed", placeholder="min")
+        hi = b.number_input("max", value=None, key=key + "_max", label_visibility="collapsed", placeholder="max")
+        return {"min": lo, "max": hi} if lo is not None or hi is not None else None
+    lo, hi, step, cast = slider_bounds(spec)
+    if key + "_sl" in ss:
+        ss[key + "_sl"] = tuple(cast(v) for v in ss[key + "_sl"])
+    ss.setdefault(key + "_sl", (lo, hi))
+    a, b = st.slider(label, lo, hi, step=step, key=key + "_sl")
+    if a <= lo and b >= hi:
+        return None
+    return {"min": a if a > lo else None, "max": b if b < hi else None}
+
+
 def sidebar_config() -> dict:
     sb = st.sidebar
-    sb.header("Strategia")
+    sb.selectbox("Esempi pronti", list(PRESETS), index=None, key="preset_pick", on_change=_load_preset,
+                 placeholder="carica un esempio...", help="Configurazioni di partenza da modificare: non sono consigli di gioco.")
+    sb.subheader("1 · Cosa punti")
+    ss.setdefault("bt_sport", "tennis")
     sport = sb.radio("Sport", list(SPORT_LABEL), format_func=SPORT_LABEL.get, horizontal=True, key="bt_sport")
     market = sb.selectbox("Mercato", bt.MARKETS[sport], format_func=MARKET_LABEL.get, key=f"bt_{sport}_market")
     opts = bt.SELECTIONS[market]
-    ss = st.session_state  # i default passano dallo stato di sessione, cosi' sopravvivono al cambio pagina
     ss.setdefault(f"bt_{sport}_{market}_sel", opts[:1])
-    selection = sb.multiselect("Selezione", opts, format_func=SEL_LABEL.get, key=f"bt_{sport}_{market}_sel")
+    selection = sb.multiselect("Selezione", opts, format_func=SEL_LABEL.get, key=f"bt_{sport}_{market}_sel", placeholder="tutte")
+    ss.setdefault("bt_side", "back")
     side = sb.radio("Modalità", ["back", "lay"], format_func={"back": "Back (punta)", "lay": "Lay (banca)"}.get,
                     horizontal=True, key="bt_side")
-    ss.setdefault("bt_comm", 0.0)
-    commission = sb.number_input("Commissione Exchange sulle vincite (%)", 0.0, 20.0, step=0.5, key="bt_comm")
-    lay_mode = "liability"
-    if side == "lay":
-        lay_mode = sb.radio("Stake del lay", ["liability", "stake"], key="bt_laymode",
-                            format_func={"liability": "Responsabilità fissa 1u", "stake": "Puntata banco fissa 1u"}.get)
     books = bt.PRICE_BOOKS[sport]
     ss.setdefault(f"bt_{sport}_price", "avg")
     price = sb.selectbox("Quota di ingresso", books, format_func=bt.BOOK_LABELS.get, key=f"bt_{sport}_price")
     timing = "open"
     if sport == "football":
+        ss.setdefault("bt_timing", "open")
         timing = sb.radio("Momento della quota", ["open", "close"], horizontal=True, key="bt_timing",
-                          format_func={"open": "Pre-match (apertura)", "close": "Chiusura"}.get)
+                          format_func={"open": "Pre-match", "close": "Chiusura"}.get)
+    ss.setdefault("bt_comm", 0.0)
+    commission = sb.number_input("Commissione Exchange sulle vincite (%)", 0.0, 20.0, step=0.5, key="bt_comm")
+    lay_mode = "liability"
+    if side == "lay":
+        ss.setdefault("bt_laymode", "liability")
+        lay_mode = sb.radio("Stake del lay", ["liability", "stake"], key="bt_laymode",
+                            format_func={"liability": "Responsabilità fissa 1u", "stake": "Puntata banco fissa 1u"}.get)
 
     sel = selections(sport, market, price, timing, db_version())
+    sb.subheader("2 · Quote e periodo")
     c1, c2 = sb.columns(2)
     ss.setdefault("bt_omin", 1.01)
     ss.setdefault("bt_omax", 50.0)
     odds_min = c1.number_input("Quota min", 1.01, 1000.0, step=0.05, key="bt_omin")
     odds_max = c2.number_input("Quota max", 1.01, 1000.0, step=0.05, key="bt_omax")
     dmin, dmax = sel["date"].min().date(), sel["date"].max().date()
-    ss.setdefault(f"bt_{sport}_period", (dmin, dmax))
-    period = sb.date_input("Periodo", min_value=dmin, max_value=dmax, key=f"bt_{sport}_period")
+    pkey = f"bt_{sport}_period"
+    if pkey in ss and not (isinstance(ss[pkey], tuple) and all(dmin <= d <= dmax for d in ss[pkey])):
+        del ss[pkey]
+    ss.setdefault(pkey, (dmin, dmax))
+    period = sb.date_input("Periodo", min_value=dmin, max_value=dmax, key=pkey)
     d_from, d_to = (period if isinstance(period, tuple) and len(period) == 2 else (dmin, dmax))
 
+    sb.subheader("3 · Filtri")
+    slot = sb.container()
     filters: dict = {}
-    cols = bt.FILTER_COLUMNS[sport]
-    sb.subheader("Filtri")
-    for col, (label, kind) in cols.items():
-        if kind != "cat":
-            continue
-        values = sorted(sel[col].dropna().unique().tolist())
-        picked = sb.multiselect(label, values, key=f"bt_{sport}_{col}", placeholder="tutti")
-        if picked:
-            filters[col] = {"in": picked}
-    with sb.expander("Ranking, form e statistiche pre-match"):
-        st.caption("Lascia vuoto per non filtrare. I match senza il dato vengono esclusi dal filtro.")
-        for col, (label, kind) in cols.items():
-            if kind != "num":
-                continue
-            st.markdown(f"<small>{label}</small>", unsafe_allow_html=True)
-            a, b = st.columns(2)
-            lo = a.number_input("min", value=None, key=f"bt_{sport}_{col}_min", label_visibility="collapsed", placeholder="min")
-            hi = b.number_input("max", value=None, key=f"bt_{sport}_{col}_max", label_visibility="collapsed", placeholder="max")
-            if lo is not None or hi is not None:
-                filters[col] = {"min": lo, "max": hi}
-    excl = sb.checkbox("Escludi i match finiti per ritiro", key="bt_excl") if sport == "tennis" else False
-    ss.setdefault("bt_bank", 100.0)
-    sb.number_input("Banca di riferimento per il drawdown % (unità)", 10.0, 100000.0, step=10.0, key="bt_bank",
-                    help="Ogni operazione rischia 1 unità: il drawdown % è calcolato su una banca iniziale di questa dimensione.")
+    groups: dict[str, list] = {}
+    for spec in bt.FILTERS[sport]:
+        groups.setdefault(spec[2], []).append(spec)
+    for group, specs in groups.items():
+        with sb.expander(group):
+            for spec in specs:
+                rule = _filter_widget(sport, spec, sel)
+                if rule:
+                    filters[spec[0]] = rule
+    excl = False
+    if sport == "tennis":
+        ss.setdefault("bt_excl", False)
+        excl = sb.checkbox("Escludi i match finiti per ritiro", key="bt_excl")
+    a, b = slot.columns([3, 2])
+    a.caption(f"{len(filters)} filtri attivi" if filters else "Nessun filtro attivo")
+    b.button("Azzera", on_click=_reset_filters, args=(sport,), icon=":material/restart_alt:", width="stretch")
+    with sb.expander("Impostazioni"):
+        ss.setdefault("bt_bank", 100.0)
+        st.number_input("Banca di riferimento per il drawdown % (unità)", 10.0, 100000.0, step=10.0, key="bt_bank",
+                        help="Ogni operazione rischia 1 unità: il drawdown % è calcolato su una banca iniziale di questa dimensione.")
     return {
         "sport": sport, "market": market, "selection": selection, "side": side, "price": price,
         "price_timing": timing, "commission": commission / 100, "lay_mode": lay_mode,
@@ -314,23 +559,35 @@ def sidebar_config() -> dict:
 
 
 def describe(cfg: dict) -> str:
+    sport = cfg.get("sport", "tennis")
+    market = cfg.get("market") or bt.MARKETS[sport][0]
     sel = ", ".join(SEL_LABEL.get(s, s) for s in cfg.get("selection") or []) or "tutte le selezioni"
-    parts = [SPORT_LABEL[cfg["sport"]], MARKET_LABEL[cfg["market"]], f"{'Lay' if cfg['side'] == 'lay' else 'Back'} {sel}",
-             f"quota {cfg['odds_min']:.2f}-{cfg['odds_max']:.2f} ({bt.BOOK_LABELS[cfg['price']]})"]
+    parts = [SPORT_LABEL.get(sport, sport), MARKET_LABEL.get(market, market), f"{'Lay' if cfg.get('side') == 'lay' else 'Back'} {sel}",
+             f"quota {float(cfg.get('odds_min') or 1.01):.2f}-{float(cfg.get('odds_max') or 50):.2f} ({bt.BOOK_LABELS.get(cfg.get('price', 'avg'), '?')})"]
     if cfg.get("commission"):
         parts.append(f"comm. {cfg['commission'] * 100:.1f}%")
     for col, rule in (cfg.get("filters") or {}).items():
-        label = bt.FILTER_COLUMNS[cfg["sport"]].get(col, (col,))[0]
+        label = bt.FILTER_LABELS.get(sport, {}).get(col, col)
         if rule.get("in"):
             parts.append(f"{label}: {', '.join(map(str, rule['in']))}")
         else:
-            parts.append(f"{label}: {rule.get('min') if rule.get('min') is not None else '-inf'}..{rule.get('max') if rule.get('max') is not None else '+inf'}")
-    return " | ".join(parts)
+            lo = "min" if rule.get("min") is None else f"{rule['min']:g}"
+            hi = "max" if rule.get("max") is None else f"{rule['max']:g}"
+            parts.append(f"{label}: {lo}..{hi}")
+    return "  ·  ".join(parts)
 
 
 TRADE_COLS = {
-    "tennis": ["date", "competition", "surface", "round", "event", "player", "selection", "rank", "opp_rank", "form10"],
-    "football": ["date", "league", "event", "selection", "home_ppg5", "away_ppg5"],
+    "tennis": ["date", "competition", "surface", "round", "event", "player", "selection", "rank", "opp_rank",
+               "form10", "form_surf", "h2h_wins", "h2h_losses"],
+    "football": ["date", "league", "event", "selection", "home_pos", "away_pos", "home_ppg5", "away_ppg5"],
+}
+STAT_COLS = {
+    "trades": st.column_config.NumberColumn("operazioni"), "win_rate_pct": st.column_config.NumberColumn("win %", format="%.1f"),
+    "profit": st.column_config.NumberColumn("profitto (u)", format="%+.2f"), "roi_pct": st.column_config.NumberColumn("ROI %", format="%+.2f"),
+    "avg_odds": st.column_config.NumberColumn("quota media", format="%.2f"), "clv_pct": st.column_config.NumberColumn("CLV %", format="%+.2f"),
+    "t_stat": st.column_config.NumberColumn("t-stat", format="%+.2f"),
+    "roi_1": st.column_config.NumberColumn("ROI % 1ª metà", format="%+.1f"), "roi_2": st.column_config.NumberColumn("ROI % 2ª metà", format="%+.1f"),
 }
 
 
@@ -342,13 +599,13 @@ def trades_table(trades: pd.DataFrame, sport: str) -> pd.DataFrame:
 
 
 def save_form(key: str) -> None:
-    last = st.session_state.get("last")
+    last = ss.get("last")
     if not last or last["metrics"]["trades"] == 0:
         st.caption("Esegui prima un backtest con almeno un'operazione.")
         return
     with st.form(key, border=False):
-        name = st.text_input("Nome della strategia", placeholder="es. Favoriti terra 1.40-1.80")
-        if st.form_submit_button("Salva nel Vault", icon=":material/save:"):
+        name = st.text_input("Nome della strategia", placeholder="es. Favoriti terra 1.30-1.80")
+        if st.form_submit_button("Salva tra le strategie", icon=":material/save:"):
             if not name.strip():
                 st.error("Inserisci un nome.")
             else:
@@ -356,75 +613,160 @@ def save_form(key: str) -> None:
                 st.success(f"Strategia '{name.strip()}' salvata in strategies.json")
 
 
-def page_backtester() -> None:
-    st.title("Strategy Backtester")
-    if need_db():
-        return
-    cfg = sidebar_config()
-    sel = selections(cfg["sport"], cfg["market"], cfg["price"], cfg["price_timing"], db_version())
-    bank = float(st.session_state.get("bt_bank", 100.0))
-    res = bt.backtest_selections(sel, cfg, bank)
+def tab_summary(cfg: dict, res: bt.BacktestResult, bank: float) -> None:
     m, trades = res.metrics, res.trades
-    st.session_state["last"] = {"cfg": cfg, "metrics": m, "trades": trades}
-    st.caption(describe(cfg))
-    if m["trades"] == 0:
-        st.warning("Nessun match soddisfa i filtri selezionati: allarga i criteri nel pannello laterale.")
-        return
-
-    k = st.columns(6)
-    k[0].metric("ROI / Yield", f"{m['roi_pct']:+.2f}%")
-    k[1].metric("Profitto", f"{m['profit']:+.2f} u")
-    k[2].metric("CLV medio", fmt(m["clv_pct"], "{:+.2f}%"))
-    k[3].metric("Max Drawdown", f"-{m['max_dd_units']:.1f} u")
-    k[4].metric("Win Rate", f"{m['win_rate_pct']:.1f}%")
-    k[5].metric("Operazioni", f"{m['trades']:,}".replace(",", "."))
-    k = st.columns(6)
-    k[0].metric("Quota media", f"{m['avg_odds']:.2f}")
-    k[1].metric("Rischiato", f"{m['staked']:,.0f} u".replace(",", "."))
-    k[2].metric("EV su chiusura", fmt(m["ev_close_pct"], "{:+.2f}%"))
-    k[3].metric("Max DD %", f"-{m['max_dd_pct']:.1f}%")
-    k[4].metric("Serie negativa", f"{m['longest_losing_streak']}")
-    k[5].metric("t-stat", fmt(m["t_stat"]))
-    st.caption(f"Stake 1 unità di rischio per operazione. Max DD % riferito a una banca di {bank:.0f} u (100% = banca azzerata). "
-               "EV su chiusura: valore atteso rispetto alla probabilità di chiusura senza margine.")
+    kpis([("ROI / Yield", f"{m['roi_pct']:+.2f}%", f"su {num_it(m['staked'])} u rischiate", sign_tone(m["roi_pct"])),
+          ("Profitto", f"{m['profit']:+.2f} u", "stake 1 u per operazione", sign_tone(m["profit"])),
+          ("CLV medio", fmt(m["clv_pct"], "{:+.2f}%"), "contro la quota di chiusura", sign_tone(m["clv_pct"])),
+          ("Max Drawdown", f"-{m['max_dd_units']:.1f} u", f"-{m['max_dd_pct']:.0f}% di una banca da {bank:.0f} u", None),
+          ("Win Rate", f"{m['win_rate_pct']:.1f}%", f"quota media {m['avg_odds']:.2f}", None),
+          ("Operazioni", num_it(m["trades"]), f"serie negativa max {m['longest_losing_streak']}", None)])
     if cfg["side"] == "lay":
         st.caption(":material/warning: Lay: il prezzo di banca è la quota back selezionata. Sull'exchange la quota lay reale è più alta "
-                   "(spread) e bancare a quote da bookmaker non è possibile: usa *Betfair Exchange* come quota dove disponibile, "
-                   "imposta la commissione e considera il risultato come limite superiore.")
+                   "e bancare a quote da bookmaker non è possibile: usa *Betfair Exchange* dove disponibile, imposta la commissione "
+                   "e considera il risultato come limite superiore.")
     if cfg["sport"] == "tennis" and cfg["price"] == "ps":
         st.caption("Tennis: l'unica quota Pinnacle disponibile è quella di chiusura, quindi con ingresso Pinnacle il CLV è 0 per costruzione.")
     elif m["clv_coverage_pct"] < 99:
         st.caption(f"CLV calcolato sul {m['clv_coverage_pct']:.0f}% delle operazioni (quota di chiusura non disponibile per le altre).")
-
     show(equity_chart(trades))
     show(drawdown_chart(trades))
-    show(monthly_chart(res.monthly))
+    mo = res.monthly
+    hover = [f"{int(n)} operazioni, yield {y:+.1f}%" for n, y in zip(mo["trades"], mo["yield_pct"])]
+    fig = bars_chart(mo["month"], mo["profit"], hover, "Rendimenti mensili (unità)", " u", 270)
+    fig.update_xaxes(nticks=14, tickangle=0)
+    fig.update_layout(bargap=0.1)
+    show(fig)
 
-    st.subheader("Operazioni")
+
+def tab_analysis(cfg: dict, trades: pd.DataFrame) -> None:
+    sport = cfg["sport"]
+    dims = {"year": "Anno", "odds_bucket": "Fascia di quota"}
+    dims.update({f[0]: f[1] for f in bt.FILTERS[sport] if f[3] == "cat" and f[0] in trades.columns and f[0] != "year"})
+    by = st.selectbox("Scomponi il risultato per", list(dims), format_func=dims.get)
+    bd = bt.breakdown(trades, by)
+    if not bd.empty:
+        top = bd if by in ("year", "odds_bucket", "month", "weekday", "season") else bd.nlargest(25, "trades")
+        hover = [f"{int(n)} operazioni, profitto {p:+.1f} u" for n, p in zip(top["trades"], top["profit"])]
+        show(bars_chart(top[by].astype(str), top["roi_pct"], hover, f"ROI % per {dims[by].lower()}", "%", 330))
+        st.dataframe(bd.rename(columns={by: dims[by].lower()}), hide_index=True, width="stretch", column_config=STAT_COLS)
+
+    st.subheader("Segmenti migliori e peggiori")
+    st.caption("Le operazioni attuali scomposte lungo tutte le variabili filtrabili (le numeriche in quattro fasce). "
+               "Ordinati per t-stat: in alto dove la strategia rende meglio, in fondo dove perde. "
+               "Le due colonne finali mostrano se il risultato regge in entrambe le metà del periodo.")
+    c1, c2 = st.columns([1, 3])
+    min_n = c1.number_input("Operazioni minime per segmento", 20, 5000, 100, 10)
+    scan = bt.segment_scan(trades, sport, int(min_n))
+    if scan.empty:
+        st.info("Nessun segmento con abbastanza operazioni: abbassa la soglia.")
+        return
+    view = pd.concat([scan.head(15), scan.tail(8)]).drop_duplicates(["col", "segmento"]) if len(scan) > 23 else scan
+    st.dataframe(view.drop(columns=["col", "rule"]), hide_index=True, width="stretch", column_config=STAT_COLS, height=420)
+    labels = [f"{r.dimensione} = {r.segmento}   (ROI {r.roi_pct:+.1f}%, {r.trades} op.)" for r in view.itertuples()]
+    pick = c2.selectbox("Aggiungi un segmento ai filtri", range(len(labels)), index=None, format_func=lambda i: labels[i],
+                        placeholder="scegli un segmento...")
+    if pick is not None and st.button("Applica come filtro", icon=":material/filter_alt:"):
+        row = view.iloc[pick]
+        new = {**cfg, "filters": {**cfg["filters"], row["col"]: row["rule"]}}
+        queue_cfg(new)
+        st.rerun()
+    st.caption(":material/warning: Scegliere a posteriori il segmento migliore gonfia il risultato: dopo averlo applicato "
+               "controlla la scheda Robustezza, e diffida dei segmenti che vanno bene in una sola metà del periodo.")
+
+
+def tab_robustness(cfg: dict, res: bt.BacktestResult, sel_args: tuple, bank: float) -> None:
+    m, trades = res.metrics, res.trades
+    c1, _ = st.columns([1, 2])
+    frac = c1.slider("Quota di operazioni usata come campione di studio (%)", 50, 90, 70, 5,
+                     help="Le operazioni più recenti restano fuori e servono da verifica: come se avessi scoperto la strategia a quella data.")
+    cut, ins, oos = bt.split_metrics(trades, frac / 100, bank)
+    yearly = bt.breakdown(trades, "year")
+    conf = bt.roi_confidence(trades)
+    checklist(bt.robustness_checks(m, oos, yearly, conf))
+    st.caption("I controlli aiutano a distinguere un vantaggio reale da un risultato casuale; non sono una garanzia.")
+
+    st.subheader("Studio contro verifica")
+    rows = [("Operazioni", "trades", "{:.0f}"), ("ROI %", "roi_pct", "{:+.2f}"), ("Profitto (u)", "profit", "{:+.2f}"),
+            ("Win rate %", "win_rate_pct", "{:.1f}"), ("CLV %", "clv_pct", "{:+.2f}"), ("Max drawdown (u)", "max_dd_units", "{:.1f}"),
+            ("t-stat", "t_stat", "{:+.2f}")]
+    table = pd.DataFrame({
+        "metrica": [r[0] for r in rows],
+        "tutto il periodo": [fmt(float(m[r[1]]), r[2]) for r in rows],
+        f"studio (primo {frac}%)": [fmt(float(ins[r[1]]), r[2]) for r in rows],
+        f"verifica (ultimo {100 - frac}%)": [fmt(float(oos[r[1]]), r[2]) for r in rows],
+    })
+    st.dataframe(table, hide_index=True, width="stretch")
+    show(equity_chart(trades, cut))
+
+    st.subheader("Anno per anno")
+    st.dataframe(yearly.rename(columns={"year": "anno"}), hide_index=True, width="stretch", column_config=STAT_COLS)
+
+    st.subheader("Stessa strategia, quote diverse")
+    if st.toggle("Confronta i bookmaker", help="Ricalcola la strategia con la quota di ogni bookmaker. Richiede qualche secondo."):
+        sport, market, _, timing = sel_args
+        out = []
+        for book in bt.PRICE_BOOKS[sport]:
+            r = bt.backtest_selections(selections(sport, market, book, timing, db_version()), {**cfg, "price": book}, bank)
+            out.append({"quota": bt.BOOK_LABELS[book], **{k: r.metrics[k] for k in ("trades", "roi_pct", "profit", "clv_pct", "avg_odds")}})
+        st.dataframe(pd.DataFrame(out), hide_index=True, width="stretch", column_config=STAT_COLS)
+        st.caption("Il range di quota si applica alla quota di ciascun bookmaker, quindi il numero di operazioni può cambiare. "
+                   "Il *massimo mercato* è il tetto raggiungibile avendo conti su molti bookmaker.")
+
+
+def tab_trades(cfg: dict, trades: pd.DataFrame) -> None:
     table = trades_table(trades, cfg["sport"])
-    st.dataframe(table, hide_index=True, width="stretch", height=380, column_config={
-        "odds": st.column_config.NumberColumn(format="%.2f"), "close_odds": st.column_config.NumberColumn(format="%.2f"),
+    shown = table.tail(MAX_TABLE_ROWS)
+    if len(table) > MAX_TABLE_ROWS:
+        st.caption(f"Mostrate le ultime {num_it(MAX_TABLE_ROWS)} operazioni su {num_it(len(table))}; l'esportazione le contiene tutte.")
+    st.dataframe(shown, hide_index=True, width="stretch", height=460, column_config={
+        "odds": st.column_config.NumberColumn("quota", format="%.2f"), "close_odds": st.column_config.NumberColumn("chiusura", format="%.2f"),
         "clv_pct": st.column_config.NumberColumn("clv %", format="%.2f"), "pnl": st.column_config.NumberColumn(format="%.3f"),
         "risk": st.column_config.NumberColumn(format="%.2f"), "equity": st.column_config.NumberColumn(format="%.2f"),
-        "form10": st.column_config.NumberColumn(format="%.2f"),
+        "form10": st.column_config.NumberColumn(format="%.0f"), "form_surf": st.column_config.NumberColumn(format="%.0f"),
+        "home_ppg5": st.column_config.NumberColumn(format="%.1f"), "away_ppg5": st.column_config.NumberColumn(format="%.1f"),
     })
-    a, b = st.columns([1, 3])
-    a.download_button("Esporta operazioni (CSV)", table.to_csv(index=False).encode("utf-8"),
-                      file_name=f"trades_{cfg['sport']}_{date.today():%Y%m%d}.csv", mime="text/csv", icon=":material/download:")
-    with b.expander("Salva questa strategia nel Vault"):
+    st.download_button("Esporta tutte le operazioni (CSV)", table.to_csv(index=False).encode("utf-8"),
+                       file_name=f"operazioni_{cfg['sport']}_{date.today():%Y%m%d}.csv", mime="text/csv", icon=":material/download:")
+
+
+def page_backtester() -> None:
+    header("Backtester")
+    if need_db():
+        return
+    cfg = sidebar_config()
+    args = (cfg["sport"], cfg["market"], cfg["price"], cfg["price_timing"])
+    bank = float(ss.get("bt_bank", 100.0))
+    res = bt.backtest_selections(selections(*args, db_version()), cfg, bank)
+    ss["last"] = {"cfg": cfg, "metrics": res.metrics, "trades": res.trades}
+    st.caption(describe(cfg))
+    if res.metrics["trades"] == 0:
+        st.warning("Nessun match soddisfa i filtri selezionati: allarga i criteri nel pannello laterale o premi *Azzera*.")
+        return
+    t1, t2, t3, t4, t5 = st.tabs(["Riepilogo", "Analisi", "Robustezza", "Operazioni", "Salva"])
+    with t1:
+        tab_summary(cfg, res, bank)
+    with t2:
+        tab_analysis(cfg, res.trades)
+    with t3:
+        tab_robustness(cfg, res, args, bank)
+    with t4:
+        tab_trades(cfg, res.trades)
+    with t5:
+        st.caption("Salva la strategia per ritrovarla nella pagina Strategie e usarla nello scanner delle quote del giorno.")
         save_form("save_bt")
 
 
-# --------------------------------------------------------------------------- pagina 3
+# --------------------------------------------------------------------------- pagina: rischio
 def page_risk() -> None:
-    st.title("Risk & Monte Carlo Simulator")
-    last = st.session_state.get("last")
+    header("Rischio", "Simulazione Monte Carlo del bankroll sull'ultima strategia testata.")
+    last = ss.get("last")
     if not last or last["metrics"]["trades"] == 0:
-        st.info("Esegui prima un backtest nella pagina **Strategy Backtester**: la simulazione usa i suoi risultati.")
+        st.info("Esegui prima un backtest nella pagina **Backtester**: la simulazione usa i suoi risultati.")
         return
     m, trades = last["metrics"], last["trades"]
     st.caption(describe(last["cfg"]))
-    st.caption(f"Base storica: {m['trades']} operazioni, ROI {m['roi_pct']:+.2f}%, win rate {m['win_rate_pct']:.1f}%.")
+    st.caption(f"Base storica: {num_it(m['trades'])} operazioni, ROI {m['roi_pct']:+.2f}%, win rate {m['win_rate_pct']:.1f}%.")
     if m["trades"] < 100:
         st.warning("Meno di 100 operazioni storiche: la simulazione è poco affidabile.")
 
@@ -446,21 +788,21 @@ def page_risk() -> None:
     if m["roi_pct"] <= 0:
         st.warning("La strategia ha ROI storico non positivo: Kelly non punta (stake 0) e lo stake fisso perde in media.")
 
+    kpis([("Risk of Ruin - stake fisso", f"{flat['risk_of_ruin_pct']:.1f}%", f"stake {stake_pct:.1f}% della banca iniziale", None),
+          ("Risk of Ruin - Kelly", f"{kelly['risk_of_ruin_pct']:.1f}%", f"stake medio {kelly['mean_stake_pct']:.2f}% della banca", None),
+          ("Mediana finale - stake fisso", num_it(flat["median_final"]), f"in utile nel {flat['prob_profit_pct']:.0f}% dei casi",
+           sign_tone(flat["median_final"] - bankroll)),
+          ("Mediana finale - Kelly", num_it(kelly["median_final"]), f"in utile nel {kelly['prob_profit_pct']:.0f}% dei casi",
+           sign_tone(kelly["median_final"] - bankroll))])
+    pct = lambda v: f"{v:.1f}%"
     summary = pd.DataFrame({
-        "Metrica": ["Risk of Ruin", "Probabilità di chiudere in utile", "Bankroll finale mediano", "Bankroll finale 5° percentile",
-                    "Bankroll finale 95° percentile", "Max drawdown mediano", "Max drawdown 95° percentile", "Stake medio"],
-        "Stake fisso": [f"{flat['risk_of_ruin_pct']:.1f}%", f"{flat['prob_profit_pct']:.1f}%", money(flat['median_final']),
-                        money(flat['p5_final']), money(flat['p95_final']), f"{flat['median_dd_pct']:.1f}%",
-                        f"{flat['p95_dd_pct']:.1f}%", f"{flat['mean_stake_pct']:.2f}% della banca iniziale"],
-        "Kelly frazionario": [f"{kelly['risk_of_ruin_pct']:.1f}%", f"{kelly['prob_profit_pct']:.1f}%", money(kelly['median_final']),
-                              money(kelly['p5_final']), money(kelly['p95_final']), f"{kelly['median_dd_pct']:.1f}%",
-                              f"{kelly['p95_dd_pct']:.1f}%", f"{kelly['mean_stake_pct']:.2f}% della banca corrente"],
+        "metrica": ["Risk of Ruin", "Probabilità di chiudere in utile", "Bankroll finale mediano", "Bankroll finale 5° percentile",
+                    "Bankroll finale 95° percentile", "Max drawdown mediano", "Max drawdown 95° percentile"],
+        "stake fisso": [pct(flat["risk_of_ruin_pct"]), pct(flat["prob_profit_pct"]), num_it(flat["median_final"]), num_it(flat["p5_final"]),
+                        num_it(flat["p95_final"]), pct(flat["median_dd_pct"]), pct(flat["p95_dd_pct"])],
+        "Kelly frazionario": [pct(kelly["risk_of_ruin_pct"]), pct(kelly["prob_profit_pct"]), num_it(kelly["median_final"]),
+                              num_it(kelly["p5_final"]), num_it(kelly["p95_final"]), pct(kelly["median_dd_pct"]), pct(kelly["p95_dd_pct"])],
     })
-    k = st.columns(4)
-    k[0].metric("Risk of Ruin - stake fisso", f"{flat['risk_of_ruin_pct']:.1f}%")
-    k[1].metric("Risk of Ruin - Kelly", f"{kelly['risk_of_ruin_pct']:.1f}%")
-    k[2].metric("Mediana finale - stake fisso", money(flat['median_final']).replace(",", "."))
-    k[3].metric("Mediana finale - Kelly", money(kelly['median_final']).replace(",", "."))
     st.dataframe(summary, hide_index=True, width="stretch")
 
     panels = [(f"Stake fisso {stake_pct:.1f}%", flat, BLUE), (f"Kelly x{kf:g}", kelly, ORANGE)]
@@ -470,37 +812,39 @@ def page_risk() -> None:
     st.subheader("Distribuzione del max drawdown atteso")
     show(dd_hist_chart(panels))
     st.caption("Metodo: bootstrap con reinserimento delle operazioni storiche (1.000 percorsi, seme fisso). "
-               "Kelly stima l'edge con il ROI storico: se quel ROI è sovrastimato (overfitting dei filtri), Kelly sovra-punta. "
+               "Kelly stima il vantaggio con il ROI storico: se quel ROI è sovrastimato, Kelly punta troppo. "
                "I rendimenti passati non garantiscono quelli futuri.")
 
 
-# --------------------------------------------------------------------------- pagina 4
+# --------------------------------------------------------------------------- pagina: strategie
 def page_vault() -> None:
-    st.title("Strategy Vault & Pre-Match Scanner")
+    header("Strategie", "Archivio delle strategie salvate e scanner delle quote del giorno.")
     vault = sv.load_vault()
     st.subheader("Strategie salvate")
     if vault:
-        rows = [{"nome": n, "sport": SPORT_LABEL.get(e["config"].get("sport"), "?"), "regole": describe(e["config"]),
-                 "operazioni": e["metrics"].get("trades"), "ROI %": e["metrics"].get("roi_pct"),
-                 "CLV %": e["metrics"].get("clv_pct"), "max DD (u)": e["metrics"].get("max_dd_units"),
+        rows = [{"nome": n, "sport": SPORT_LABEL.get(e.get("config", {}).get("sport"), "?"), "regole": describe(e.get("config", {})),
+                 "operazioni": e.get("metrics", {}).get("trades"), "ROI %": e.get("metrics", {}).get("roi_pct"),
+                 "CLV %": e.get("metrics", {}).get("clv_pct"), "max DD (u)": e.get("metrics", {}).get("max_dd_units"),
                  "salvata il": e.get("saved_at")} for n, e in vault.items()]
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", column_config={
             "ROI %": st.column_config.NumberColumn(format="%+.2f"), "CLV %": st.column_config.NumberColumn(format="%+.2f"),
             "max DD (u)": st.column_config.NumberColumn(format="%.1f")})
-        a, b = st.columns([3, 1])
-        victim = a.selectbox("Elimina strategia", list(vault), index=None, placeholder="scegli...", label_visibility="collapsed")
-        if b.button("Elimina", disabled=victim is None, icon=":material/delete:"):
-            sv.delete_strategy(victim)
+        a, b, c = st.columns([3, 1, 1])
+        chosen = a.selectbox("Strategia", list(vault), index=None, placeholder="scegli una strategia...", label_visibility="collapsed")
+        if b.button("Apri nel Backtester", disabled=chosen is None, icon=":material/open_in_new:", width="stretch"):
+            queue_cfg(vault[chosen].get("config", {}))
+            st.switch_page(PAGES["backtester"])
+        if c.button("Elimina", disabled=chosen is None, icon=":material/delete:", width="stretch"):
+            sv.delete_strategy(chosen)
             st.rerun()
     else:
-        st.info("Nessuna strategia salvata. Testa una strategia nel Backtester e salvala qui sotto.")
-    with st.expander("Salva l'ultima strategia testata", expanded=not vault):
-        last = st.session_state.get("last")
-        if last:
-            st.caption(describe(last["cfg"]))
+        st.info("Nessuna strategia salvata. Testa una strategia nel Backtester e salvala dalla scheda *Salva*.")
+    with st.expander("Salva l'ultima strategia testata", expanded=False):
+        if ss.get("last"):
+            st.caption(describe(ss["last"]["cfg"]))
         save_form("save_vault")
 
-    st.subheader("Pre-Match Scanner")
+    st.subheader("Scanner delle quote del giorno")
     c = st.columns([2, 1, 1, 1])
     upload = c[0].file_uploader("CSV con le quote del giorno", type=["csv"])
     bankroll = c[1].number_input("Bankroll", 1.0, 1e9, 1000.0, 100.0)
@@ -514,8 +858,9 @@ def page_vault() -> None:
     t1.download_button("Modello CSV tennis", sv.TENNIS_TEMPLATE.to_csv(index=False).encode(), "quote_tennis_modello.csv", "text/csv")
     t2.download_button("Modello CSV calcio", sv.FOOTBALL_TEMPLATE.to_csv(index=False).encode(), "quote_calcio_modello.csv", "text/csv")
     if upload is None:
-        st.caption("Carica un CSV (separatore virgola o punto e virgola). Colonne minime - tennis: player1, player2, odds1, odds2; "
-                   "calcio: home_team, away_team, odds_home, odds_draw, odds_away. Ranking e form mancanti vengono letti dal database.")
+        st.caption("Scarica un modello, compilalo con i match e le quote di oggi e caricalo qui. Colonne minime - tennis: player1, "
+                   "player2, odds1, odds2; calcio: home_team, away_team, odds_home, odds_draw, odds_away. Ranking e form mancanti "
+                   "vengono letti dal database se i nomi coincidono con quelli storici; i filtri su dati assenti vengono segnalati.")
         return
     try:
         df = pd.read_csv(upload, sep=None, engine="python")
@@ -525,17 +870,19 @@ def page_vault() -> None:
     if not vault:
         st.warning("Salva almeno una strategia per poter generare segnali.")
         return
-    if db_ready():
-        with closing(bt.connect()) as con:
-            signals, notes = sv.scan(df, vault, bankroll, con, method, flat_pct, kf, cap)
-    else:
-        signals, notes = sv.scan(df, vault, bankroll, None, method, flat_pct, kf, cap)
+    try:
+        if db_ready():
+            with closing(bt.connect()) as con:
+                signals, notes = sv.scan(df, vault, bankroll, con, method, flat_pct, kf, cap)
+        else:
+            signals, notes = sv.scan(df, vault, bankroll, None, method, flat_pct, kf, cap)
+    except Exception as exc:  # contenuto del CSV non interpretabile
+        st.error(f"Il file non è nel formato atteso ({exc}). Confrontalo con il modello scaricabile qui sopra.")
+        return
     for n in dict.fromkeys(notes):
         st.caption(":material/info: " + n)
-    k = st.columns(3)
-    k[0].metric("Match nel file", len(df))
-    k[1].metric("Segnali attivi", len(signals))
-    k[2].metric("Esposizione totale", f"{signals['importo_rischio'].sum():,.2f}" if len(signals) else "0")
+    kpis([("Match nel file", str(len(df)), None, None), ("Segnali attivi", str(len(signals)), None, None),
+          ("Esposizione totale", num_it(signals["importo_rischio"].sum(), 2) if len(signals) else "0", "somma degli importi a rischio", None)])
     if signals.empty:
         st.info("Nessun match del file attiva le strategie salvate.")
     else:
@@ -549,23 +896,26 @@ def page_vault() -> None:
     with st.expander("File caricato (righe con segnale evidenziate)"):
         hits = set(signals["evento"]) if len(signals) else set()
         norm = df.rename(columns=lambda c: str(c).strip().lower().replace(" ", "_"))
-        if "player1" in norm:
-            ev = norm["player1"].astype(str).str.strip() + " vs " + norm["player2"].astype(str).str.strip()
-            ev2 = norm["player2"].astype(str).str.strip() + " vs " + norm["player1"].astype(str).str.strip()
-            flag = ev.isin(hits) | ev2.isin(hits)
-        elif "home_team" in norm:
+        if "player1" in norm and "player2" in norm:
+            p1, p2 = norm["player1"].astype(str).str.strip(), norm["player2"].astype(str).str.strip()
+            flag = (p1 + " vs " + p2).isin(hits) | (p2 + " vs " + p1).isin(hits)
+        elif "home_team" in norm and "away_team" in norm:
             flag = (norm["home_team"].astype(str).str.strip() + " - " + norm["away_team"].astype(str).str.strip()).isin(hits)
         else:
             flag = pd.Series(False, index=df.index)
-        styled = df.style.apply(lambda row: ["background-color: rgba(57,135,229,0.28)" if flag[row.name] else ""] * len(row), axis=1)
+        flag = flag.to_numpy()
+        styled = df.reset_index(drop=True).style.apply(
+            lambda row: ["background-color: rgba(57,135,229,0.28)" if flag[row.name] else ""] * len(row), axis=1)
         st.dataframe(styled, hide_index=True, width="stretch")
 
 
 # --------------------------------------------------------------------------- navigazione
-pages = [
-    st.Page(page_data, title="Data Manager", icon=":material/database:", url_path="data"),
-    st.Page(page_backtester, title="Strategy Backtester", icon=":material/query_stats:", url_path="backtester", default=True),
-    st.Page(page_risk, title="Risk & Monte Carlo", icon=":material/casino:", url_path="risk"),
-    st.Page(page_vault, title="Vault & Scanner", icon=":material/bookmark:", url_path="vault"),
-]
-st.navigation(pages).run()
+ensure_schema()
+PAGES = {
+    "backtester": st.Page(page_backtester, title="Backtester", icon=":material/query_stats:", url_path="backtester", default=True),
+    "risk": st.Page(page_risk, title="Rischio", icon=":material/casino:", url_path="risk"),
+    "vault": st.Page(page_vault, title="Strategie", icon=":material/bookmark:", url_path="vault"),
+    "data": st.Page(page_data, title="Dati", icon=":material/database:", url_path="data"),
+    "guide": st.Page(page_guide, title="Guida", icon=":material/help:", url_path="guide"),
+}
+st.navigation(list(PAGES.values())).run()

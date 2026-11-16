@@ -338,6 +338,108 @@ def test_tennis_form_has_no_lookahead():
     assert f.loc[6, "winner_form10"] == pytest.approx(4 / 6)  # P prima del match 6: V V S V V S
 
 
+def test_tennis_h2h_rest_and_serve_features():
+    df = pd.DataFrame({
+        "match_id": ["a", "b", "c"], "match_date": pd.to_datetime(["2024-01-01", "2024-01-05", "2024-01-20"]),
+        "round_order": 4.0, "surface": "Hard",
+        "winner_name": ["P", "Q", "P"], "loser_name": ["Q", "P", "Q"],
+        "w_svpt": [50.0, 60.0, 50.0], "w_1stWon": [30.0, 30.0, 30.0], "w_2ndWon": [10.0, 12.0, 10.0],
+        "w_ace": [5.0, 3.0, 5.0], "w_df": [2.0, 1.0, 2.0],
+        "l_svpt": [40.0, 50.0, 40.0], "l_1stWon": [20.0, 25.0, 20.0], "l_2ndWon": [4.0, 5.0, 4.0],
+        "l_ace": [1.0, 2.0, 1.0], "l_df": [3.0, 4.0, 3.0],
+    })
+    f = ud.tennis_features(df).set_index("match_id")
+    assert f.loc["a", "winner_h2h_wins"] == 0 and f.loc["a", "loser_h2h_wins"] == 0
+    assert f.loc["b", "winner_h2h_wins"] == 0 and f.loc["b", "loser_h2h_wins"] == 1   # Q 0 vittorie, P 1
+    assert f.loc["c", "winner_h2h_wins"] == 1 and f.loc["c", "loser_h2h_wins"] == 1
+    assert np.isnan(f.loc["a", "winner_rest_days"])
+    assert f.loc["b", "winner_rest_days"] == 4 and f.loc["c", "winner_rest_days"] == 15
+    assert f.loc["a", "winner_matches14"] == 0 and f.loc["b", "loser_matches14"] == 1 and f.loc["c", "winner_matches14"] == 0
+    assert f["winner_srv_won10"].isna().all()   # servono almeno 5 match precedenti
+
+
+def test_tennis_serve_stats_use_only_previous_matches():
+    n = 7
+    df = pd.DataFrame({
+        "match_id": [f"s{i}" for i in range(n)], "match_date": pd.date_range("2024-01-01", periods=n, freq="3D"),
+        "round_order": 4.0, "surface": "Clay", "winner_name": "P", "loser_name": "Q",
+        "w_svpt": 50.0, "w_1stWon": 30.0, "w_2ndWon": [10.0] * 5 + [0.0, 0.0], "w_ace": 5.0, "w_df": 2.0,
+        "l_svpt": 40.0, "l_1stWon": 20.0, "l_2ndWon": 4.0, "l_ace": 1.0, "l_df": 3.0,
+    })
+    f = ud.tennis_features(df)
+    assert f["winner_srv_won10"].iloc[:5].isna().all()
+    assert f.loc[5, "winner_srv_won10"] == pytest.approx(40 / 50)             # i primi 5 match: (30+10)/50
+    assert f.loc[6, "winner_srv_won10"] == pytest.approx((5 * 40 + 30) / 300)  # il sesto pesa, il settimo no
+    assert f.loc[5, "winner_ret_won10"] == pytest.approx(1 - 24 / 40)
+    assert f.loc[5, "winner_ace10"] == pytest.approx(0.1) and f.loc[5, "loser_df10"] == pytest.approx(3 / 40)
+    assert f.loc[5, "winner_form_surf"] == pytest.approx(1.0)
+
+
+def test_football_table_position_and_venue_form():
+    rows, d = [], pd.Timestamp("2024-08-01")
+    teams = ["A", "B", "C", "D"]
+    for rnd in range(4):          # A vince sempre in casa contro B, C pareggia sempre con D
+        rows.append(("A", "B", "H", 2, 0, d + pd.Timedelta(days=7 * rnd)))
+        rows.append(("C", "D", "D", 1, 1, d + pd.Timedelta(days=7 * rnd)))
+    df = pd.DataFrame(rows, columns=["home_team", "away_team", "ftr", "fthg", "ftag", "match_date"])
+    df["match_id"] = [f"m{i}" for i in range(len(df))]
+    df["div"], df["season_start"] = "X1", 2024
+    f = ud.football_features(df).set_index(df["match_id"])
+    last_ab, last_cd = f.loc["m6"], f.loc["m7"]
+    assert np.isnan(f.loc["m4", "home_pos"])          # meno di 3 giornate giocate
+    assert last_ab["home_pos"] == 1 and last_ab["away_pos"] == 4
+    assert {last_cd["home_pos"], last_cd["away_pos"]} == {2, 3}
+    assert last_ab["home_sppg"] == pytest.approx(3.0) and last_cd["away_sppg"] == pytest.approx(1.0)
+    assert last_ab["home_rest_days"] == 7
+    assert f["home_venue_ppg5"].isna().all()           # servono 5 partite in casa precedenti
+
+
+def test_breakdown_segments_and_confidence():
+    rng = np.random.default_rng(3)
+    n = 800
+    odds = np.round(rng.uniform(1.5, 3.0, n), 2)
+    surface = np.where(np.arange(n) % 2 == 0, "Clay", "Hard")
+    won = rng.random(n) < np.where(surface == "Clay", 1.15, 0.85) / odds   # vantaggio solo sulla terra
+    sel = make_sel(odds.tolist(), won.tolist(), close=(odds * 0.98).tolist(),
+                   dates=pd.date_range("2022-01-01", periods=n, freq="D").strftime("%Y-%m-%d").tolist())
+    sel["surface"], sel["rank"] = surface, rng.integers(1, 200, n).astype(float)
+    t = bt.settle(sel)
+    by = bt.breakdown(t, "surface").set_index("surface")
+    assert by["trades"].sum() == n and by["profit"].sum() == pytest.approx(t["pnl"].sum())
+    clay = t[t["surface"] == "Clay"]
+    assert by.loc["Clay", "roi_pct"] == pytest.approx(clay["pnl"].sum() / len(clay) * 100)
+    assert bt.breakdown(t, "odds_bucket")["trades"].sum() == n
+    scan = bt.segment_scan(t, "tennis", min_trades=100)
+    assert scan.iloc[0]["segmento"] == "Clay" and scan.iloc[0]["rule"] == {"in": ["Clay"]}
+    rank_rules = scan[scan["col"] == "rank"]["rule"].tolist()
+    assert len(rank_rules) == 4 and sum(r["min"] is None for r in rank_rules) == 1
+    # applicare la regola di un segmento riproduce esattamente le sue operazioni
+    seg = scan[scan["col"] == "rank"].iloc[0]
+    again = bt.backtest_selections(sel, {"filters": {"rank": seg["rule"]}})
+    assert again.metrics["trades"] == seg["trades"] and again.metrics["roi_pct"] == pytest.approx(seg["roi_pct"])
+    conf = bt.roi_confidence(t)
+    roi = t["pnl"].sum() / len(t) * 100
+    assert conf["lo"] < roi < conf["hi"] and 0 <= conf["p_positive"] <= 100
+    cut, a, b = bt.split_metrics(t, 0.7)
+    assert a["trades"] == 560 and b["trades"] == 240 and a["profit"] + b["profit"] == pytest.approx(t["pnl"].sum())
+    assert cut == t["date"].iloc[560]
+
+
+def test_old_database_schema_is_upgraded(tmp_path):
+    import duckdb
+    con = duckdb.connect(str(tmp_path / "old.duckdb"))
+    con.execute("CREATE TABLE football_matches (match_id VARCHAR, home_ppg5 DOUBLE)")
+    con.execute("CREATE TABLE tennis_matches (match_id VARCHAR)")
+    assert ud.needs_feature_refresh(con)
+    ud.init_db(con)
+    cols = {r[0] for r in con.execute("DESCRIBE football_matches").fetchall()}
+    assert set(C.FOOT_COLUMNS) <= cols
+    assert set(C.TENNIS_COLUMNS) <= {r[0] for r in con.execute("DESCRIBE tennis_matches").fetchall()}
+    ud.refresh_features(con)
+    assert not ud.needs_feature_refresh(con)
+    con.close()
+
+
 def test_incremental_update_never_duplicates(tmp_path):
     import duckdb
     con = duckdb.connect(str(tmp_path / "t.duckdb"))

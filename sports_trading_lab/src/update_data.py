@@ -188,27 +188,69 @@ def parse_football(raw: bytes, div: str, season: str) -> tuple[pd.DataFrame, int
     return out, n_in - len(d)
 
 
+
+def _roll_mean(long: pd.DataFrame, keys, cols: list[str], window: int, min_periods: int) -> pd.DataFrame:
+    """Media mobile delle `window` osservazioni precedenti (quella corrente esclusa) per gruppo."""
+    shifted = long.groupby(keys, sort=False)[cols].shift(1)
+    key_frame = long[[keys] if isinstance(keys, str) else keys]
+    out = pd.concat([key_frame, shifted], axis=1).groupby(keys, sort=False)[cols].rolling(window, min_periods=min_periods).mean()
+    return out.reset_index(level=list(range(out.index.nlevels - 1)), drop=True).reindex(long.index)
+
+
+def _col(df: pd.DataFrame, name: str) -> pd.Series:
+    return df[name] if name in df.columns else pd.Series(np.nan, index=df.index, dtype="float64")
+
+
+def _table_positions(long: pd.DataFrame) -> pd.Series:
+    """Posizione in classifica prima della partita (punti, differenza reti, gol fatti); NaN nelle prime 3 giornate."""
+    pos = pd.Series(np.nan, index=long.index, dtype="float64")
+    for _, grp in long.groupby(["div", "season"], sort=False):
+        state = {t: [0.0, 0.0, 0.0, 0] for t in grp["team"].unique()}  # punti, diff. reti, gol fatti, giocate
+        for _, day in grp.groupby("date", sort=True):
+            order = sorted(state, key=lambda t: (-state[t][0], -state[t][1], -state[t][2], t))
+            rank = {t: i + 1 for i, t in enumerate(order)}
+            for idx, team in zip(day.index, day["team"]):
+                if state[team][3] >= 3:
+                    pos[idx] = rank[team]
+            for team, pts, gf, ga in zip(day["team"], day["pts"], day["gf"], day["ga"]):
+                st = state[team]
+                st[0] += pts
+                st[1] += gf - ga
+                st[2] += gf
+                st[3] += 1
+    return pos
+
+
 def football_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Form pre-partita senza look-ahead: punti/gol medi nelle ultime 5 partite di campionato."""
-    home = pd.DataFrame({
-        "match_id": df["match_id"], "side": "home", "team": df["home_team"], "date": df["match_date"],
-        "pts": np.select([df["ftr"] == "H", df["ftr"] == "D"], [3.0, 1.0], 0.0),
-        "gf": df["fthg"], "ga": df["ftag"],
-    })
-    away = pd.DataFrame({
-        "match_id": df["match_id"], "side": "away", "team": df["away_team"], "date": df["match_date"],
-        "pts": np.select([df["ftr"] == "A", df["ftr"] == "D"], [3.0, 1.0], 0.0),
-        "gf": df["ftag"], "ga": df["fthg"],
-    })
-    long = pd.concat([home, away]).sort_values(["team", "date", "match_id"], kind="stable")
-    g = long.groupby("team", sort=False)
-    for src, dst in (("pts", "ppg5"), ("gf", "gf5"), ("ga", "ga5")):
-        long[dst] = g[src].transform(lambda s: s.shift(1).rolling(5, min_periods=5).mean())
+    """Feature pre-partita senza look-ahead per squadra di casa e ospite:
+    ppg5/gf5/ga5 (ultime 5 partite), venue_ppg5 (ultime 5 in casa / in trasferta), sot5/sota5 (tiri in porta
+    fatti/subiti), corners5, pos (classifica), sppg (punti a partita in stagione), rest_days (max 30)."""
+    df = df.reset_index(drop=True)
+    sides = []
+    for side, opp, win in (("home", "away", "H"), ("away", "home", "A")):
+        gf, ga = ("fthg", "ftag") if side == "home" else ("ftag", "fthg")
+        sides.append(pd.DataFrame({
+            "match_id": df["match_id"], "side": side, "team": df[f"{side}_team"], "date": pd.to_datetime(df["match_date"]),
+            "div": _col(df, "div"), "season": _col(df, "season_start"),
+            "pts": np.select([df["ftr"] == win, df["ftr"] == "D"], [3.0, 1.0], 0.0),
+            "gf": df[gf].astype(float), "ga": df[ga].astype(float),
+            "sot": _col(df, f"{side}_sot"), "sota": _col(df, f"{opp}_sot"), "corners": _col(df, f"{side}_corners"),
+        }))
+    long = pd.concat(sides).sort_values(["team", "date", "match_id"], kind="stable").reset_index(drop=True)
+    long[["div", "season"]] = long[["div", "season"]].astype(object).where(long[["div", "season"]].notna(), "-")
+    src = ["pts", "gf", "ga", "sot", "sota", "corners"]
+    long[["ppg5", "gf5", "ga5", "sot5", "sota5", "corners5"]] = _roll_mean(long, "team", src, 5, 5).to_numpy()
+    long["venue_ppg5"] = _roll_mean(long, ["team", "side"], ["pts"], 5, 5)["pts"].to_numpy()
+    long["rest_days"] = long.groupby("team", sort=False)["date"].diff().dt.days.clip(upper=30)
+    season = long.groupby(["team", "div", "season"], sort=False)
+    played = season.cumcount()
+    long["sppg"] = ((season["pts"].cumsum() - long["pts"]) / played).where(played >= 3)
+    long["pos"] = _table_positions(long)
     out = pd.DataFrame({"match_id": df["match_id"]})
     for side in ("home", "away"):
         part = long[long["side"] == side].set_index("match_id")
-        for k in ("ppg5", "gf5", "ga5"):
-            out[f"{side}_{k}"] = out["match_id"].map(part[k])
+        for k in C.FOOT_FEATURE_KEYS:
+            out[f"{side}_{k}"] = out["match_id"].map(part[k]).astype("float64")
     return out
 
 
@@ -401,23 +443,54 @@ def build_tennis_year(year: int, tour: pd.DataFrame, chall: pd.DataFrame, odds: 
     return d[C.TENNIS_COLUMNS].reset_index(drop=True), info
 
 
+
 def tennis_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Form pre-partita senza look-ahead: % vittorie nelle ultime 10 partite (min. 5)."""
-    base = df[["match_id", "match_date", "round_order"]]
-    w = base.assign(player=df["winner_name"], won=1.0, side="winner")
-    l = base.assign(player=df["loser_name"], won=0.0, side="loser")
-    long = pd.concat([w, l]).sort_values(["player", "match_date", "round_order", "match_id"], kind="stable")
-    long["form10"] = long.groupby("player", sort=False)["won"].transform(
-        lambda s: s.shift(1).rolling(10, min_periods=5).mean()
-    )
+    """Feature pre-partita senza look-ahead per vincitore e perdente (valori in frazione 0-1 dove percentuali):
+    form10 (% vittorie ultime 10), form_surf (ultime 20 sulla stessa superficie), rest_days (max 60),
+    matches14 (partite nei 14 giorni precedenti), h2h_wins (vittorie precedenti contro l'avversario),
+    srv_won10 / ret_won10 (punti vinti al servizio / in risposta), ace10, df10 (per punto di servizio)."""
+    df = df.reset_index(drop=True)
+    sides = []
+    for a, b, won in (("winner", "loser", 1.0), ("loser", "winner", 0.0)):
+        x, y = a[0], b[0]
+        sides.append(pd.DataFrame({
+            "match_id": df["match_id"], "side": a, "player": df[f"{a}_name"], "opponent": df[f"{b}_name"],
+            "date": pd.to_datetime(df["match_date"]), "round_order": _col(df, "round_order"),
+            "surface": df["surface"].fillna("-") if "surface" in df.columns else "-", "won": won,
+            "svpt": _col(df, f"{x}_svpt"), "sv_won": _col(df, f"{x}_1stWon") + _col(df, f"{x}_2ndWon"),
+            "ace": _col(df, f"{x}_ace"), "dfault": _col(df, f"{x}_df"),
+            "o_svpt": _col(df, f"{y}_svpt"), "o_sv_won": _col(df, f"{y}_1stWon") + _col(df, f"{y}_2ndWon"),
+        }))
+    long = pd.concat(sides).sort_values(["player", "date", "round_order", "match_id"], kind="stable").reset_index(drop=True)
+    # statistiche valide solo se il match ha i punti di servizio di entrambi
+    ok = (long["svpt"] > 0) & (long["o_svpt"] > 0)
+    stat_cols = ["svpt", "sv_won", "ace", "dfault", "o_svpt", "o_sv_won"]
+    long.loc[~ok, stat_cols] = np.nan
+    long["form10"] = _roll_mean(long, "player", ["won"], 10, 5)["won"].to_numpy()
+    long["form_surf"] = _roll_mean(long, ["player", "surface"], ["won"], 20, 5)["won"].to_numpy()
+    grp = long.groupby("player", sort=False)
+    rest = grp["date"].diff().dt.days
+    long["rest_days"] = rest.where(rest > 0).clip(upper=60)  # 0 = data del match non nota (solo data torneo)
+    recent = long.set_index("date").groupby("player", sort=False)["won"].rolling("14D", closed="left", min_periods=0).count()
+    long["matches14"] = recent.to_numpy()
+    pair = long.groupby(["player", "opponent"], sort=False)["won"]
+    long["h2h_wins"] = pair.cumsum() - long["won"]
+    sums = _roll_mean(long, "player", stat_cols, 10, 5)  # medie: i rapporti tra medie equivalgono ai rapporti tra somme
+    long["srv_won10"] = (sums["sv_won"] / sums["svpt"]).to_numpy()
+    long["ret_won10"] = (1 - sums["o_sv_won"] / sums["o_svpt"]).to_numpy()
+    long["ace10"] = (sums["ace"] / sums["svpt"]).to_numpy()
+    long["df10"] = (sums["dfault"] / sums["svpt"]).to_numpy()
     out = pd.DataFrame({"match_id": df["match_id"]})
     for side in ("winner", "loser"):
-        out[f"{side}_form10"] = out["match_id"].map(long[long["side"] == side].set_index("match_id")["form10"])
+        part = long[long["side"] == side].set_index("match_id")
+        for k in C.TENNIS_FEATURE_KEYS:
+            out[f"{side}_{k}"] = out["match_id"].map(part[k]).astype("float64")
     return out
 
 
 # --------------------------------------------------------------------------- database
-def _ddl(table: str, columns: list[str], text: list[str], floats: list[str]) -> str:
+
+def _types(columns: list[str], text: list[str], floats: list[str]) -> dict[str, str]:
     types = {}
     for c in columns:
         if c in text:
@@ -430,16 +503,50 @@ def _ddl(table: str, columns: list[str], text: list[str], floats: list[str]) -> 
             types[c] = "BOOLEAN"
         else:
             types[c] = "INTEGER"
-    cols = ", ".join(f'"{c}" {t}' for c, t in types.items())
-    return f"CREATE TABLE IF NOT EXISTS {table} ({cols})"
+    return types
+
 
 
 def init_db(con: duckdb.DuckDBPyConnection) -> None:
-    con.execute(_ddl("football_matches", C.FOOT_COLUMNS, C.FOOT_TEXT_COLS, C.FOOT_FLOAT_COLS))
-    con.execute(_ddl("tennis_matches", C.TENNIS_COLUMNS, C.TENNIS_TEXT_COLS, C.TENNIS_FLOAT_COLS))
+    """Crea le tabelle se mancano e aggiunge le colonne nuove a un database creato da una versione precedente."""
+    specs = {
+        "football_matches": _types(C.FOOT_COLUMNS, C.FOOT_TEXT_COLS, C.FOOT_FLOAT_COLS),
+        "tennis_matches": _types(C.TENNIS_COLUMNS, C.TENNIS_TEXT_COLS, C.TENNIS_FLOAT_COLS),
+    }
+    for table, types in specs.items():
+        cols = ", ".join(f'"{c}" {t}' for c, t in types.items())
+        con.execute(f"CREATE TABLE IF NOT EXISTS {table} ({cols})")
+        have = {r[0] for r in con.execute(f"DESCRIBE {table}").fetchall()}
+        for c, t in types.items():
+            if c not in have:
+                con.execute(f'ALTER TABLE {table} ADD COLUMN "{c}" {t}')
     con.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_football ON football_matches(match_id)")
     con.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_tennis ON tennis_matches(match_id)")
     con.execute("CREATE TABLE IF NOT EXISTS meta (key VARCHAR PRIMARY KEY, value VARCHAR)")
+
+
+def refresh_features(con, sport: str = "all") -> None:
+    """Ricalcola da zero tutte le feature pre-partita (non richiede download)."""
+    if sport in ("all", "football"):
+        df = con.execute("""SELECT match_id, div, season_start, home_team, away_team, match_date, ftr, fthg, ftag,
+                                   home_sot, away_sot, home_corners, away_corners FROM football_matches""").df()
+        if not df.empty:
+            write_features(con, "football_matches", football_features(df))
+    if sport in ("all", "tennis"):
+        df = con.execute("""SELECT match_id, match_date, round_order, surface, winner_name, loser_name,
+                                   w_svpt, w_1stWon, w_2ndWon, w_ace, w_df, l_svpt, l_1stWon, l_2ndWon, l_ace, l_df
+                            FROM tennis_matches""").df()
+        if not df.empty:
+            write_features(con, "tennis_matches", tennis_features(df))
+    con.execute("INSERT OR REPLACE INTO meta VALUES ('schema_version', ?)", [C.SCHEMA_VERSION])
+
+
+def needs_feature_refresh(con) -> bool:
+    try:
+        row = con.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+    except duckdb.Error:
+        return True
+    return row is None or row[0] != C.SCHEMA_VERSION
 
 
 def replace_rows(con, table: str, df: pd.DataFrame, where: str, params: list) -> None:
@@ -490,9 +597,7 @@ def update_football(con, full: bool, progress) -> dict:
             stats["rows"] += len(df)
             stats["dropped"] += dropped
             stats["outliers"] += df.attrs.get("outliers", 0)
-    all_df = con.execute("SELECT match_id, home_team, away_team, match_date, ftr, fthg, ftag FROM football_matches").df()
-    if not all_df.empty:
-        write_features(con, "football_matches", football_features(all_df))
+    refresh_features(con, "football")
     return stats
 
 
@@ -557,9 +662,7 @@ def update_tennis(con, full: bool, progress) -> dict:
             f"Challenger/quali {info['chall']} ({c_src.split('/')[3] if '/' in c_src else c_src}), "
             f"quote {info['odds']} ({o_src}), abbinate {info['matched']}"
         )
-    all_df = con.execute("SELECT match_id, match_date, round_order, winner_name, loser_name FROM tennis_matches").df()
-    if not all_df.empty:
-        write_features(con, "tennis_matches", tennis_features(all_df))
+    refresh_features(con, "tennis")
     return stats
 
 

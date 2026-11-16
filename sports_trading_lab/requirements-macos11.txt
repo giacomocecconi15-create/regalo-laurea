@@ -1,0 +1,6 @@
+# Mac Intel con macOS 11 o precedente: richiede Python 3.12 e queste versioni
+# (le più recenti di pyarrow non girano su macOS 11).
+-r requirements.txt
+pyarrow==15.0.2
+numpy==1.26.4
+pandas==2.2.3

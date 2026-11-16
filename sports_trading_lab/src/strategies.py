@@ -2,7 +2,7 @@
 
 CSV delle quote del giorno - colonne riconosciute (le facoltative tra parentesi):
   tennis  : date, tournament, surface, player1, player2, odds1, odds2,
-            (circuit, level, series, round, best_of, rank1, rank2, form1, form2)
+            (circuit, level, series, round, best_of, rank1, rank2, form1, form2 in % 0-100)
   calcio  : date, league, home_team, away_team, odds_home, odds_draw, odds_away,
             (odds_over25, odds_under25, home_ppg5, away_ppg5, home_gf5, home_ga5, away_gf5, away_ga5)
 Ranking/form mancanti vengono recuperati dal database quando il nome coincide con quello storico.
@@ -97,7 +97,7 @@ def latest_tennis_profiles(con) -> pd.DataFrame:
             SELECT *, row_number() OVER (PARTITION BY player ORDER BY match_date DESC, round_order DESC) AS n FROM long
         )
         SELECT player, max(CASE WHEN n = 1 THEN rnk END) AS rank,
-               CASE WHEN count(*) >= 5 THEN avg(won) END AS form10
+               CASE WHEN count(*) >= 5 THEN avg(won) * 100 END AS form10
         FROM ranked WHERE n <= 10 GROUP BY player
     """).df().set_index("player")
 
@@ -148,8 +148,9 @@ def tennis_upload_selections(df: pd.DataFrame, con=None) -> pd.DataFrame:
         rank = _col(df, f"rank{a}", True).fillna(player.map(prof["rank"]))
         opp_rank = _col(df, f"rank{b}", True).fillna(opp.map(prof["rank"]))
         odds, opp_odds = _col(df, f"odds{a}", True), _col(df, f"odds{b}", True)
+        dates = pd.to_datetime(_col(df, "date"), errors="coerce")
         parts.append(pd.DataFrame({
-            "match_id": "row" + df.index.astype(str), "date": pd.to_datetime(_col(df, "date"), errors="coerce"),
+            "match_id": "row" + df.index.astype(str), "date": dates, **bt._calendar(dates),
             "circuit": _col(df, "circuit"), "competition": _col(df, "tournament"), "level": _col(df, "level"),
             "series": _col(df, "series"), "surface": _col(df, "surface").astype(str).str.title().replace({"Nan": np.nan}),
             "round": _col(df, "round"), "best_of": _col(df, "best_of", True),
@@ -178,11 +179,13 @@ def football_upload_selections(df: pd.DataFrame, market: str, con=None) -> pd.Da
         for k in ("ppg5", "gf5", "ga5"):
             feat[f"{side}_{k}"] = _col(df, f"{side}_{k}", True).fillna(team.map(form[k]))
     oh, od, oa = (_col(df, c, True) for c in ("odds_home", "odds_draw", "odds_away"))
+    dates = pd.to_datetime(_col(df, "date"), errors="coerce")
     common = {
-        "match_id": "row" + df.index.astype(str), "date": pd.to_datetime(_col(df, "date"), errors="coerce"),
+        "match_id": "row" + df.index.astype(str), "date": dates, **bt._calendar(dates),
         "country": country, "league": league, "competition": league, "season": np.nan,
         "home_team": home, "away_team": away, "event": home + " - " + away,
-        "odds_home": oh, "odds_draw": od, "odds_away": oa, **feat,
+        "odds_home": oh, "odds_draw": od, "odds_away": oa, "odds_over": _col(df, "odds_over25", True), **feat,
+        "goals5": (feat["home_gf5"] + feat["home_ga5"] + feat["away_gf5"] + feat["away_ga5"]) / 2,
         "ppg_diff": feat["home_ppg5"] - feat["away_ppg5"],
     }
     if market == "1x2":
@@ -246,7 +249,7 @@ def scan(upload: pd.DataFrame, vault: dict, bankroll: float, con=None, method: s
         live = {k: v for k, v in cfg.items() if k not in ("date_from", "date_to", "exclude_retirements")}
         live["filters"] = {}
         for col, rule in (cfg.get("filters") or {}).items():
-            if col == "season":
+            if col in ("season", "year"):
                 continue
             if col not in sel.columns or sel[col].isna().all():
                 notes.append(f"'{name}': filtro '{col}' non verificabile (dato assente nel CSV e nel database) - ignorato.")

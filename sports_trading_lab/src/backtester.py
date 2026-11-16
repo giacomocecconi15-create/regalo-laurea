@@ -46,26 +46,88 @@ PRICE_BOOKS = {"tennis": C.TENNIS_BOOKS, "football": C.FOOT_BOOKS}
 BOOK_LABELS = {"ps": "Pinnacle", "b365": "Bet365", "max": "Massimo mercato", "avg": "Media mercato", "bfe": "Betfair Exchange"}
 CLOSE_PRIORITY = ["ps", "bfe", "avg"]  # riferimento di chiusura per il CLV
 
-# colonne filtrabili: nome -> (etichetta, tipo)
-FILTER_COLUMNS = {
-    "tennis": {
-        "circuit": ("Circuito", "cat"), "level": ("Livello torneo", "cat"), "series": ("Serie", "cat"),
-        "competition": ("Torneo", "cat"), "surface": ("Superficie", "cat"), "round": ("Turno", "cat"),
-        "best_of": ("Al meglio di", "cat"),
-        "rank": ("Ranking giocatore", "num"), "opp_rank": ("Ranking avversario", "num"),
-        "rank_adv": ("Vantaggio ranking (avv - gioc)", "num"),
-        "form10": ("Form giocatore (% vinte ultime 10)", "num"), "opp_form10": ("Form avversario", "num"),
-        "age": ("Eta' giocatore", "num"), "opp_odds": ("Quota avversario", "num"),
-    },
-    "football": {
-        "country": ("Paese", "cat"), "league": ("Lega", "cat"), "season": ("Stagione", "cat"),
-        "odds_home": ("Quota casa", "num"), "odds_draw": ("Quota pareggio", "num"), "odds_away": ("Quota ospite", "num"),
-        "home_ppg5": ("Punti/partita casa (ult. 5)", "num"), "away_ppg5": ("Punti/partita ospite (ult. 5)", "num"),
-        "ppg_diff": ("Differenza form (casa - ospite)", "num"),
-        "home_gf5": ("Gol fatti casa (media ult. 5)", "num"), "home_ga5": ("Gol subiti casa (media ult. 5)", "num"),
-        "away_gf5": ("Gol fatti ospite (media ult. 5)", "num"), "away_ga5": ("Gol subiti ospite (media ult. 5)", "num"),
-    },
+# Filtri disponibili: (colonna, etichetta, gruppo, tipo, min, max, passo)
+#   cat    -> selezione multipla;  num -> min/max liberi;  slider -> intervallo su scala fissa
+MONTHS = ["01 Gen", "02 Feb", "03 Mar", "04 Apr", "05 Mag", "06 Giu", "07 Lug", "08 Ago", "09 Set", "10 Ott", "11 Nov", "12 Dic"]
+WEEKDAYS = ["1 Lun", "2 Mar", "3 Mer", "4 Gio", "5 Ven", "6 Sab", "7 Dom"]
+FILTERS = {
+    "tennis": [
+        ("level", "Livello torneo", "Torneo", "cat"), ("series", "Serie", "Torneo", "cat"),
+        ("competition", "Torneo", "Torneo", "cat"), ("surface", "Superficie", "Torneo", "cat"),
+        ("court", "Indoor / Outdoor", "Torneo", "cat"), ("round", "Turno", "Torneo", "cat"),
+        ("best_of", "Al meglio di (set)", "Torneo", "cat"),
+        ("year", "Anno", "Calendario", "cat"), ("month", "Mese", "Calendario", "cat"),
+        ("weekday", "Giorno della settimana", "Calendario", "cat"),
+        ("rank", "Ranking", "Giocatore puntato", "num"), ("rank_points", "Punti ATP", "Giocatore puntato", "num"),
+        ("form10", "Form: % vittorie ultime 10", "Giocatore puntato", "slider", 0, 100, 5),
+        ("form_surf", "Form sulla superficie: % ultime 20", "Giocatore puntato", "slider", 0, 100, 5),
+        ("rest_days", "Giorni dall'ultimo match", "Giocatore puntato", "slider", 1, 60, 1),
+        ("matches14", "Match giocati negli ultimi 14 giorni", "Giocatore puntato", "slider", 0, 10, 1),
+        ("srv_won10", "% punti vinti al servizio (ult. 10)", "Giocatore puntato", "slider", 50, 80, 1),
+        ("ret_won10", "% punti vinti in risposta (ult. 10)", "Giocatore puntato", "slider", 25, 50, 1),
+        ("ace10", "% ace per punto di servizio", "Giocatore puntato", "slider", 0, 25, 1),
+        ("df10", "% doppi falli per punto di servizio", "Giocatore puntato", "slider", 0, 10, 0.5),
+        ("age", "Età", "Giocatore puntato", "slider", 15, 45, 1), ("height", "Altezza (cm)", "Giocatore puntato", "slider", 160, 215, 1),
+        ("hand", "Mano", "Giocatore puntato", "cat"), ("country", "Nazione", "Giocatore puntato", "cat"),
+        ("opp_rank", "Ranking", "Avversario", "num"), ("opp_odds", "Quota", "Avversario", "num"),
+        ("opp_form10", "Form: % vittorie ultime 10", "Avversario", "slider", 0, 100, 5),
+        ("opp_form_surf", "Form sulla superficie: % ultime 20", "Avversario", "slider", 0, 100, 5),
+        ("opp_rest_days", "Giorni dall'ultimo match", "Avversario", "slider", 1, 60, 1),
+        ("opp_srv_won10", "% punti vinti al servizio (ult. 10)", "Avversario", "slider", 50, 80, 1),
+        ("opp_ret_won10", "% punti vinti in risposta (ult. 10)", "Avversario", "slider", 25, 50, 1),
+        ("opp_hand", "Mano", "Avversario", "cat"),
+        ("rank_adv", "Vantaggio di ranking (avversario - giocatore)", "Confronto diretto", "num"),
+        ("form_adv", "Vantaggio di form (punti %)", "Confronto diretto", "slider", -100, 100, 5),
+        ("h2h_wins", "Precedenti vinti (dal 2019)", "Confronto diretto", "slider", 0, 15, 1),
+        ("h2h_losses", "Precedenti persi (dal 2019)", "Confronto diretto", "slider", 0, 15, 1),
+        ("h2h_diff", "Saldo dei precedenti", "Confronto diretto", "slider", -10, 10, 1),
+    ],
+    "football": [
+        ("country", "Paese", "Competizione", "cat"), ("league", "Lega", "Competizione", "cat"),
+        ("season", "Stagione", "Competizione", "cat"),
+        ("month", "Mese", "Calendario", "cat"), ("weekday", "Giorno della settimana", "Calendario", "cat"),
+        ("odds_home", "Quota 1", "Quote del match", "num"), ("odds_draw", "Quota X", "Quote del match", "num"),
+        ("odds_away", "Quota 2", "Quote del match", "num"), ("odds_over", "Quota Over 2.5", "Quote del match", "num"),
+        ("ah_line", "Handicap asiatico (linea casa)", "Quote del match", "slider", -3.0, 3.0, 0.25),
+        ("home_pos", "Posizione in classifica", "Squadra di casa", "slider", 1, 24, 1),
+        ("home_sppg", "Punti a partita in stagione", "Squadra di casa", "slider", 0.0, 3.0, 0.1),
+        ("home_ppg5", "Punti a partita (ultime 5)", "Squadra di casa", "slider", 0.0, 3.0, 0.2),
+        ("home_venue_ppg5", "Punti a partita (ultime 5 in casa)", "Squadra di casa", "slider", 0.0, 3.0, 0.2),
+        ("home_gf5", "Gol fatti (media ult. 5)", "Squadra di casa", "slider", 0.0, 4.0, 0.2),
+        ("home_ga5", "Gol subiti (media ult. 5)", "Squadra di casa", "slider", 0.0, 4.0, 0.2),
+        ("home_sot5", "Tiri in porta fatti (media ult. 5)", "Squadra di casa", "slider", 0.0, 10.0, 0.5),
+        ("home_sota5", "Tiri in porta subiti (media ult. 5)", "Squadra di casa", "slider", 0.0, 10.0, 0.5),
+        ("home_corners5", "Calci d'angolo (media ult. 5)", "Squadra di casa", "slider", 0.0, 12.0, 0.5),
+        ("home_rest_days", "Giorni di riposo", "Squadra di casa", "slider", 2, 30, 1),
+        ("away_pos", "Posizione in classifica", "Squadra ospite", "slider", 1, 24, 1),
+        ("away_sppg", "Punti a partita in stagione", "Squadra ospite", "slider", 0.0, 3.0, 0.1),
+        ("away_ppg5", "Punti a partita (ultime 5)", "Squadra ospite", "slider", 0.0, 3.0, 0.2),
+        ("away_venue_ppg5", "Punti a partita (ultime 5 in trasferta)", "Squadra ospite", "slider", 0.0, 3.0, 0.2),
+        ("away_gf5", "Gol fatti (media ult. 5)", "Squadra ospite", "slider", 0.0, 4.0, 0.2),
+        ("away_ga5", "Gol subiti (media ult. 5)", "Squadra ospite", "slider", 0.0, 4.0, 0.2),
+        ("away_sot5", "Tiri in porta fatti (media ult. 5)", "Squadra ospite", "slider", 0.0, 10.0, 0.5),
+        ("away_sota5", "Tiri in porta subiti (media ult. 5)", "Squadra ospite", "slider", 0.0, 10.0, 0.5),
+        ("away_corners5", "Calci d'angolo (media ult. 5)", "Squadra ospite", "slider", 0.0, 12.0, 0.5),
+        ("away_rest_days", "Giorni di riposo", "Squadra ospite", "slider", 2, 30, 1),
+        ("pos_diff", "Posizioni di vantaggio della casa", "Confronto", "slider", -23, 23, 1),
+        ("ppg_diff", "Differenza punti a partita ult. 5 (casa - ospite)", "Confronto", "slider", -3.0, 3.0, 0.2),
+        ("goals5", "Gol totali medi nelle partite recenti", "Confronto", "slider", 0.0, 6.0, 0.2),
+    ],
 }
+FILTER_COLUMNS = {sp: {f[0]: (f[1], f[3]) for f in specs} for sp, specs in FILTERS.items()}
+FILTER_LABELS = {sp: {f[0]: (f[1] if f[2] in ("Torneo", "Competizione", "Calendario", "Quote del match", "Confronto", "Confronto diretto")
+                            else f"{f[2]}: {f[1]}") for f in specs} for sp, specs in FILTERS.items()}
+
+
+def _get(m: pd.DataFrame, name: str) -> pd.Series:
+    """Colonna del database, o NaN se il database e' di una versione precedente."""
+    return m[name] if name in m.columns else pd.Series(np.nan, index=m.index, dtype="float64")
+
+
+def _calendar(dates: pd.Series) -> dict:
+    return {"year": dates.dt.year.astype("Int64").astype(str),
+            "month": dates.dt.month.map(lambda i: MONTHS[int(i) - 1] if pd.notna(i) else None),
+            "weekday": dates.dt.day_of_week.map(lambda i: WEEKDAYS[int(i)] if pd.notna(i) else None)}
 
 
 def connect(db_path: str | Path | None = None, read_only: bool = True) -> duckdb.DuckDBPyConnection:
@@ -74,28 +136,44 @@ def connect(db_path: str | Path | None = None, read_only: bool = True) -> duckdb
 
 # --------------------------------------------------------------------------- selezioni
 def tennis_selections(matches: pd.DataFrame, price: str = "avg") -> pd.DataFrame:
-    """Due righe per match (una per giocatore). I walkover sono esclusi (scommessa nulla)."""
+    """Due righe per match (una per giocatore). I walkover sono esclusi (scommessa nulla).
+    Le percentuali (form, servizio, risposta) sono espresse in punti 0-100."""
     m = matches[matches["status"].fillna("Completed") != "Walkover"]
+    dates = pd.to_datetime(m["match_date"])
+    indoor = _get(m, "indoor")
     common = {
-        "match_id": m["match_id"], "date": pd.to_datetime(m["match_date"]), "season": m["season"],
+        "match_id": m["match_id"], "date": dates, "season": m["season"], **_calendar(dates),
         "circuit": m["circuit"], "competition": m["tourney_name"], "level": m["tourney_level"],
         "series": m["series"], "surface": m["surface"], "round": m["round"], "best_of": m["best_of"],
+        "court": np.where(indoor.isna(), None, np.where(indoor.eq(True), "Indoor", "Outdoor")),
         "status": m["status"],
     }
     sides = []
     for a, b, won in (("winner", "loser", True), ("loser", "winner", False)):
         x, y = a[0], b[0]
+        pct = lambda col: _get(m, col) * 100
         sides.append(pd.DataFrame({
             **common,
             "player": m[f"{a}_name"], "opponent": m[f"{b}_name"],
-            "rank": m[f"{a}_rank"], "opp_rank": m[f"{b}_rank"],
-            "form10": m[f"{a}_form10"], "opp_form10": m[f"{b}_form10"], "age": m[f"{a}_age"],
+            "rank": m[f"{a}_rank"], "opp_rank": m[f"{b}_rank"], "rank_points": _get(m, f"{a}_rank_points"),
+            "age": _get(m, f"{a}_age"), "height": _get(m, f"{a}_ht"),
+            "hand": _get(m, f"{a}_hand"), "opp_hand": _get(m, f"{b}_hand"), "country": _get(m, f"{a}_ioc"),
+            "form10": pct(f"{a}_form10"), "opp_form10": pct(f"{b}_form10"),
+            "form_surf": pct(f"{a}_form_surf"), "opp_form_surf": pct(f"{b}_form_surf"),
+            "rest_days": _get(m, f"{a}_rest_days"), "opp_rest_days": _get(m, f"{b}_rest_days"),
+            "matches14": _get(m, f"{a}_matches14"),
+            "h2h_wins": _get(m, f"{a}_h2h_wins"), "h2h_losses": _get(m, f"{b}_h2h_wins"),
+            "srv_won10": pct(f"{a}_srv_won10"), "ret_won10": pct(f"{a}_ret_won10"),
+            "ace10": pct(f"{a}_ace10"), "df10": pct(f"{a}_df10"),
+            "opp_srv_won10": pct(f"{b}_srv_won10"), "opp_ret_won10": pct(f"{b}_ret_won10"),
             "odds": m[f"{price}_{x}"], "opp_odds": m[f"{price}_{y}"],
             "close_odds": m[f"ps_{x}"], "_close_opp": m[f"ps_{y}"],
             "won": won,
         }))
     s = pd.concat(sides, ignore_index=True)
     s["rank_adv"] = s["opp_rank"] - s["rank"]
+    s["form_adv"] = s["form10"] - s["opp_form10"]
+    s["h2h_diff"] = s["h2h_wins"] - s["h2h_losses"]
     inv = 1 / s["close_odds"] + 1 / s["_close_opp"]
     s["p_close"] = (1 / s["close_odds"]) / inv  # probabilita' di chiusura senza margine
     s["selection"] = np.select([s["odds"] < s["opp_odds"], s["odds"] > s["opp_odds"]], ["favourite", "underdog"], "pick")
@@ -129,14 +207,19 @@ def football_selections(matches: pd.DataFrame, market: str = "1x2", price: str =
     close, close_src = _close_reference(m, sfx)
     inv = (1 / close).sum(axis=1, min_count=len(sfx))
     oh, od, oa = m[f"{price}_{pre}h"], m[f"{price}_{pre}d"], m[f"{price}_{pre}a"]
+    dates = pd.to_datetime(m["match_date"])
+    feats = {f"{side}_{k}": _get(m, f"{side}_{k}") for side in ("home", "away") for k in C.FOOT_FEATURE_KEYS}
     common = {
-        "match_id": m["match_id"], "date": pd.to_datetime(m["match_date"]), "season": m["season"],
+        "match_id": m["match_id"], "date": dates, "season": m["season"], **_calendar(dates),
         "country": m["country"], "league": m["league"], "competition": m["league"],
         "home_team": m["home_team"], "away_team": m["away_team"],
         "event": m["home_team"] + " - " + m["away_team"],
-        "odds_home": oh, "odds_draw": od, "odds_away": oa,
-        "home_ppg5": m["home_ppg5"], "away_ppg5": m["away_ppg5"], "ppg_diff": m["home_ppg5"] - m["away_ppg5"],
-        "home_gf5": m["home_gf5"], "home_ga5": m["home_ga5"], "away_gf5": m["away_gf5"], "away_ga5": m["away_ga5"],
+        "odds_home": oh, "odds_draw": od, "odds_away": oa, "odds_over": _get(m, f"{price}_{pre}o25"),
+        "ah_line": _get(m, "ah_cline" if timing == "close" else "ah_line"),
+        **feats,
+        "ppg_diff": feats["home_ppg5"] - feats["away_ppg5"],
+        "pos_diff": feats["away_pos"] - feats["home_pos"],
+        "goals5": (feats["home_gf5"] + feats["home_ga5"] + feats["away_gf5"] + feats["away_ga5"]) / 2,
         "close_source": close_src,
     }
     parts = []
@@ -331,10 +414,149 @@ def run_backtest(cfg: dict, con: duckdb.DuckDBPyConnection | None = None, bankro
     return backtest_selections(sel, cfg, bankroll)
 
 
+# --------------------------------------------------------------------------- analisi
+ODDS_BINS = [1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0, 6.0, 1001.0]
+ODDS_LABELS = ["1.01-1.25", "1.26-1.50", "1.51-1.75", "1.76-2.00", "2.01-2.50", "2.51-3.00", "3.01-4.00", "4.01-6.00", "oltre 6.00"]
+
+
+def _aggregate(trades: pd.DataFrame, key) -> pd.DataFrame:
+    """Statistiche per gruppo: operazioni, win rate, profitto, ROI, quota media, CLV, t-stat."""
+    t = trades.assign(_r=trades["pnl"] / trades["risk"], _w=trades["pnl"] > 0)
+    g = t.groupby(key, observed=True, sort=True)
+    out = pd.DataFrame({
+        "trades": g.size(), "win_rate_pct": g["_w"].mean() * 100, "profit": g["pnl"].sum(),
+        "staked": g["risk"].sum(), "avg_odds": g["odds"].mean(), "clv_pct": g["clv_pct"].mean(),
+    })
+    out["roi_pct"] = out["profit"] / out["staked"] * 100
+    sd = g["_r"].std(ddof=1)
+    out["t_stat"] = (g["_r"].mean() / sd * np.sqrt(out["trades"])).where(sd > 0)
+    return out[["trades", "win_rate_pct", "profit", "roi_pct", "avg_odds", "clv_pct", "t_stat"]]
+
+
+def breakdown(trades: pd.DataFrame, by: str) -> pd.DataFrame:
+    """Risultati scomposti per una dimensione ('odds_bucket' = fasce di quota)."""
+    if trades.empty:
+        return pd.DataFrame()
+    if by == "odds_bucket":
+        key = pd.cut(trades["odds"], ODDS_BINS, labels=ODDS_LABELS).rename("odds_bucket")
+    else:
+        key = trades[by]
+    return _aggregate(trades, key).rename_axis(by).reset_index()
+
+
+def segment_scan(trades: pd.DataFrame, sport: str, min_trades: int = 100, buckets: int = 4) -> pd.DataFrame:
+    """Scompone le operazioni lungo tutte le dimensioni filtrabili e misura ogni segmento.
+    `roi_1` / `roi_2`: ROI nella prima e nella seconda meta' cronologica (stabilita' nel tempo).
+    `rule` e' il filtro da applicare per isolare il segmento."""
+    rows = []
+    if trades.empty:
+        return pd.DataFrame(columns=["col", "dimensione", "segmento", "trades", "roi_pct", "clv_pct", "t_stat", "roi_1", "roi_2", "rule"])
+    t = trades.reset_index(drop=True)
+    half = np.where(np.arange(len(t)) < len(t) / 2, 1, 2)
+    for spec in FILTERS[sport]:
+        col, kind = spec[0], spec[3]
+        if col not in t.columns or t[col].notna().sum() < min_trades:
+            continue
+        if kind == "cat":
+            key, rules = t[col], None
+        else:
+            try:
+                key, edges = pd.qcut(t[col], buckets, retbins=True, duplicates="drop")
+            except ValueError:
+                continue
+            if len(edges) < 3:
+                continue
+            # estremi = valori realmente presenti nella fascia, cosi' il filtro riproduce esattamente il segmento
+            span = t.groupby(key, observed=True)[col].agg(["min", "max"])
+            rules = {iv: {"min": float(span.loc[iv, "min"]), "max": float(span.loc[iv, "max"])} for iv in span.index}
+            rules[span.index[0]]["min"] = None
+            rules[span.index[-1]]["max"] = None
+        agg = _aggregate(t, key.rename("seg"))
+        agg = agg[agg["trades"] >= min_trades]
+        if agg.empty:
+            continue
+        h = t.assign(_h=half, _seg=key).groupby(["_seg", "_h"], observed=True)[["pnl", "risk"]].sum()
+        roi_h = (h["pnl"] / h["risk"] * 100).unstack("_h")
+        for seg, r in agg.iterrows():
+            if rules is None:
+                label, rule = str(seg), {"in": [seg]}
+            else:
+                rule = rules[seg]
+                lo = "min" if rule["min"] is None else f"{rule['min']:g}"
+                hi = "max" if rule["max"] is None else f"{rule['max']:g}"
+                label = f"{lo} .. {hi}"
+            rows.append({"col": col, "dimensione": FILTER_LABELS[sport][col], "segmento": label,
+                         "trades": int(r["trades"]), "roi_pct": r["roi_pct"], "clv_pct": r["clv_pct"], "t_stat": r["t_stat"],
+                         "roi_1": roi_h.loc[seg].get(1, np.nan) if seg in roi_h.index else np.nan,
+                         "roi_2": roi_h.loc[seg].get(2, np.nan) if seg in roi_h.index else np.nan, "rule": rule})
+    out = pd.DataFrame(rows)
+    return out.sort_values("t_stat", ascending=False).reset_index(drop=True) if len(out) else out
+
+
+def roi_confidence(trades: pd.DataFrame, n_boot: int = 1000, seed: int = 7) -> dict:
+    """Intervallo di confidenza 95% del ROI e probabilita' che il ROI vero sia positivo.
+    Bootstrap fino a 5.000 operazioni, approssimazione normale oltre (stesso risultato, piu' leggero)."""
+    n = len(trades)
+    if n < 2:
+        return {"lo": float("nan"), "hi": float("nan"), "p_positive": float("nan"), "method": "n/d"}
+    pnl, risk = trades["pnl"].to_numpy(dtype=float), trades["risk"].to_numpy(dtype=float)
+    if n <= 5000:
+        rng = np.random.default_rng(seed)
+        idx = rng.integers(0, n, size=(n_boot, n))
+        rois = pnl[idx].sum(axis=1) / risk[idx].sum(axis=1) * 100
+        lo, hi = np.percentile(rois, [2.5, 97.5])
+        return {"lo": float(lo), "hi": float(hi), "p_positive": float((rois > 0).mean() * 100), "method": "bootstrap"}
+    from math import erf, sqrt
+    roi = pnl.sum() / risk.sum()
+    se = np.std(pnl - roi * risk, ddof=1) * np.sqrt(n) / risk.sum()
+    z = roi / se if se > 0 else 0.0
+    return {"lo": float((roi - 1.96 * se) * 100), "hi": float((roi + 1.96 * se) * 100),
+            "p_positive": float(0.5 * (1 + erf(z / sqrt(2))) * 100), "method": "normale"}
+
+
+def split_metrics(trades: pd.DataFrame, frac: float = 0.7, bankroll: float = 100.0) -> tuple[pd.Timestamp | None, dict, dict]:
+    """Divide le operazioni in ordine di tempo: primo `frac` (campione di studio) e resto (verifica)."""
+    n = len(trades)
+    cut = int(round(n * frac))
+    if n == 0 or cut == 0 or cut >= n:
+        return None, compute_metrics(trades, bankroll), compute_metrics(trades.iloc[0:0], bankroll)
+    a, b = trades.iloc[:cut].copy(), trades.iloc[cut:].copy()
+    b["equity"] = b["pnl"].cumsum()
+    return trades["date"].iloc[cut], compute_metrics(a, bankroll), compute_metrics(b, bankroll)
+
+
+def robustness_checks(metrics: dict, oos: dict, yearly: pd.DataFrame, conf: dict) -> list[tuple[str, str, str]]:
+    """Lista di controlli (nome, esito 'ok'|'warn'|'bad', dettaglio) per valutare se fidarsi del risultato."""
+    n = metrics["trades"]
+    checks = [("Dimensione del campione", "ok" if n >= 500 else "warn" if n >= 150 else "bad",
+               f"{n} operazioni (meglio almeno 500)")]
+    t = metrics["t_stat"]
+    checks.append(("Significatività statistica", "ok" if t >= 2 else "warn" if t >= 1 else "bad",
+                   f"t-stat {t:.2f} (sopra 2 è difficile da spiegare col caso)" if np.isfinite(t) else "non calcolabile"))
+    if np.isfinite(conf.get("lo", float("nan"))):
+        checks.append(("Intervallo di confidenza del ROI", "ok" if conf["lo"] > 0 else "warn" if conf["p_positive"] >= 80 else "bad",
+                       f"95%: da {conf['lo']:+.1f}% a {conf['hi']:+.1f}% - probabilità ROI positivo {conf['p_positive']:.0f}%"))
+    clv = metrics["clv_pct"]
+    if np.isfinite(clv):
+        checks.append(("Closing Line Value", "ok" if clv > 0.5 else "warn" if clv > -0.5 else "bad",
+                       f"CLV medio {clv:+.2f}% (positivo = batti la chiusura)"))
+    if oos["trades"] >= 30:
+        checks.append(("Tenuta fuori campione", "ok" if oos["roi_pct"] > 0 else "bad",
+                       f"ROI {oos['roi_pct']:+.2f}% sulle ultime {oos['trades']} operazioni"))
+    if len(yearly) >= 3:
+        pos = int((yearly["profit"] > 0).sum())
+        share = pos / len(yearly)
+        checks.append(("Costanza negli anni", "ok" if share >= 0.7 else "warn" if share >= 0.5 else "bad",
+                       f"{pos} anni positivi su {len(yearly)}"))
+    return checks
+
+
 if __name__ == "__main__":
     demo = {"sport": "tennis", "market": "h2h", "selection": ["favourite"], "side": "back", "price": "max",
             "odds_min": 1.2, "odds_max": 1.8, "filters": {"surface": {"in": ["Clay"]}}}
     res = run_backtest(demo)
     for k, v in res.metrics.items():
         print(f"{k:>24}: {v:,.2f}" if isinstance(v, float) else f"{k:>24}: {v}")
+
+
     print(res.monthly.tail(6).to_string(index=False))
