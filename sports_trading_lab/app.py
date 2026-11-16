@@ -33,7 +33,8 @@ from src import strategies as sv  # noqa: E402
 from src import update_data as ud  # noqa: E402
 
 # palette (tema scuro): superfici, inchiostri e colori di serie verificati per daltonismo
-PAGE, SURFACE, GRID, INK, INK2, MUTED = "#0d0d0d", "#1a1a19", "#2c2c2a", "#f0efec", "#c3c2b7", "#898781"
+PAGE, SURFACE, RAISED, GRID = "#080b11", "#10151f", "#161d2a", "#222b3b"
+INK, INK2, MUTED = "#eef1f6", "#bcc5d6", "#8791a6"
 BLUE, ORANGE, RED = "#3987e5", "#d95926", "#e66767"
 GOOD, WARN, BAD = "#0ca30c", "#fab219", "#d03b3b"
 FONT = "Inter, -apple-system, 'Segoe UI', Roboto, sans-serif"
@@ -71,37 +72,72 @@ if ICON.exists():
     st.logo(str(ICON), size="large")
 st.markdown(f"""
 <style>
-:root {{ --line:{GRID}; --surface:{SURFACE}; --ink:{INK}; --ink2:{INK2}; --muted:{MUTED}; --accent:{BLUE}; }}
+:root {{ --page:{PAGE}; --surface:{SURFACE}; --raised:{RAISED}; --line:{GRID}; --ink:{INK}; --ink2:{INK2}; --muted:{MUTED};
+        --accent:{BLUE}; --good:{GOOD}; --bad:{BAD}; --warn:{WARN}; --r:14px; }}
 .stApp * {{ transition:none !important; }}
-html, body, .stApp {{ font-feature-settings:"tnum" 1; -webkit-font-smoothing:antialiased; }}
-.block-container {{ padding:2.4rem 2.6rem 4rem; max-width:1480px; }}
-header[data-testid="stHeader"] {{ background:transparent; }}
-section[data-testid="stSidebar"] {{ border-right:1px solid var(--line); }}
-section[data-testid="stSidebar"] [data-testid="stSidebarNav"] a {{ border-radius:8px; }}
-section[data-testid="stSidebar"] h3 {{ font-size:.7rem !important; letter-spacing:.12em; text-transform:uppercase; color:var(--muted);
-    font-weight:600 !important; margin:1.1rem 0 .2rem; padding-top:.9rem; border-top:1px solid var(--line); }}
-h1 {{ font-size:1.75rem !important; font-weight:680 !important; letter-spacing:-.022em; padding:0 0 .15rem !important; }}
-h3 {{ font-size:1.02rem !important; font-weight:620 !important; letter-spacing:-.01em; margin-top:1.1rem !important; }}
-.brand {{ font-size:.68rem; letter-spacing:.16em; text-transform:uppercase; color:var(--accent); font-weight:650; }}
-.kpis {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(158px,1fr)); gap:12px; margin:.5rem 0 .9rem; }}
-.kpi {{ position:relative; background:linear-gradient(180deg,#1e1e1d 0%,#181817 100%); border:1px solid var(--line); border-radius:12px;
-    padding:14px 16px 12px; }}
-.kpi::before {{ content:""; position:absolute; left:16px; right:16px; top:-1px; height:2px; border-radius:0 0 2px 2px; background:var(--tone,transparent); }}
-.kpi .l {{ color:var(--muted); font-size:.66rem; letter-spacing:.1em; text-transform:uppercase; font-weight:600; }}
-.kpi .v {{ color:var(--ink); font-size:1.5rem; font-weight:640; letter-spacing:-.02em; line-height:1.45; white-space:nowrap; }}
-.kpi .s {{ color:var(--muted); font-size:.74rem; line-height:1.3; }}
-.check {{ display:flex; gap:12px; align-items:baseline; padding:9px 14px; border:1px solid var(--line); border-radius:10px; margin-bottom:6px; background:var(--surface); }}
-.check b {{ color:var(--ink); font-weight:600; min-width:240px; display:inline-block; }}
-.check span.d {{ color:var(--ink2); font-size:.86rem; }}
-.dot {{ width:9px; height:9px; border-radius:50%; display:inline-block; flex:none; position:relative; top:-1px; }}
-.tag {{ font-size:.66rem; letter-spacing:.07em; text-transform:uppercase; color:var(--muted); min-width:82px; font-weight:600; }}
-.status {{ display:flex; gap:8px; align-items:center; color:var(--muted); font-size:.76rem; padding:.8rem 0 0; margin-top:1rem; border-top:1px solid var(--line); }}
-[data-testid="stPlotlyChart"] {{ border:1px solid var(--line); border-radius:12px; overflow:hidden; background:var(--surface); }}
-[data-testid="stDataFrame"] {{ border:1px solid var(--line); border-radius:10px; overflow:hidden; }}
-[data-testid="stExpander"] details {{ border-color:var(--line); border-radius:10px; }}
-[data-testid="stVerticalBlockBorderWrapper"] {{ border-radius:12px; }}
+html, body, .stApp {{ font-feature-settings:"tnum" 1, "ss01" 1; -webkit-font-smoothing:antialiased; }}
+.stApp {{ background:radial-gradient(1100px 520px at 88% -8%, rgba(57,135,229,.13), transparent 62%),
+                     radial-gradient(900px 480px at -6% 4%, rgba(25,158,112,.07), transparent 60%), var(--page); }}
+.block-container {{ padding:5rem 2.8rem 4.5rem; max-width:1520px; }}
+
+/* barra di navigazione in alto */
+header[data-testid="stHeader"] {{ background:rgba(8,11,17,.94); border-bottom:1px solid var(--line); height:3.6rem; }}
+[data-testid="stTopNavLink"] {{ border-radius:10px; padding:.42rem .8rem; color:var(--muted); font-weight:560; }}
+[data-testid="stTopNavLink"]:hover {{ background:var(--raised); }}
+[data-testid="stTopNavLink"][aria-current="page"] {{ background:linear-gradient(180deg, rgba(57,135,229,.24), rgba(57,135,229,.12));
+    box-shadow:inset 0 0 0 1px rgba(57,135,229,.55); }}
+[data-testid="stTopNavLink"][aria-current="page"] * {{ color:var(--ink) !important; }}
+
+/* pannello laterale (solo backtester) */
+section[data-testid="stSidebar"] {{ background:var(--surface); border-right:1px solid var(--line); }}
+section[data-testid="stSidebar"] h3 {{ font-size:.68rem !important; letter-spacing:.14em; text-transform:uppercase; color:var(--accent);
+    font-weight:680 !important; margin:1.2rem 0 .3rem !important; padding:1rem 0 0 !important; border-top:1px solid var(--line);
+    border-left:0 !important; }}
+
+/* testata di pagina */
+.topline {{ display:flex; justify-content:space-between; align-items:center; margin:0 0 .55rem; }}
+.brand {{ font-size:.66rem; letter-spacing:.2em; text-transform:uppercase; font-weight:700;
+    background:linear-gradient(90deg, {BLUE}, #199e70); -webkit-background-clip:text; background-clip:text; color:transparent; }}
+.chip {{ display:inline-flex; gap:8px; align-items:center; font-size:.74rem; color:var(--ink2); background:var(--surface);
+    border:1px solid var(--line); border-radius:999px; padding:5px 12px; }}
+h1 {{ font-size:2.05rem !important; font-weight:720 !important; letter-spacing:-.03em; padding:0 0 .1rem !important; line-height:1.15 !important; }}
+h3 {{ font-size:.78rem !important; font-weight:680 !important; letter-spacing:.12em; text-transform:uppercase; color:var(--ink2);
+    margin:1.7rem 0 .6rem !important; padding:.12rem 0 .12rem .7rem !important; border-left:3px solid var(--accent); line-height:1.2 !important; }}
 [data-testid="stCaptionContainer"] {{ color:var(--muted); }}
-div[data-testid="stAlert"] {{ border-radius:10px; }}
+
+/* schede dei numeri */
+.kpis {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(138px,1fr)); gap:14px; margin:.7rem 0 1.1rem; }}
+.kpi {{ position:relative; overflow:hidden; background:linear-gradient(160deg, var(--raised) 0%, var(--surface) 70%);
+    border:1px solid var(--line); border-radius:var(--r); padding:16px 18px 14px; box-shadow:0 1px 0 rgba(255,255,255,.03) inset, 0 8px 24px rgba(0,0,0,.28); }}
+.kpi::before {{ content:""; position:absolute; inset:0 auto 0 0; width:3px; background:var(--tone, transparent); }}
+.kpi.good {{ background:linear-gradient(160deg, rgba(12,163,12,.16) 0%, var(--surface) 62%); border-color:rgba(12,163,12,.38); }}
+.kpi.bad {{ background:linear-gradient(160deg, rgba(208,59,59,.17) 0%, var(--surface) 62%); border-color:rgba(208,59,59,.40); }}
+.kpi .l {{ color:var(--muted); font-size:.64rem; letter-spacing:.13em; text-transform:uppercase; font-weight:650; }}
+.kpi .v {{ color:var(--ink); font-size:1.6rem; font-weight:700; letter-spacing:-.03em; line-height:1.4; white-space:nowrap; }}
+.kpi .s {{ color:var(--muted); font-size:.74rem; line-height:1.35; }}
+.kpi.hero {{ grid-column:span 2; }}
+.kpi.hero .v {{ font-size:2.5rem; line-height:1.2; }}
+.kpi svg.spark {{ position:absolute; right:0; bottom:0; width:52%; height:52%; opacity:.9; pointer-events:none; }}
+@media (max-width:900px) {{ .kpi.hero {{ grid-column:span 1; }} }}
+
+/* controlli, tabelle, grafici */
+.check {{ display:flex; gap:12px; align-items:baseline; padding:11px 16px; border:1px solid var(--line); border-radius:12px; margin-bottom:7px;
+    background:linear-gradient(160deg, var(--raised), var(--surface)); }}
+.check b {{ color:var(--ink); font-weight:620; min-width:240px; display:inline-block; }}
+.check span.d {{ color:var(--ink2); font-size:.86rem; }}
+.dot {{ width:9px; height:9px; border-radius:50%; display:inline-block; flex:none; position:relative; top:-1px; box-shadow:0 0 0 3px rgba(255,255,255,.05); }}
+.tag {{ font-size:.64rem; letter-spacing:.09em; text-transform:uppercase; color:var(--muted); min-width:86px; font-weight:650; }}
+[data-testid="stPlotlyChart"] {{ border:1px solid var(--line); border-radius:var(--r); overflow:hidden; background:var(--surface);
+    box-shadow:0 8px 24px rgba(0,0,0,.25); }}
+[data-testid="stDataFrame"] {{ border:1px solid var(--line); border-radius:12px; overflow:hidden; }}
+[data-testid="stExpander"] details {{ border-color:var(--line); border-radius:12px; background:var(--surface); }}
+[data-testid="stVerticalBlockBorderWrapper"] {{ border-radius:var(--r); }}
+div[data-testid="stAlert"] {{ border-radius:12px; }}
+[data-testid="stButtonGroup"] button {{ border-radius:999px !important; padding:.34rem 1.05rem; font-weight:580; }}
+[data-testid="stButtonGroup"] {{ gap:6px; }}
+[data-testid="stBaseButton-primary"] {{ background:linear-gradient(180deg, #4a93ec, #2f77d2); border:0; font-weight:640; box-shadow:0 6px 18px rgba(57,135,229,.32); }}
+[data-testid="stBaseButton-secondary"] {{ border-radius:10px; }}
+hr {{ border-color:var(--line) !important; }}
 </style>
 """, unsafe_allow_html=True)
 ss = st.session_state
@@ -313,23 +349,22 @@ def auto_update() -> None:
 
 
 def data_badge() -> None:
-    """Riga di stato in fondo al pannello laterale; mentre l'aggiornamento gira si ricarica da sola."""
+    """Riga in cima a ogni pagina: nome dell'app e stato dei dati; durante un aggiornamento si ricarica da sola."""
     def body() -> None:
         up = _updater()
         if update_running():
-            frac, label, _ = update_progress()
-            st.markdown(f'<div class="status"><span class="dot" style="background:{BLUE}"></span>Aggiornamento dati... {frac * 100:.0f}%</div>',
-                        unsafe_allow_html=True)
-            return
-        if up["proc"] is not None and not up["handled"]:
-            st.rerun()
-        last = last_update_time()
-        when = last.tz_convert("Europe/Rome").strftime("%d/%m %H:%M") if last is not None and pd.notna(last) else "mai"
-        st.markdown(f'<div class="status"><span class="dot" style="background:{GOOD if when != "mai" else MUTED}"></span>Dati aggiornati: {when}</div>',
+            frac, _, _ = update_progress()
+            chip = f'<span class="dot" style="background:{BLUE}"></span>Aggiornamento dati in corso: {frac * 100:.0f}%'
+        else:
+            if up["proc"] is not None and not up["handled"]:
+                st.rerun()
+            last = last_update_time()
+            when = last.tz_convert("Europe/Rome").strftime("%d/%m %H:%M") if last is not None and pd.notna(last) else "mai"
+            chip = f'<span class="dot" style="background:{GOOD if when != "mai" else MUTED}"></span>Dati aggiornati: {when}'
+        st.markdown(f'<div class="topline"><span class="brand">Sports Trading Lab</span><span class="chip status">{chip}</span></div>',
                     unsafe_allow_html=True)
 
-    with st.sidebar:
-        st.fragment(body, run_every=3 if update_running() else None)()
+    st.fragment(body, run_every=3 if update_running() else None)()
 
 
 def need_db() -> bool:
@@ -341,20 +376,37 @@ def need_db() -> bool:
 
 # --------------------------------------------------------------------------- componenti
 def header(title: str, subtitle: str | None = None) -> None:
-    st.markdown('<div class="brand">Sports Trading Lab</div>', unsafe_allow_html=True)
     st.title(title)
     if subtitle:
         st.caption(subtitle)
 
 
-def kpis(items: list[tuple]) -> None:
-    """items: (etichetta, valore, nota, tono) con tono 'good' | 'bad' | None."""
+def spark(values) -> str:
+    """Mini-grafico (SVG leggero, senza librerie) da mettere sullo sfondo di una scheda."""
+    v = np.asarray(values, dtype=float)
+    v = v[np.isfinite(v)]
+    if len(v) < 3:
+        return ""
+    if len(v) > 80:
+        v = v[np.linspace(0, len(v) - 1, 80).astype(int)]
+    lo, hi = float(v.min()), float(v.max())
+    span = (hi - lo) or 1.0
+    pts = " ".join(f"{i / (len(v) - 1) * 100:.1f},{36 - (x - lo) / span * 32:.1f}" for i, x in enumerate(v))
+    return (f'<svg class="spark" viewBox="0 0 100 40" preserveAspectRatio="none"><polygon points="0,40 {pts} 100,40" fill="{BLUE}" '
+            f'fill-opacity=".16"/><polyline points="{pts}" fill="none" stroke="{BLUE}" stroke-width="1.6" vector-effect="non-scaling-stroke"/></svg>')
+
+
+def kpis(items: list[tuple], hero_spark=None) -> None:
+    """items: (etichetta, valore, nota, tono) con tono 'good' | 'bad' | None. Con `hero_spark` (serie di
+    valori) la prima scheda diventa grande e mostra l'andamento sullo sfondo."""
     tones = {"good": GOOD, "bad": BAD}
-    cells = "".join(
-        f'<div class="kpi" style="--tone:{tones.get(tone, GRID)}"><div class="l">{label}</div>'
-        f'<div class="v">{value}</div><div class="s">{note or "&nbsp;"}</div></div>'
-        for label, value, note, tone in items)
-    st.markdown(f'<div class="kpis">{cells}</div>', unsafe_allow_html=True)
+    cells = []
+    for k, (label, value, note, tone) in enumerate(items):
+        hero = k == 0 and hero_spark is not None
+        cells.append(f'<div class="kpi {tone or ""}{" hero" if hero else ""}" style="--tone:{tones.get(tone, "transparent")}">'
+                     f'<div class="l">{label}</div><div class="v">{value}</div><div class="s">{note or "&nbsp;"}</div>'
+                     f'{spark(hero_spark) if hero else ""}</div>')
+    st.markdown(f'<div class="kpis">{"".join(cells)}</div>', unsafe_allow_html=True)
 
 
 def sign_tone(v: float) -> str | None:
@@ -386,12 +438,14 @@ def checklist(checks: list[tuple[str, str, str]]) -> None:
 def base_layout(fig: go.Figure, height: int, title: str | None = None) -> go.Figure:
     fig.update_layout(
         height=height, paper_bgcolor=SURFACE, plot_bgcolor=SURFACE, font=dict(color=INK, size=12, family=FONT),
-        margin=dict(l=56, r=20, t=46 if title else 16, b=40), hovermode="x unified",
-        title=dict(text=title, font=dict(size=14), x=0.01) if title else None,
-        hoverlabel=dict(bgcolor=PAGE, bordercolor=GRID, font=dict(color=INK, family=FONT)), showlegend=False,
+        margin=dict(l=58, r=22, t=52 if title else 18, b=40), hovermode="x unified",
+        title=dict(text=title, font=dict(size=13, color=INK2), x=0.012, y=0.965, yanchor="top") if title else None,
+        hoverlabel=dict(bgcolor=RAISED, bordercolor=GRID, font=dict(color=INK, family=FONT)), showlegend=False,
     )
-    fig.update_xaxes(gridcolor=GRID, linecolor=GRID, zeroline=False, tickfont=dict(color=MUTED))
-    fig.update_yaxes(gridcolor=GRID, linecolor=GRID, zerolinecolor=MUTED, zerolinewidth=1, tickfont=dict(color=MUTED))
+    fig.update_xaxes(gridcolor="rgba(0,0,0,0)", linecolor=GRID, zeroline=False, tickfont=dict(color=MUTED, size=11), ticks="outside",
+                     tickcolor=GRID, ticklen=4)
+    fig.update_yaxes(gridcolor=GRID, griddash="dot", linecolor="rgba(0,0,0,0)", zerolinecolor=MUTED, zerolinewidth=1,
+                     tickfont=dict(color=MUTED, size=11))
     return fig
 
 
@@ -408,6 +462,7 @@ def equity_chart(trades: pd.DataFrame, cut: pd.Timestamp | None = None) -> go.Fi
     t = thin(trades)
     fig = go.Figure(go.Scatter(
         x=t["date"], y=t["equity"], mode="lines", line=dict(color=BLUE, width=2, shape="hv"),
+        fill="tozeroy", fillcolor="rgba(57,135,229,0.10)",
         customdata=t["_n"], hovertemplate="%{y:+.2f} u  (operazione n. %{customdata})<extra></extra>"))
     base_layout(fig, 360, "Equity curve - profitto cumulato (unità)")
     if cut is not None:
@@ -422,7 +477,7 @@ def drawdown_chart(trades: pd.DataFrame) -> go.Figure:
     eq = trades["equity"].to_numpy()
     t = thin(trades.assign(_dd=eq - np.maximum.accumulate(np.maximum(eq, 0))))
     fig = go.Figure(go.Scatter(x=t["date"], y=t["_dd"], mode="lines", line=dict(color=RED, width=1.5, shape="hv"),
-                               fill="tozeroy", fillcolor="rgba(230,103,103,0.25)", hovertemplate="%{y:.2f} u<extra></extra>"))
+                               fill="tozeroy", fillcolor="rgba(230,103,103,0.18)", hovertemplate="%{y:.2f} u<extra></extra>"))
     base_layout(fig, 210, "Drawdown dal massimo (unità)")
     fig.update_yaxes(ticksuffix=" u")
     return fig
@@ -853,7 +908,8 @@ def tab_summary(cfg: dict, res: bt.BacktestResult, bank: float) -> None:
           ("CLV medio", fmt(m["clv_pct"], "{:+.2f}%"), "contro la quota di chiusura", sign_tone(m["clv_pct"])),
           ("Max Drawdown", f"-{m['max_dd_units']:.1f} u", f"-{m['max_dd_pct']:.0f}% di una banca da {bank:.0f} u", None),
           ("Win Rate", f"{m['win_rate_pct']:.1f}%", f"quota media {m['avg_odds']:.2f}", None),
-          ("Operazioni", num_it(m["trades"]), f"serie negativa max {m['longest_losing_streak']}", None)])
+          ("Operazioni", num_it(m["trades"]), f"serie negativa max {m['longest_losing_streak']}", None)],
+         hero_spark=trades["equity"].to_numpy())
     if "cashout" in trades.columns:
         closed = int((trades["cashout"] != "").sum())
         delta = float(trades["pnl"].sum() - trades["pnl_hold"].sum())
@@ -1782,5 +1838,6 @@ PAGES = {
     "data": st.Page(page_data, title="Dati", icon=":material/database:", url_path="data"),
     "guide": st.Page(page_guide, title="Guida", icon=":material/help:", url_path="guide"),
 }
-st.navigation(list(PAGES.values())).run()
+_nav = st.navigation(list(PAGES.values()), position="top")
 data_badge()
+_nav.run()

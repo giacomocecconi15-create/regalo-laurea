@@ -155,6 +155,9 @@ effettivamente incassati.
 
 ## Dashboard
 
+Navigazione in alto tra le pagine; il pannello laterale compare solo nel Backtester, dove servono i filtri. In cima
+a ogni pagina c'è lo stato dei dati. Tema scuro, senza animazioni: i mini-grafici nelle schede sono SVG statici.
+
 1. **Backtester** – pannello laterale con esempi pronti e filtri a gruppi (torneo/lega, calendario,
    giocatore/squadra, avversario, confronto). Cinque schede:
    - *Riepilogo*: KPI, equity curve, drawdown, rendimenti mensili.
