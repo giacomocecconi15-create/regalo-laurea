@@ -9,6 +9,8 @@ Convenzioni:
 - P&L:  back vinto  = stake * (quota - 1) * (1 - commissione)
         lay vinto   = stake / (quota - 1) * (1 - commissione)
         perso       = -stake;   'void' (rimborsata) = 0;   'open' = non ancora chiusa.
+        'cashout'   = chiusa in anticipo: il profitto (positivo o negativo) e' quello incassato davvero,
+                      inserito a mano e gia' al netto delle commissioni.
 - CLV%: back = quota / chiusura - 1;  lay = 1 - quota / chiusura.
 - Saldo di un conto = depositi - prelievi + P&L delle giocate chiuse; il saldo disponibile toglie
   anche l'importo a rischio delle giocate aperte.
@@ -28,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src import config as C  # noqa: E402
 
 LEDGER_PATH = C.DATA_DIR / "gestionale.duckdb"
-RESULTS = ["open", "won", "lost", "void"]
+RESULTS = ["open", "won", "lost", "void", "cashout"]
 BET_COLUMNS = ["id", "placed_date", "sport", "event", "selection", "side", "odds", "stake", "commission",
                "account", "strategy", "status", "close_odds", "pnl", "note", "created_at"]
 
@@ -51,10 +53,18 @@ def connect(path: Path | None = None) -> duckdb.DuckDBPyConnection:
 
 
 # --------------------------------------------------------------------------- calcoli
-def bet_pnl(side: str, odds: float, stake: float, status: str, commission: float = 0.0) -> float | None:
-    """Profitto di una giocata chiusa (None se ancora aperta)."""
+def bet_pnl(side: str, odds: float, stake: float, status: str, commission: float = 0.0,
+            cash_pnl: float | None = None) -> float | None:
+    """Profitto di una giocata chiusa (None se ancora aperta). Per 'cashout' serve `cash_pnl`,
+    il profitto o la perdita realmente incassati: non puo' essere peggiore della perdita totale."""
     if status == "open":
         return None
+    if status == "cashout":
+        if cash_pnl is None or cash_pnl != cash_pnl:
+            raise ValueError("per il cash out indica il profitto o la perdita incassati")
+        if cash_pnl < -float(stake) - 1e-9:
+            raise ValueError("la perdita del cash out non puo' superare l'importo a rischio")
+        return float(cash_pnl)
     if status == "void":
         return 0.0
     if status == "lost":
@@ -147,7 +157,7 @@ def movements(con) -> pd.DataFrame:
 # --------------------------------------------------------------------------- giocate
 def add_bet(con, *, placed_date: date, sport: str, event: str, selection: str, side: str, odds: float, stake: float,
             account: str, strategy: str = "", commission: float = 0.0, status: str = "open",
-            close_odds: float | None = None, note: str = "") -> int:
+            close_odds: float | None = None, note: str = "", cash_pnl: float | None = None) -> int:
     _check_bet(side, odds, stake, status)
     if not str(event).strip():
         raise ValueError("l'evento e' obbligatorio")
@@ -157,12 +167,12 @@ def add_bet(con, *, placed_date: date, sport: str, event: str, selection: str, s
     con.execute("INSERT INTO bets VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
         bet_id, placed_date, sport, str(event).strip(), str(selection).strip(), side, float(odds), float(stake),
         float(commission or 0), account, (strategy or "").strip(), status,
-        float(close_odds) if close_odds else None, bet_pnl(side, odds, stake, status, commission or 0),
+        float(close_odds) if close_odds else None, bet_pnl(side, odds, stake, status, commission or 0, cash_pnl),
         note or "", datetime.now()])
     return int(bet_id)
 
 
-def settle_bet(con, bet_id: int, status: str, close_odds: float | None = None) -> None:
+def settle_bet(con, bet_id: int, status: str, close_odds: float | None = None, cash_pnl: float | None = None) -> None:
     """Chiude (o riapre con 'open') una giocata e ricalcola il profitto."""
     row = con.execute("SELECT side, odds, stake, commission, close_odds FROM bets WHERE id = ?", [int(bet_id)]).fetchone()
     if row is None:
@@ -171,7 +181,7 @@ def settle_bet(con, bet_id: int, status: str, close_odds: float | None = None) -
     _check_bet(side, odds, stake, status)
     close = float(close_odds) if close_odds else old_close
     con.execute("UPDATE bets SET status = ?, pnl = ?, close_odds = ? WHERE id = ?",
-                [status, bet_pnl(side, odds, stake, status, commission or 0), close, int(bet_id)])
+                [status, bet_pnl(side, odds, stake, status, commission or 0, cash_pnl), close, int(bet_id)])
 
 
 def delete_bet(con, bet_id: int) -> None:
@@ -190,9 +200,9 @@ def bets(con, status: str | None = None) -> pd.DataFrame:
 
 def settled_trades(df: pd.DataFrame) -> pd.DataFrame:
     """Giocate chiuse nel formato del backtester (per riusare metriche e grafici). Le rimborsate sono escluse."""
-    t = df[df["status"].isin(["won", "lost"])].copy()
+    t = df[df["status"].isin(["won", "lost", "cashout"])].copy()
     t = t.rename(columns={"placed_date": "date", "stake": "risk"})
-    t["trade_won"] = t["status"] == "won"
+    t["trade_won"] = t["pnl"] > 0
     t["ev_close_pct"] = np.nan
     t = t.sort_values(["date", "id"], kind="stable").reset_index(drop=True)
     t["equity"] = t["pnl"].cumsum()

@@ -26,7 +26,7 @@ Uso manuale:
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python src/update_data.py        # scarica / aggiorna il database
-.venv/bin/python -m pytest tests -q        # 48 test
+.venv/bin/python -m pytest tests -q        # 56 test
 .venv/bin/python -m streamlit run app.py   # dashboard
 ```
 
@@ -41,6 +41,7 @@ src/risk.py            Monte Carlo: stake fisso vs Kelly frazionario
 src/strategies.py      Strategy Vault (strategies.json) e Pre-Match Scanner
 src/ledger.py          gestionale: conti, movimenti e registro delle giocate reali
 src/roadmap.py         roadmap 2027 (voci predefinite e stato salvato)
+src/cashout.py         simulazione del cash out (regole manuali e modello intelligente)
 src/fixtures.py        partite in programma con quote (calcio gratis, tennis con chiave gratuita) e impostazioni
 assets/                icona dell'app
 crea_app_mac.sh        crea l'app da doppio clic per Mac
@@ -123,6 +124,29 @@ curve, rendimenti mensili. Ogni operazione rischia 1 unità.
   quota back scelta: il risultato reale sull'exchange è un po' peggiore (spread).
 - **CLV %**: back `quota/chiusura - 1`, lay `1 - quota/chiusura`.
 
+### Cash out
+
+Il database non contiene quote in corso di partita, quindi le chiusure anticipate si simulano in due modi
+(pannello laterale, sezione *4 · Cash out*; risultati nella vista *Cash out*):
+
+- **Manuale** – riproduci le tue abitudini con quattro regole, ognuna con la quota di giocate interessate e
+  l'importo: vincenti incassate prima (parte del profitto), vincenti chiuse in perdita, perdenti chiuse in
+  profitto, perdenti tagliate (parte della puntata recuperata). Le giocate interessate sono scelte a caso ma in
+  modo ripetibile (seme): lo stesso backtest dà sempre lo stesso risultato.
+- **Intelligente** – decide da solo usando lo stato reale della partita a un punto di controllo presente nei
+  dati: il risultato all'intervallo nel calcio, l'esito del primo set nel tennis. Un modello calibrato sulle
+  quote pre-partita (Poisson sui gol del secondo tempo; set indipendenti con una correzione misurata sul
+  database) stima la probabilità della selezione a quel punto e quindi il valore del cash out, a cui si toglie
+  il margine impostato. Chiude se il valore supera la soglia *incassa* o scende sotto la soglia *taglia*. La
+  vista mostra anche il confronto tra soglie diverse.
+
+Sul database le probabilità stimate sono in linea con le frequenze reali (scarti entro pochi punti, verificati
+da un test), ma resta una stima: le quote reali in corso di partita possono differire e il cash out vero può
+scattare in altri momenti. Chiudere prima costa il margine, quindi in media riduce il rendimento.
+
+Nel **Registro** una giocata reale si può chiudere come *Cash out* indicando a mano il profitto o la perdita
+effettivamente incassati.
+
 ## Dashboard
 
 1. **Backtester** – pannello laterale con esempi pronti e filtri a gruppi (torneo/lega, calendario,
@@ -132,6 +156,7 @@ curve, rendimenti mensili. Ogni operazione rischia 1 unità.
      segmenti migliori e peggiori, applicabili come filtro con un clic.
    - *Robustezza*: sei controlli (campione, significatività, intervallo di confidenza del ROI, CLV, tenuta
      fuori campione, costanza negli anni), confronto studio/verifica, anno per anno, confronto tra bookmaker.
+   - *Cash out*: effetto delle chiusure anticipate rispetto a tenere fino alla fine, per tipo di chiusura e per soglia.
    - *Operazioni*: tabella esportabile in CSV.  *Salva*: archivia la strategia.
 
    Ogni vista viene calcolata solo quando la apri, e il backtest si ricalcola solo se cambia la strategia.

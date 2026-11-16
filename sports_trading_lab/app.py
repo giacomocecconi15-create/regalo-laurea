@@ -22,6 +22,7 @@ from plotly.subplots import make_subplots
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 from src import backtester as bt  # noqa: E402
+from src import cashout as co  # noqa: E402
 from src import config as C  # noqa: E402
 from src import fixtures as fx  # noqa: E402
 from src import ledger as lg  # noqa: E402
@@ -137,6 +138,12 @@ def apply_pending() -> None:
     ss["bt_omin"] = float(cfg.get("odds_min") or 1.01)
     ss["bt_omax"] = float(cfg.get("odds_max") or 50.0)
     ss["bt_excl"] = bool(cfg.get("exclude_retirements"))
+    saved = cfg.get("cashout") or {}
+    ss["bt_co_mode"] = saved.get("mode") if saved.get("mode") in ("off", "manual", "smart") else "off"
+    for k, v in saved.items():
+        if k in co.DEFAULTS and k != "mode":
+            default = co.DEFAULTS[k]
+            ss[f"bt_co_{k}"] = bool(v) if isinstance(default, bool) else int(v) if isinstance(default, int) else float(v)
     specs = {f[0]: f for f in bt.FILTERS[sport]}
     for col, rule in (cfg.get("filters") or {}).items():
         spec = specs.get(col)
@@ -510,6 +517,8 @@ Più filtri provi, più è facile trovare per caso una combinazione che ha reso 
 strategia solo se supera i controlli e ha una logica che sai spiegare.
 
 ### 5 · Dal test alla pratica
+- **Cash out**: nel pannello laterale puoi simulare le chiusure anticipate, a mano (quante giocate chiudi prima
+  e a quanto) o in automatico dal risultato all'intervallo / primo set. La vista *Cash out* mostra l'effetto.
 - **Rischio**: simula 1.000 futuri possibili e confronta stake fisso e Kelly frazionario.
 - **Strategie**: salva le strategie valide, poi scarica con un clic le partite in programma (calcio) e ottieni
   i match che le attivano, con lo stake già calcolato sul tuo bankroll.
@@ -606,6 +615,17 @@ def _load_preset() -> None:
         ss["preset_pick"] = None
 
 
+def describe_cashout(cfg: dict) -> str:
+    c = co.settings(cfg)
+    if c["mode"] == "manual":
+        parts = [f"{title.lower()} {c[sk]:g}%" for sk, _, title, _ in CO_MANUAL if c[sk] > 0]
+        return "cash out manuale: " + (", ".join(parts) if parts else "nessuna regola attiva")
+    if c["mode"] == "smart":
+        parts = ([f"incassa da +{c['tp_pct']:g}%"] if c["take_profit"] else []) + ([f"taglia da -{c['sl_pct']:g}%"] if c["stop_loss"] else [])
+        return "cash out intelligente: " + (", ".join(parts) if parts else "nessuna regola attiva") + f", margine {c['margin_pct']:g}%"
+    return ""
+
+
 def _reset_filters(sport: str) -> None:
     for k in [k for k in ss.keys() if k.startswith(f"bt_{sport}_f_") or k in ("bt_omin", "bt_omax", f"bt_{sport}_period", "bt_excl")]:
         del ss[k]
@@ -634,6 +654,58 @@ def _filter_widget(sport: str, spec: tuple, sel: pd.DataFrame) -> dict | None:
     if a <= lo and b >= hi:
         return None
     return {"min": a if a > lo else None, "max": b if b < hi else None}
+
+
+CO_MODES = {"off": "No", "manual": "Manuale", "smart": "Intelligente"}
+CO_MANUAL = [  # (chiave quota, chiave importo, titolo, etichetta importo)
+    ("win_early_share", "win_early_keep", "Vincenti incassate prima", "% del profitto incassata"),
+    ("win_panic_share", "win_panic_loss", "Vincenti chiuse in perdita", "% della puntata persa"),
+    ("lose_saved_share", "lose_saved_gain", "Perdenti chiuse in profitto", "% del profitto potenziale"),
+    ("lose_cut_share", "lose_cut_recover", "Perdenti tagliate", "% della puntata recuperata"),
+]
+
+
+def cashout_controls(sb, sport: str) -> dict:
+    """Sezione 'Cash out' del pannello laterale. Ritorna le impostazioni da salvare con la strategia."""
+    sb.subheader("4 · Cash out")
+    ss.setdefault("bt_co_mode", "off")
+    mode = sb.radio("Simula le chiusure anticipate", list(CO_MODES), format_func=CO_MODES.get, horizontal=True, key="bt_co_mode",
+                    help="Manuale: imposti tu quante giocate chiudi prima e a quanto. Intelligente: chiude da solo in base al "
+                         "risultato all'intervallo (calcio) o al primo set (tennis).")
+    out = {"mode": mode}
+    if mode == "manual":
+        with sb.expander("Regole manuali", expanded=True):
+            st.caption("Per ogni caso: quante giocate su 100 chiudi così, e a quanto.")
+            for share_k, amount_k, title, amount_label in CO_MANUAL:
+                st.markdown(f"<small><b>{title}</b></small>", unsafe_allow_html=True)
+                a, b = st.columns(2)
+                ss.setdefault(f"bt_co_{share_k}", float(co.DEFAULTS[share_k]))
+                ss.setdefault(f"bt_co_{amount_k}", float(co.DEFAULTS[amount_k]))
+                out[share_k] = a.number_input("% di giocate", 0.0, 100.0, step=5.0, key=f"bt_co_{share_k}")
+                out[amount_k] = b.number_input(amount_label, 0.0, 100.0, step=5.0, key=f"bt_co_{amount_k}")
+            ss.setdefault("bt_co_seed", 1)
+            out["seed"] = int(st.number_input("Seme della scelta casuale", 1, 9999, step=1, key="bt_co_seed",
+                                              help="Quali giocate vengono chiuse è casuale ma ripetibile. Cambia il seme per vedere "
+                                                   "quanto il risultato dipende dalla sorte."))
+    elif mode == "smart":
+        point = "all'intervallo" if sport == "football" else "dopo il primo set"
+        with sb.expander("Regole automatiche", expanded=True):
+            st.caption(f"Il valore del cash out è stimato {point}, dal risultato reale a quel punto.")
+            ss.setdefault("bt_co_take_profit", True)
+            ss.setdefault("bt_co_tp_pct", float(co.DEFAULTS["tp_pct"]))
+            out["take_profit"] = st.checkbox("Incassa se sei in profitto", key="bt_co_take_profit")
+            out["tp_pct"] = st.number_input("Profitto minimo per incassare (% del rischio)", 1.0, 500.0, step=5.0, key="bt_co_tp_pct",
+                                            disabled=not out["take_profit"])
+            ss.setdefault("bt_co_stop_loss", False)
+            ss.setdefault("bt_co_sl_pct", float(co.DEFAULTS["sl_pct"]))
+            out["stop_loss"] = st.checkbox("Taglia se sei in perdita", key="bt_co_stop_loss")
+            out["sl_pct"] = st.number_input("Perdita che fa scattare il taglio (% del rischio)", 1.0, 99.0, step=5.0, key="bt_co_sl_pct",
+                                            disabled=not out["stop_loss"])
+            ss.setdefault("bt_co_margin_pct", float(co.DEFAULTS["margin_pct"]))
+            out["margin_pct"] = st.number_input("Margine del cash out (%)", 0.0, 30.0, step=1.0, key="bt_co_margin_pct",
+                                                help="Quanto trattiene chi ti offre il cash out rispetto al valore equo: "
+                                                     "circa 1-2% su un exchange, 5-10% su un bookmaker.")
+    return out
 
 
 def sidebar_config() -> dict:
@@ -700,6 +772,7 @@ def sidebar_config() -> dict:
     a, b = slot.columns([3, 2])
     a.caption(f"{len(filters)} filtri attivi" if filters else "Nessun filtro attivo")
     b.button("Azzera", on_click=_reset_filters, args=(sport,), icon=":material/restart_alt:", width="stretch")
+    cash = cashout_controls(sb, sport)
     with sb.expander("Impostazioni"):
         ss.setdefault("bt_bank", 100.0)
         st.number_input("Banca di riferimento per il drawdown % (unità)", 10.0, 100000.0, step=10.0, key="bt_bank",
@@ -708,7 +781,7 @@ def sidebar_config() -> dict:
         "sport": sport, "market": market, "selection": selection, "side": side, "price": price,
         "price_timing": timing, "commission": commission / 100, "lay_mode": lay_mode,
         "odds_min": odds_min, "odds_max": odds_max, "date_from": str(d_from), "date_to": str(d_to),
-        "exclude_retirements": bool(excl), "filters": filters,
+        "exclude_retirements": bool(excl), "filters": filters, "cashout": cash,
     }
 
 
@@ -728,6 +801,8 @@ def describe(cfg: dict) -> str:
             lo = "min" if rule.get("min") is None else f"{rule['min']:g}"
             hi = "max" if rule.get("max") is None else f"{rule['max']:g}"
             parts.append(f"{label}: {lo}..{hi}")
+    if co.is_active(cfg):
+        parts.append(describe_cashout(cfg))
     return "  ·  ".join(parts)
 
 
@@ -746,9 +821,11 @@ STAT_COLS = {
 
 
 def trades_table(trades: pd.DataFrame, sport: str) -> pd.DataFrame:
-    cols = TRADE_COLS[sport] + ["side", "odds", "close_odds", "clv_pct", "won", "risk", "pnl", "equity"]
+    cols = TRADE_COLS[sport] + ["side", "odds", "close_odds", "clv_pct", "won", "risk", "cashout", "pnl_hold", "pnl", "equity"]
     out = trades[[c for c in cols if c in trades.columns]].copy()
     out["date"] = out["date"].dt.date
+    if "cashout" in out.columns:
+        out["cashout"] = out["cashout"].map(lambda k: "" if k == "" else co.REASONS.get(k, k))
     return out
 
 
@@ -775,6 +852,12 @@ def tab_summary(cfg: dict, res: bt.BacktestResult, bank: float) -> None:
           ("Max Drawdown", f"-{m['max_dd_units']:.1f} u", f"-{m['max_dd_pct']:.0f}% di una banca da {bank:.0f} u", None),
           ("Win Rate", f"{m['win_rate_pct']:.1f}%", f"quota media {m['avg_odds']:.2f}", None),
           ("Operazioni", num_it(m["trades"]), f"serie negativa max {m['longest_losing_streak']}", None)])
+    if "cashout" in trades.columns:
+        closed = int((trades["cashout"] != "").sum())
+        delta = float(trades["pnl"].sum() - trades["pnl_hold"].sum())
+        st.caption(f":material/currency_exchange: Cash out simulato: {num_it(closed)} giocate chiuse in anticipo "
+                   f"({closed / len(trades) * 100:.0f}%), effetto sul profitto {delta:+.2f} u rispetto a tenerle fino alla fine. "
+                   "Dettaglio nella vista *Cash out*.")
     if cfg["side"] == "lay":
         st.caption(":material/warning: Lay: il prezzo di banca è la quota back selezionata. Sull'exchange la quota lay reale è più alta "
                    "e bancare a quote da bookmaker non è possibile: usa *Betfair Exchange* dove disponibile, imposta la commissione "
@@ -870,6 +953,57 @@ def tab_robustness(cfg: dict, res: bt.BacktestResult, sel_args: tuple, bank: flo
                    "Il *massimo mercato* è il tetto raggiungibile avendo conti su molti bookmaker.")
 
 
+def tab_cashout(cfg: dict, res: bt.BacktestResult, sel_args: tuple, bank: float) -> None:
+    trades = res.trades
+    if "cashout" not in trades.columns:
+        st.info("Il cash out non è attivo. Accendilo nel pannello laterale, sezione **4 · Cash out**: "
+                "*Manuale* per riprodurre le tue chiusure abituali, *Intelligente* per farle decidere dal risultato "
+                "all'intervallo (calcio) o dal primo set (tennis).")
+        return
+    hold = trades.assign(pnl=trades["pnl_hold"])
+    hold["equity"] = hold["pnl"].cumsum()
+    mh, m = bt.compute_metrics(hold, bank), res.metrics
+    rows = [("ROI %", "roi_pct", "{:+.2f}"), ("Profitto (u)", "profit", "{:+.2f}"), ("Win rate %", "win_rate_pct", "{:.1f}"),
+            ("Max drawdown (u)", "max_dd_units", "{:.1f}"), ("Serie negativa max", "longest_losing_streak", "{:.0f}"),
+            ("t-stat", "t_stat", "{:+.2f}")]
+    kpis([("Effetto sul profitto", f"{m['profit'] - mh['profit']:+.2f} u", "rispetto a tenere fino alla fine", sign_tone(m["profit"] - mh["profit"])),
+          ("ROI con cash out", f"{m['roi_pct']:+.2f}%", f"senza: {mh['roi_pct']:+.2f}%", sign_tone(m["roi_pct"])),
+          ("Max drawdown", f"-{m['max_dd_units']:.1f} u", f"senza: -{mh['max_dd_units']:.1f} u",
+           "good" if m["max_dd_units"] < mh["max_dd_units"] else None),
+          ("Giocate chiuse prima", num_it(int((trades["cashout"] != "").sum())), f"su {num_it(len(trades))}", None)])
+    st.dataframe(pd.DataFrame({"metrica": [r[0] for r in rows],
+                               "con cash out": [fmt(float(m[r[1]]), r[2]) for r in rows],
+                               "tenendo fino alla fine": [fmt(float(mh[r[1]]), r[2]) for r in rows]}),
+                 hide_index=True, width="stretch")
+    st.subheader("Per tipo di chiusura")
+    st.dataframe(co.summary(trades), hide_index=True, width="stretch", column_config={
+        "profitto": st.column_config.NumberColumn("profitto ottenuto (u)", format="%+.2f"),
+        "profitto_tenendo": st.column_config.NumberColumn("tenendole (u)", format="%+.2f"),
+        "differenza": st.column_config.NumberColumn("differenza (u)", format="%+.2f")})
+    mode = co.settings(cfg)["mode"]
+    if mode == "smart":
+        st.subheader("Confronto delle soglie")
+        st.caption("Stessa strategia con soglie diverse di *incassa* e *taglia*. Le ultime due colonne mostrano se il risultato "
+                   "regge in entrambe le metà del periodo: diffida delle combinazioni buone in una sola.")
+        grid = co.threshold_grid(hold, cfg)
+        st.dataframe(grid.sort_values("roi_pct", ascending=False), hide_index=True, width="stretch", height=420, column_config={
+            "incassa_da": "incassa da", "taglia_da": "taglia da",
+            "chiuse_pct": st.column_config.NumberColumn("giocate chiuse %", format="%.0f"),
+            "roi_pct": st.column_config.NumberColumn("ROI %", format="%+.2f"), "profit": st.column_config.NumberColumn("profitto (u)", format="%+.1f"),
+            "max_dd": st.column_config.NumberColumn("max drawdown (u)", format="%.1f"),
+            "roi_1": st.column_config.NumberColumn("ROI % 1ª metà", format="%+.2f"), "roi_2": st.column_config.NumberColumn("ROI % 2ª metà", format="%+.2f")})
+        point = "all'intervallo, dal risultato del primo tempo" if cfg["sport"] == "football" else "dopo il primo set"
+        st.caption(f":material/info: Il valore del cash out è una stima {point}: un modello calibrato sulle quote pre-partita "
+                   "calcola la probabilità della selezione a quel punto, e il margine impostato viene sottratto. Sul database il "
+                   "modello è in linea con le frequenze reali (scarti di pochi punti percentuali), ma le quote in corso di partita "
+                   "vere possono differire e il cash out reale può scattare in altri momenti. Chiudere prima costa il margine: "
+                   "in media riduce il rendimento e in cambio riduce le oscillazioni.")
+    else:
+        st.caption(":material/info: Modalità manuale: le giocate chiuse sono scelte a caso (in modo ripetibile) nelle quote "
+                   "indicate. Serve a vedere quanto le tue abitudini di chiusura cambiano il risultato: cambia il seme nel "
+                   "pannello laterale per capire quanto conta la sorte.")
+
+
 def tab_trades(cfg: dict, trades: pd.DataFrame) -> None:
     table = trades_table(trades, cfg["sport"])
     shown = table.tail(MAX_TABLE_ROWS)
@@ -879,6 +1013,7 @@ def tab_trades(cfg: dict, trades: pd.DataFrame) -> None:
         "odds": st.column_config.NumberColumn("quota", format="%.2f"), "close_odds": st.column_config.NumberColumn("chiusura", format="%.2f"),
         "clv_pct": st.column_config.NumberColumn("clv %", format="%.2f"), "pnl": st.column_config.NumberColumn(format="%.3f"),
         "risk": st.column_config.NumberColumn(format="%.2f"), "equity": st.column_config.NumberColumn(format="%.2f"),
+        "pnl_hold": st.column_config.NumberColumn("pnl tenendo", format="%.3f"),
         "form10": st.column_config.NumberColumn(format="%.0f"), "form_surf": st.column_config.NumberColumn(format="%.0f"),
         "home_ppg5": st.column_config.NumberColumn(format="%.1f"), "away_ppg5": st.column_config.NumberColumn(format="%.1f"),
     })
@@ -886,7 +1021,7 @@ def tab_trades(cfg: dict, trades: pd.DataFrame) -> None:
                        file_name=f"operazioni_{cfg['sport']}_{date.today():%Y%m%d}.csv", mime="text/csv", icon=":material/download:")
 
 
-VIEWS = ["Riepilogo", "Analisi", "Robustezza", "Operazioni", "Salva"]
+VIEWS = ["Riepilogo", "Analisi", "Robustezza", "Cash out", "Operazioni", "Salva"]
 
 
 def page_backtester() -> None:
@@ -915,6 +1050,8 @@ def page_backtester() -> None:
         tab_analysis(cfg, res.trades)
     elif view == "Robustezza":
         tab_robustness(cfg, res, args, bank)
+    elif view == "Cash out":
+        tab_cashout(cfg, res, args, bank)
     elif view == "Operazioni":
         tab_trades(cfg, res.trades)
     else:
@@ -1131,7 +1268,7 @@ def page_vault() -> None:
 
 
 # --------------------------------------------------------------------------- pagina: registro
-STATUS_LABEL = {"open": "Aperta", "won": "Vinta", "lost": "Persa", "void": "Rimborsata"}
+STATUS_LABEL = {"open": "Aperta", "won": "Vinta", "lost": "Persa", "void": "Rimborsata", "cashout": "Cash out"}
 SIDE_LABEL = {"back": "Punta", "lay": "Banca"}
 
 
@@ -1235,7 +1372,8 @@ def ledger_bets_tab(acc: pd.DataFrame, allb: pd.DataFrame, vault: dict) -> None:
         account = c[4].selectbox("Conto", names)
         c = st.columns([2, 1, 1, 2])
         strategy = c[0].selectbox("Strategia", list(vault), index=None, placeholder="nessuna", accept_new_options=True)
-        status = c[1].selectbox("Esito", lg.RESULTS, format_func=STATUS_LABEL.get)
+        status = c[1].selectbox("Esito", [r for r in lg.RESULTS if r != "cashout"], format_func=STATUS_LABEL.get,
+                                help="Per un cash out registra la giocata come aperta e chiudila qui sotto indicando l'importo.")
         close = c[2].number_input("Quota di chiusura", 1.0, 1000.0, None, 0.01, placeholder="facoltativa", help="Serve a calcolare il CLV.")
         note = c[3].text_input("Nota", placeholder="facoltativa")
         if st.form_submit_button("Registra giocata", type="primary", icon=":material/add:"):
@@ -1255,15 +1393,24 @@ def ledger_bets_tab(acc: pd.DataFrame, allb: pd.DataFrame, vault: dict) -> None:
     else:
         st.dataframe(_bets_view(opened).drop(columns=["esito", "profitto", "clv %", "chiusura"]), hide_index=True, width="stretch", column_config=BET_COLS)
         labels = {int(r.id): _bet_label(r) for r in opened.itertuples()}
-        c = st.columns([4, 2, 1, 1])
+        c = st.columns([4, 3, 1, 1])
         bid = c[0].selectbox("Giocata da chiudere", list(labels), format_func=labels.get)
-        result = c[1].radio("Esito", ["won", "lost", "void"], format_func=STATUS_LABEL.get, horizontal=True)
+        result = c[1].radio("Esito", ["won", "lost", "void", "cashout"], format_func=STATUS_LABEL.get, horizontal=True)
         close = c[2].number_input("Chiusura", 1.0, 1000.0, None, 0.01, placeholder="facolt.", key="settle_close")
+        cash = None
+        if result == "cashout":
+            at_risk = float(opened.loc[opened["id"] == bid, "stake"].iloc[0])
+            cash = c[0].number_input("Profitto o perdita incassati con il cash out", -at_risk, 1e9, 0.0, 1.0, key="settle_cash",
+                                     help="Importo ricevuto meno importo a rischio, al netto delle commissioni: positivo se hai "
+                                          f"chiuso in profitto, negativo se in perdita (al massimo -{at_risk:.2f}).")
         c[3].markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
         if c[3].button("Chiudi", type="primary", width="stretch"):
-            with lg.open_ledger() as con:
-                lg.settle_bet(con, bid, result, close)
-            _flash(f"Giocata #{bid} chiusa: {STATUS_LABEL[result].lower()}.")
+            try:
+                with lg.open_ledger() as con:
+                    lg.settle_bet(con, bid, result, close, cash)
+                _flash(f"Giocata #{bid} chiusa: {STATUS_LABEL[result].lower()}.")
+            except ValueError as exc:
+                st.error(str(exc).capitalize())
 
     st.subheader("Storico")
     closed = allb[allb["status"] != "open"]

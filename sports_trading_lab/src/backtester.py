@@ -20,7 +20,8 @@ Configurazione di una strategia (dict serializzabile in JSON):
       "odds_min": 1.5, "odds_max": 2.5,
       "date_from": "2021-01-01", "date_to": null,
       "exclude_retirements": false,        # solo tennis
-      "filters": {"surface": {"in": ["Clay"]}, "rank": {"min": 1, "max": 50}}
+      "filters": {"surface": {"in": ["Clay"]}, "rank": {"min": 1, "max": 50}},
+      "cashout": {"mode": "off" | "manual" | "smart", ...}   # vedi src/cashout.py
     }
 """
 from __future__ import annotations
@@ -34,6 +35,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from src import cashout  # noqa: E402
 from src import config as C  # noqa: E402
 
 MARKETS = {"tennis": ["h2h"], "football": ["1x2", "ou25"]}
@@ -148,6 +150,12 @@ def tennis_selections(matches: pd.DataFrame, price: str = "avg") -> pd.DataFrame
         "court": np.where(indoor.isna(), None, np.where(indoor.eq(True), "Indoor", "Outdoor")),
         "status": m["status"],
     }
+    # esito del primo set (dato successivo al match: serve solo alla simulazione del cash out, non ai filtri)
+    first = m["score"].astype(str).str.extract(r"^\s*(\d+)-(\d+)") if "score" in m.columns else pd.DataFrame({0: [], 1: []})
+    g_w = pd.to_numeric(first[0], errors="coerce").reindex(m.index)
+    g_l = pd.to_numeric(first[1], errors="coerce").reindex(m.index)
+    set1 = {True: (g_w > g_l).astype(float).where(g_w.notna() & g_l.notna() & (g_w != g_l)),
+            False: (g_l > g_w).astype(float).where(g_w.notna() & g_l.notna() & (g_w != g_l))}
     sides = []
     for a, b, won in (("winner", "loser", True), ("loser", "winner", False)):
         x, y = a[0], b[0]
@@ -168,7 +176,7 @@ def tennis_selections(matches: pd.DataFrame, price: str = "avg") -> pd.DataFrame
             "opp_srv_won10": pct(f"{b}_srv_won10"), "opp_ret_won10": pct(f"{b}_ret_won10"),
             "odds": m[f"{price}_{x}"], "opp_odds": m[f"{price}_{y}"],
             "close_odds": m[f"ps_{x}"], "_close_opp": m[f"ps_{y}"],
-            "won": won,
+            "won": won, "set1_won": set1[won],
         }))
     s = pd.concat(sides, ignore_index=True)
     s["rank_adv"] = s["opp_rank"] - s["rank"]
@@ -215,6 +223,9 @@ def football_selections(matches: pd.DataFrame, market: str = "1x2", price: str =
         "home_team": m["home_team"], "away_team": m["away_team"],
         "event": m["home_team"] + " - " + m["away_team"],
         "odds_home": oh, "odds_draw": od, "odds_away": oa, "odds_over": _get(m, f"{price}_{pre}o25"),
+        "odds_under": _get(m, f"{price}_{pre}u25"),
+        # risultato all'intervallo (dato successivo al match: serve solo alla simulazione del cash out)
+        "ht_home": _get(m, "hthg"), "ht_away": _get(m, "htag"),
         "ah_line": _get(m, "ah_cline" if timing == "close" else "ah_line"),
         **feats,
         "ppg_diff": feats["home_ppg5"] - feats["away_ppg5"],
@@ -404,6 +415,8 @@ def backtest_selections(sel: pd.DataFrame, cfg: dict, bankroll: float = 100.0) -
     picked = apply_filters(sel, cfg)
     trades = settle(picked, cfg.get("side", "back"), float(cfg.get("commission") or 0.0),
                     cfg.get("lay_mode", "liability"), float(cfg.get("stake") or 1.0))
+    if cashout.is_active(cfg):
+        trades = cashout.apply(trades, cfg)
     return BacktestResult(cfg, trades, compute_metrics(trades, bankroll), monthly_returns(trades))
 
 
