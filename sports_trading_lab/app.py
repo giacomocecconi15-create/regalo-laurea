@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 from src import backtester as bt  # noqa: E402
 from src import config as C  # noqa: E402
+from src import ledger as lg  # noqa: E402
 from src import risk  # noqa: E402
 from src import strategies as sv  # noqa: E402
 from src import update_data as ud  # noqa: E402
@@ -223,6 +224,10 @@ def num_it(v: float, dec: int = 0) -> str:
     return f"{v:,.{dec}f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
+def signed_it(v: float, dec: int = 2) -> str:
+    return ("+" if v > 0 else "") + num_it(v, dec)
+
+
 def fmt(v: float, pattern: str = "{:+.2f}") -> str:
     return "n/d" if v is None or (isinstance(v, float) and not np.isfinite(v)) else pattern.format(v)
 
@@ -375,6 +380,8 @@ strategia solo se supera i controlli e ha una logica che sai spiegare.
 - **Rischio**: simula 1.000 futuri possibili e confronta stake fisso e Kelly frazionario.
 - **Strategie**: salva le strategie valide, carica il CSV con le quote del giorno e ottieni i match che le
   attivano con lo stake già calcolato sul tuo bankroll.
+- **Registro**: annota le giocate reali (o importale dallo scanner), tieni i saldi dei conti e confronta
+  ROI e CLV reali con quelli del backtest.
 - **Dati**: aggiorna il database quando vuoi (pulsante *Aggiorna Database*).
 """)
     st.info("Limiti dei dati: le quote tennis esistono solo per il circuito ATP (non per i Challenger) e sono una sola "
@@ -893,6 +900,17 @@ def page_vault() -> None:
         st.caption("Back: importo a rischio = puntata. Lay: importo a rischio = responsabilità; la puntata da inserire sull'exchange è responsabilità / (quota - 1).")
         st.download_button("Esporta segnali (CSV)", signals.to_csv(index=False).encode("utf-8"),
                            f"segnali_{date.today():%Y%m%d}.csv", "text/csv", icon=":material/download:")
+        with lg.open_ledger() as con:
+            names = lg.accounts(con)["conto"].tolist()
+        if names:
+            a, b = st.columns([2, 2])
+            target = a.selectbox("Conto su cui registrare i segnali", names, label_visibility="collapsed")
+            if b.button(f"Registra i {len(signals)} segnali nel Registro come giocate aperte", icon=":material/playlist_add:"):
+                with lg.open_ledger() as con:
+                    n = lg.add_signals(con, signals, target, sv.detect_sport(df) or "", vault)
+                st.success(f"{n} giocate aperte aggiunte al Registro sul conto {target}.")
+        else:
+            st.caption("Per registrare i segnali come giocate, crea prima un conto nella pagina Registro.")
     with st.expander("File caricato (righe con segnale evidenziate)"):
         hits = set(signals["evento"]) if len(signals) else set()
         norm = df.rename(columns=lambda c: str(c).strip().lower().replace(" ", "_"))
@@ -909,12 +927,227 @@ def page_vault() -> None:
         st.dataframe(styled, hide_index=True, width="stretch")
 
 
+# --------------------------------------------------------------------------- pagina: registro
+STATUS_LABEL = {"open": "Aperta", "won": "Vinta", "lost": "Persa", "void": "Rimborsata"}
+SIDE_LABEL = {"back": "Punta", "lay": "Banca"}
+
+
+def _flash(msg: str) -> None:
+    ss["_flash"] = msg
+    st.rerun()
+
+
+def _bet_label(r) -> str:
+    return f"#{r.id}  {r.placed_date:%d/%m/%Y}  {r.event} - {r.selection} @ {r.odds:.2f}  ({r.stake:.2f} su {r.account})"
+
+
+def _bets_view(df: pd.DataFrame) -> pd.DataFrame:
+    v = df[["id", "placed_date", "sport", "event", "selection", "side", "odds", "stake", "account", "strategy",
+            "status", "close_odds", "clv_pct", "pnl", "note"]].copy()
+    v["placed_date"] = v["placed_date"].dt.date
+    v["side"] = v["side"].map(SIDE_LABEL)
+    v["status"] = v["status"].map(STATUS_LABEL)
+    return v.rename(columns={"placed_date": "data", "event": "evento", "selection": "selezione", "side": "lato",
+                             "odds": "quota", "stake": "a rischio", "account": "conto", "strategy": "strategia",
+                             "status": "esito", "close_odds": "chiusura", "clv_pct": "clv %", "pnl": "profitto", "note": "nota"})
+
+
+BET_COLS = {
+    "quota": st.column_config.NumberColumn(format="%.2f"), "a rischio": st.column_config.NumberColumn(format="%.2f"),
+    "chiusura": st.column_config.NumberColumn(format="%.2f"), "clv %": st.column_config.NumberColumn(format="%+.2f"),
+    "profitto": st.column_config.NumberColumn(format="%+.2f"),
+}
+
+
+def ledger_accounts_tab(acc: pd.DataFrame, mov: pd.DataFrame) -> None:
+    if len(acc):
+        st.dataframe(acc, hide_index=True, width="stretch", column_config={
+            c: st.column_config.NumberColumn(format="%.2f") for c in ("depositi", "prelievi", "profitto", "saldo", "in_gioco", "disponibile")})
+        st.caption("Saldo = depositi - prelievi + profitto delle giocate chiuse. Disponibile = saldo meno l'importo a rischio delle giocate aperte.")
+    a, b = st.columns(2)
+    with a, st.form("new_account", clear_on_submit=True):
+        st.markdown("**Nuovo conto**")
+        name = st.text_input("Nome", placeholder="es. Betfair Exchange, Bet365...")
+        kind = st.selectbox("Tipo", ["Bookmaker", "Exchange", "Altro"])
+        opening = st.number_input("Saldo iniziale", 0.0, 1e9, 0.0, 50.0)
+        if st.form_submit_button("Crea conto", icon=":material/add:"):
+            try:
+                with lg.open_ledger() as con:
+                    lg.add_account(con, name, kind, opening)
+                _flash(f"Conto '{name.strip()}' creato.")
+            except ValueError as exc:
+                st.error(str(exc).capitalize())
+    with b, st.form("new_move", clear_on_submit=True):
+        st.markdown("**Deposito o prelievo**")
+        names = acc["conto"].tolist()
+        account = st.selectbox("Conto", names, index=0 if names else None, placeholder="crea prima un conto")
+        c1, c2, c3 = st.columns(3)
+        kind = c1.selectbox("Tipo", ["deposit", "withdrawal"], format_func={"deposit": "Deposito", "withdrawal": "Prelievo"}.get)
+        amount = c2.number_input("Importo", 0.0, 1e9, 0.0, 50.0)
+        when = c3.date_input("Data", date.today())
+        note = st.text_input("Nota", placeholder="facoltativa")
+        if st.form_submit_button("Registra movimento", icon=":material/payments:"):
+            try:
+                with lg.open_ledger() as con:
+                    lg.add_movement(con, account or "", kind, amount, when, note)
+                _flash("Movimento registrato.")
+            except ValueError as exc:
+                st.error(str(exc).capitalize())
+    if len(mov):
+        st.subheader("Movimenti")
+        st.dataframe(mov.drop(columns="id"), hide_index=True, width="stretch",
+                     column_config={"importo": st.column_config.NumberColumn(format="%.2f")})
+        with st.expander("Correggi un errore"):
+            labels = {int(r.id): f"{r.data}  {r.tipo} {r.importo:.2f} su {r.conto}" for r in mov.itertuples()}
+            c1, c2 = st.columns([3, 1])
+            mid = c1.selectbox("Movimento da eliminare", list(labels), index=None, format_func=labels.get, label_visibility="collapsed",
+                               placeholder="movimento da eliminare...")
+            if c2.button("Elimina movimento", disabled=mid is None, width="stretch"):
+                with lg.open_ledger() as con:
+                    lg.delete_movement(con, mid)
+                _flash("Movimento eliminato.")
+            empty = acc[(acc["giocate"] == 0) & (acc["depositi"] == 0) & (acc["prelievi"] == 0)]["conto"].tolist()
+            if empty:
+                c1, c2 = st.columns([3, 1])
+                victim = c1.selectbox("Conto vuoto da eliminare", empty, index=None, label_visibility="collapsed", placeholder="conto vuoto da eliminare...")
+                if c2.button("Elimina conto", disabled=victim is None, width="stretch"):
+                    with lg.open_ledger() as con:
+                        lg.delete_account(con, victim)
+                    _flash("Conto eliminato.")
+
+
+def ledger_bets_tab(acc: pd.DataFrame, allb: pd.DataFrame, vault: dict) -> None:
+    names = acc["conto"].tolist()
+    with st.expander("Nuova giocata", expanded=allb.empty), st.form("new_bet", clear_on_submit=True):
+        c = st.columns([1, 1, 3, 2])
+        when = c[0].date_input("Data", date.today())
+        sport = c[1].selectbox("Sport", ["tennis", "football", "altro"], format_func={"tennis": "Tennis", "football": "Calcio", "altro": "Altro"}.get)
+        event = c[2].text_input("Evento", placeholder="es. Sinner vs Alcaraz, Inter - Milan")
+        selection = c[3].text_input("Selezione", placeholder="es. Sinner, 1, Over 2.5")
+        c = st.columns([1, 1, 1, 1, 2])
+        side = c[0].selectbox("Lato", ["back", "lay"], format_func=SIDE_LABEL.get)
+        odds = c[1].number_input("Quota", 1.01, 1000.0, 2.00, 0.01)
+        stake = c[2].number_input("Importo a rischio", 0.0, 1e9, 10.0, 1.0, help="Puntata per un back; responsabilità per un lay.")
+        comm = c[3].number_input("Commissione %", 0.0, 20.0, 0.0, 0.5)
+        account = c[4].selectbox("Conto", names)
+        c = st.columns([2, 1, 1, 2])
+        strategy = c[0].selectbox("Strategia", list(vault), index=None, placeholder="nessuna", accept_new_options=True)
+        status = c[1].selectbox("Esito", lg.RESULTS, format_func=STATUS_LABEL.get)
+        close = c[2].number_input("Quota di chiusura", 1.0, 1000.0, None, 0.01, placeholder="facoltativa", help="Serve a calcolare il CLV.")
+        note = c[3].text_input("Nota", placeholder="facoltativa")
+        if st.form_submit_button("Registra giocata", type="primary", icon=":material/add:"):
+            try:
+                with lg.open_ledger() as con:
+                    lg.add_bet(con, placed_date=when, sport=sport, event=event, selection=selection, side=side, odds=odds,
+                               stake=stake, account=account or "", strategy=strategy or "", commission=comm / 100, status=status,
+                               close_odds=close, note=note)
+                _flash("Giocata registrata.")
+            except ValueError as exc:
+                st.error(str(exc).capitalize())
+
+    opened = allb[allb["status"] == "open"]
+    st.subheader(f"Giocate aperte ({len(opened)})")
+    if opened.empty:
+        st.caption("Nessuna giocata in attesa di esito.")
+    else:
+        st.dataframe(_bets_view(opened).drop(columns=["esito", "profitto", "clv %", "chiusura"]), hide_index=True, width="stretch", column_config=BET_COLS)
+        labels = {int(r.id): _bet_label(r) for r in opened.itertuples()}
+        c = st.columns([4, 2, 1, 1])
+        bid = c[0].selectbox("Giocata da chiudere", list(labels), format_func=labels.get)
+        result = c[1].radio("Esito", ["won", "lost", "void"], format_func=STATUS_LABEL.get, horizontal=True)
+        close = c[2].number_input("Chiusura", 1.0, 1000.0, None, 0.01, placeholder="facolt.", key="settle_close")
+        c[3].markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
+        if c[3].button("Chiudi", type="primary", width="stretch"):
+            with lg.open_ledger() as con:
+                lg.settle_bet(con, bid, result, close)
+            _flash(f"Giocata #{bid} chiusa: {STATUS_LABEL[result].lower()}.")
+
+    st.subheader("Storico")
+    closed = allb[allb["status"] != "open"]
+    if closed.empty:
+        st.caption("Nessuna giocata chiusa.")
+    else:
+        st.dataframe(_bets_view(closed).iloc[::-1].head(MAX_TABLE_ROWS), hide_index=True, width="stretch",
+                     height=360 if len(closed) > 9 else "auto", column_config=BET_COLS)
+    if not allb.empty:
+        c = st.columns([1, 3, 1, 1])
+        c[0].download_button("Esporta (CSV)", _bets_view(allb).to_csv(index=False).encode("utf-8"),
+                             f"registro_{date.today():%Y%m%d}.csv", "text/csv", icon=":material/download:")
+        labels = {int(r.id): _bet_label(r) for r in allb.iloc[::-1].itertuples()}
+        fix = c[1].selectbox("Giocata da correggere", list(labels), index=None, format_func=labels.get, label_visibility="collapsed",
+                             placeholder="correggi una giocata: riaprila o eliminala...")
+        if c[2].button("Riapri", disabled=fix is None, width="stretch"):
+            with lg.open_ledger() as con:
+                lg.settle_bet(con, fix, "open")
+            _flash(f"Giocata #{fix} riaperta.")
+        if c[3].button("Elimina", disabled=fix is None, width="stretch"):
+            with lg.open_ledger() as con:
+                lg.delete_bet(con, fix)
+            _flash(f"Giocata #{fix} eliminata.")
+
+
+def ledger_dashboard_tab(allb: pd.DataFrame, vault: dict) -> None:
+    trades = lg.settled_trades(allb)
+    if trades.empty:
+        st.info("Qui compariranno andamento e confronto con il backtest appena avrai chiuso le prime giocate.")
+        return
+    show(equity_chart(trades.assign(equity=trades["equity"])).update_layout(title_text="Profitto reale cumulato"))
+    st.subheader("Reale contro backtest, per strategia")
+    st.dataframe(lg.by_strategy(allb, vault), hide_index=True, width="stretch", column_config={
+        "profitto": st.column_config.NumberColumn(format="%+.2f"), "rischiato": st.column_config.NumberColumn(format="%.2f"),
+        "roi_pct": st.column_config.NumberColumn("ROI % reale", format="%+.2f"), "clv_pct": st.column_config.NumberColumn("CLV % reale", format="%+.2f"),
+        "roi_backtest_pct": st.column_config.NumberColumn("ROI % backtest", format="%+.2f"),
+        "clv_backtest_pct": st.column_config.NumberColumn("CLV % backtest", format="%+.2f")})
+    st.caption("Con poche giocate il ROI reale oscilla molto: il CLV converge prima ed è il confronto più utile nelle prime settimane. "
+               "Le colonne backtest si riempiono quando il nome della strategia coincide con una strategia salvata.")
+    mo = bt.monthly_returns(trades)
+    if len(mo) > 1:
+        hover = [f"{int(n)} giocate, yield {y:+.1f}%" for n, y in zip(mo["trades"], mo["yield_pct"])]
+        fig = bars_chart(mo["month"], mo["profit"], hover, "Profitto reale per mese", "", 260)
+        fig.update_xaxes(tickangle=0)
+        show(fig)
+
+
+def page_ledger() -> None:
+    header("Registro", "Le tue giocate reali, i saldi dei conti e il confronto con il backtest.")
+    if ss.get("_flash"):
+        st.success(ss.pop("_flash"))
+    try:
+        with lg.open_ledger() as con:
+            acc, allb, mov, tot = lg.accounts(con), lg.bets(con), lg.movements(con), lg.totals(con)
+    except duckdb.Error as exc:
+        st.error(f"Impossibile aprire il registro: {exc}. Chiudi altre finestre dell'app e ricarica la pagina.")
+        return
+    vault = sv.load_vault()
+    if acc.empty:
+        st.info("Per iniziare crea un conto per ogni bookmaker o exchange che usi, con il saldo attuale. "
+                "Poi registra le giocate: a mano dalla scheda Giocate, oppure dai segnali dello scanner nella pagina Strategie.")
+        ledger_accounts_tab(acc, mov)
+        return
+    m = bt.compute_metrics(lg.settled_trades(allb), max(tot["versato"], 1.0))
+    n_open = int((allb["status"] == "open").sum())
+    kpis([("Bankroll totale", num_it(tot["saldo"], 2), f"versato netto {num_it(tot['versato'], 2)}", None),
+          ("Disponibile", num_it(tot["saldo"] - tot["in_gioco"], 2), f"{num_it(tot['in_gioco'], 2)} in gioco su {n_open} aperte", None),
+          ("Profitto", signed_it(tot["profitto"]), f"{m['trades']} giocate chiuse", sign_tone(tot["profitto"])),
+          ("ROI reale", f"{m['roi_pct']:+.2f}%" if m["trades"] else "n/d", f"win rate {m['win_rate_pct']:.0f}%" if m["trades"] else "", sign_tone(m["roi_pct"]) if m["trades"] else None),
+          ("CLV medio", fmt(m["clv_pct"], "{:+.2f}%"), "sulle giocate con quota di chiusura", sign_tone(m["clv_pct"])),
+          ("Max drawdown", signed_it(-m["max_dd_units"]) if m["max_dd_units"] else "0,00", f"{m['max_dd_pct']:.0f}% del versato", None)])
+    t1, t2, t3 = st.tabs(["Giocate", "Andamento", "Conti"])
+    with t1:
+        ledger_bets_tab(acc, allb, vault)
+    with t2:
+        ledger_dashboard_tab(allb, vault)
+    with t3:
+        ledger_accounts_tab(acc, mov)
+
+
 # --------------------------------------------------------------------------- navigazione
 ensure_schema()
 PAGES = {
     "backtester": st.Page(page_backtester, title="Backtester", icon=":material/query_stats:", url_path="backtester", default=True),
     "risk": st.Page(page_risk, title="Rischio", icon=":material/casino:", url_path="risk"),
     "vault": st.Page(page_vault, title="Strategie", icon=":material/bookmark:", url_path="vault"),
+    "ledger": st.Page(page_ledger, title="Registro", icon=":material/receipt_long:", url_path="registro"),
     "data": st.Page(page_data, title="Dati", icon=":material/database:", url_path="data"),
     "guide": st.Page(page_guide, title="Guida", icon=":material/help:", url_path="guide"),
 }

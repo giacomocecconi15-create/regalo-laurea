@@ -5,3 +5,6 @@ data/raw/
 *.duckdb.wal
 *.tmp
 data/trading_db.duckdb
+data/gestionale.duckdb
+data/*.wal
+strategies.json

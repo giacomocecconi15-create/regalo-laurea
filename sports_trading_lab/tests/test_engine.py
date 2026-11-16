@@ -512,3 +512,73 @@ def test_real_tennis_backtest(con):
     assert r.metrics["trades"] > 8000 and 60 < r.metrics["win_rate_pct"] < 80
     assert -8 < r.metrics["roi_pct"] < 2
     assert r.metrics["clv_pct"] == pytest.approx(0.0)  # prezzo di ingresso = chiusura Pinnacle
+
+
+# ------------------------------------------------------------------ gestionale
+from src import ledger as lg  # noqa: E402
+
+
+def test_ledger_pnl_and_clv_formulas():
+    assert lg.bet_pnl("back", 2.5, 10, "won", 0.05) == pytest.approx(10 * 1.5 * 0.95)
+    assert lg.bet_pnl("back", 2.5, 10, "lost") == -10
+    assert lg.bet_pnl("lay", 3.0, 20, "won", 0.02) == pytest.approx(20 / 2 * 0.98)   # responsabilita' 20 -> puntata banco 10
+    assert lg.bet_pnl("lay", 3.0, 20, "lost") == -20
+    assert lg.bet_pnl("back", 2.0, 10, "void") == 0.0 and lg.bet_pnl("back", 2.0, 10, "open") is None
+    assert lg.clv_pct("back", 2.10, 2.00) == pytest.approx(5.0)
+    assert lg.clv_pct("lay", 1.90, 2.00) == pytest.approx(5.0)
+    assert np.isnan(lg.clv_pct("back", 2.0, None))
+
+
+def test_ledger_accounts_bets_and_balances(tmp_path):
+    from datetime import date
+    with lg.open_ledger(tmp_path / "g.duckdb") as con:
+        lg.add_account(con, "Exchange", "Exchange", 1000)
+        lg.add_account(con, "Book", "Bookmaker")
+        with pytest.raises(ValueError):
+            lg.add_account(con, "exchange")
+        lg.add_movement(con, "Book", "deposit", 200)
+        lg.add_movement(con, "Exchange", "withdrawal", 100)
+        kw = dict(placed_date=date(2026, 1, 10), sport="tennis", event="A vs B", selection="A")
+        b1 = lg.add_bet(con, side="back", odds=2.0, stake=50, account="Exchange", strategy="S1", commission=0.05, **kw)
+        b2 = lg.add_bet(con, side="back", odds=3.0, stake=20, account="Book", strategy="S1", status="lost", close_odds=2.8, **kw)
+        b3 = lg.add_bet(con, side="lay", odds=1.5, stake=30, account="Exchange", strategy="", **kw)
+        for bad in (dict(odds=1.0, stake=10), dict(odds=2.0, stake=0)):
+            with pytest.raises(ValueError):
+                lg.add_bet(con, side="back", account="Book", **kw, **bad)
+        with pytest.raises(ValueError):
+            lg.add_bet(con, side="back", odds=2.0, stake=10, account="Inesistente", **kw)
+
+        acc = lg.accounts(con).set_index("conto")
+        assert acc.loc["Exchange", "saldo"] == pytest.approx(900) and acc.loc["Exchange", "in_gioco"] == pytest.approx(80)
+        assert acc.loc["Exchange", "disponibile"] == pytest.approx(820)
+        assert acc.loc["Book", "saldo"] == pytest.approx(180)
+
+        lg.settle_bet(con, b1, "won", close_odds=1.9)
+        lg.settle_bet(con, b3, "won")
+        acc = lg.accounts(con).set_index("conto")
+        assert acc.loc["Exchange", "saldo"] == pytest.approx(900 + 47.5 + 60) and acc.loc["Exchange", "in_gioco"] == 0
+        tot = lg.totals(con)
+        assert tot["saldo"] == pytest.approx(1100 + 47.5 + 60 - 20) and tot["profitto"] == pytest.approx(87.5)
+
+        df = lg.bets(con)
+        t = lg.settled_trades(df)
+        m = bt.compute_metrics(t, 1100)
+        assert m["trades"] == 3 and m["profit"] == pytest.approx(87.5) and m["roi_pct"] == pytest.approx(87.5 / 100 * 100)
+        assert df.set_index("id").loc[b1, "clv_pct"] == pytest.approx((2.0 / 1.9 - 1) * 100)
+        s = lg.by_strategy(df, {"S1": {"metrics": {"roi_pct": 4.0, "clv_pct": 1.5}}}).set_index("strategia")
+        assert s.loc["S1", "giocate"] == 2 and s.loc["S1", "roi_pct"] == pytest.approx(27.5 / 70 * 100)
+        assert s.loc["S1", "roi_backtest_pct"] == 4.0 and np.isnan(s.loc["(senza strategia)", "roi_backtest_pct"])
+
+        lg.settle_bet(con, b1, "open")           # riapertura: il profitto torna a zero
+        assert lg.totals(con)["profitto"] == pytest.approx(40.0)
+        lg.delete_bet(con, b2)
+        assert lg.totals(con)["profitto"] == pytest.approx(60.0)
+        with pytest.raises(ValueError):
+            lg.delete_account(con, "Exchange")
+
+        signals = pd.DataFrame({"strategia": ["S1", "S1"], "data": ["2026-02-01", "2026-02-01"], "evento": ["C vs D", "E vs F"],
+                                "selezione": ["C", "E"], "lato": ["PUNTA", "BANCA"], "quota": [1.8, 2.2],
+                                "importo_rischio": [10.0, 0.0]})
+        assert lg.add_signals(con, signals, "Book", "tennis", {"S1": {"config": {"commission": 0.02}}}) == 1
+        last = lg.bets(con, "open").iloc[-1]
+        assert last["event"] == "C vs D" and last["commission"] == 0.02 and last["account"] == "Book"

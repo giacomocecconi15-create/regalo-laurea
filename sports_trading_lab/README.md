@@ -21,19 +21,20 @@ Uso manuale:
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python src/update_data.py        # scarica / aggiorna il database
-.venv/bin/python -m pytest tests -q        # 38 test
+.venv/bin/python -m pytest tests -q        # 40 test
 .venv/bin/python -m streamlit run app.py   # dashboard
 ```
 
 ## Struttura
 
 ```
-app.py                 dashboard Streamlit (Backtester, Rischio, Strategie, Dati, Guida)
+app.py                 dashboard Streamlit (Backtester, Rischio, Strategie, Registro, Dati, Guida)
 src/config.py          percorsi, sorgenti dati, leghe, schema delle tabelle
 src/update_data.py     download, pulizia, caricamento incrementale in DuckDB
 src/backtester.py      motore di backtesting vettorizzato
 src/risk.py            Monte Carlo: stake fisso vs Kelly frazionario
 src/strategies.py      Strategy Vault (strategies.json) e Pre-Match Scanner
+src/ledger.py          gestionale: conti, movimenti e registro delle giocate reali
 tests/test_engine.py   test dei calcoli, dei parser e dell'integrità del database
 data/trading_db.duckdb database (generato, non versionato)   data/raw/  cache dei file scaricati
 ```
@@ -114,8 +115,11 @@ curve, rendimenti mensili. Ogni operazione rischia 1 unità.
    risk of ruin, distribuzione del drawdown.
 3. **Strategie** – archivio in `strategies.json` (riapribili nel Backtester) e scanner: carica un CSV con le
    quote del giorno e ottieni i segnali con lo stake calcolato sul bankroll. I modelli CSV si scaricano dalla pagina.
-4. **Dati** – stato del database e pulsante di aggiornamento con barra di avanzamento.
-5. **Guida** – come si usa, in cinque passi.
+4. **Registro** – gestionale delle giocate reali: conti per bookmaker/exchange con depositi e prelievi, giocate
+   aperte e chiuse (anche importate dai segnali dello scanner), saldo e disponibile, ROI e CLV reali confrontati
+   con quelli del backtest per strategia. I dati stanno in `data/gestionale.duckdb`, separato dagli storici.
+5. **Dati** – stato del database e pulsante di aggiornamento con barra di avanzamento.
+6. **Guida** – come si usa, in cinque passi.
 
 Un backtest positivo non garantisce risultati futuri: più filtri si provano, più è probabile trovare un risultato
 buono per caso. Guarda numero di operazioni, t-stat e CLV prima di fidarti di un ROI.
