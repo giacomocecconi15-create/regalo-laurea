@@ -16,25 +16,32 @@ dashboard su `http://localhost:8501`. Serve Python 3.10+.
 **Mac Intel con macOS 11 o precedente:** serve Python **3.12** (non più recente) e si installa da
 `requirements-macos11.txt`; `start_app.sh` lo fa da solo.
 
+**App da doppio clic su Mac.** Dopo la prima installazione, esegui una volta `./crea_app_mac.sh`: crea
+*Sports Trading Lab.app* sulla Scrivania. Il doppio clic avvia la piattaforma e la apre in una finestra dedicata
+(con Chrome, Edge o Brave; altrimenti nel browser predefinito). Se è già aperta chiede se riaprire la finestra o
+spegnerla. L'app punta alla cartella del progetto: se la sposti, riesegui lo script.
+
 Uso manuale:
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python src/update_data.py        # scarica / aggiorna il database
-.venv/bin/python -m pytest tests -q        # 40 test
+.venv/bin/python -m pytest tests -q        # 41 test
 .venv/bin/python -m streamlit run app.py   # dashboard
 ```
 
 ## Struttura
 
 ```
-app.py                 dashboard Streamlit (Backtester, Rischio, Strategie, Registro, Dati, Guida)
+app.py                 dashboard Streamlit (Backtester, Rischio, Strategie, Registro, Roadmap, Dati, Guida)
 src/config.py          percorsi, sorgenti dati, leghe, schema delle tabelle
 src/update_data.py     download, pulizia, caricamento incrementale in DuckDB
 src/backtester.py      motore di backtesting vettorizzato
 src/risk.py            Monte Carlo: stake fisso vs Kelly frazionario
 src/strategies.py      Strategy Vault (strategies.json) e Pre-Match Scanner
 src/ledger.py          gestionale: conti, movimenti e registro delle giocate reali
+src/roadmap.py         roadmap 2027 (voci predefinite e stato salvato)
+crea_app_mac.sh        crea l'app da doppio clic per Mac
 tests/test_engine.py   test dei calcoli, dei parser e dell'integrità del database
 data/trading_db.duckdb database (generato, non versionato)   data/raw/  cache dei file scaricati
 ```
@@ -118,8 +125,10 @@ curve, rendimenti mensili. Ogni operazione rischia 1 unità.
 4. **Registro** – gestionale delle giocate reali: conti per bookmaker/exchange con depositi e prelievi, giocate
    aperte e chiuse (anche importate dai segnali dello scanner), saldo e disponibile, ROI e CLV reali confrontati
    con quelli del backtest per strategia. I dati stanno in `data/gestionale.duckdb`, separato dagli storici.
-5. **Dati** – stato del database e pulsante di aggiornamento con barra di avanzamento.
-6. **Guida** – come si usa, in cinque passi.
+5. **Roadmap 2027** – il piano dell'anno per trimestri, su due binari (funzioni della piattaforma e metodo di
+   lavoro); lo stato di ogni voce, le note e le voci aggiunte si salvano in `data/roadmap.json`.
+6. **Dati** – stato del database e pulsante di aggiornamento con barra di avanzamento.
+7. **Guida** – come si usa, in cinque passi.
 
 Un backtest positivo non garantisce risultati futuri: più filtri si provano, più è probabile trovare un risultato
 buono per caso. Guarda numero di operazioni, t-stat e CLV prima di fidarti di un ROI.

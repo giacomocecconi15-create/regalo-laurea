@@ -582,3 +582,30 @@ def test_ledger_accounts_bets_and_balances(tmp_path):
         assert lg.add_signals(con, signals, "Book", "tennis", {"S1": {"config": {"commission": 0.02}}}) == 1
         last = lg.bets(con, "open").iloc[-1]
         assert last["event"] == "C vs D" and last["commission"] == 0.02 and last["account"] == "Book"
+
+
+# ------------------------------------------------------------------ roadmap
+def test_roadmap_state_is_saved_and_merged(tmp_path):
+    from src import roadmap as rm
+    p = tmp_path / "roadmap.json"
+    base = rm.items(p)
+    assert len(base) == len(rm.DEFAULT_ITEMS) and all(i["status"] == "todo" for i in base)
+    assert {i["quarter"] for i in base} == set(rm.QUARTERS) and {i["track"] for i in base} == set(rm.TRACKS)
+    assert len({i["id"] for i in base}) == len(base)
+    rm.update_item("q1-paper", status="doing", note="partito il 7 gennaio", path=p)
+    rm.update_item("q1-rules", status="done", path=p)
+    mine = rm.add_item("Q2", "Metodo", "Aprire conto exchange", "con verifica documenti", path=p)
+    rm.update_item(mine, status="done", path=p)
+    now = {i["id"]: i for i in rm.items(p)}
+    assert now["q1-paper"]["status"] == "doing" and now["q1-paper"]["note"] == "partito il 7 gennaio"
+    assert now[mine]["custom"] and now[mine]["status"] == "done" and now[mine]["quarter"] == "Q2"
+    prog = rm.progress(list(now.values()))
+    assert prog["all"] == (2, len(base) + 1) and prog["Q1"][0] == 1 and prog["Q2"][0] == 1
+    with pytest.raises(ValueError):
+        rm.update_item("q1-paper", status="boh", path=p)
+    with pytest.raises(ValueError):
+        rm.add_item("Q9", "Metodo", "x", path=p)
+    rm.delete_item(mine, path=p)
+    assert mine not in {i["id"] for i in rm.items(p)}
+    p.write_text("{rotto", encoding="utf-8")       # file danneggiato: si riparte dalle voci predefinite
+    assert len(rm.items(p)) == len(rm.DEFAULT_ITEMS)

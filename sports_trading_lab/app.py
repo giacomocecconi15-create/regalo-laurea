@@ -23,6 +23,7 @@ from src import backtester as bt  # noqa: E402
 from src import config as C  # noqa: E402
 from src import ledger as lg  # noqa: E402
 from src import risk  # noqa: E402
+from src import roadmap as rm  # noqa: E402
 from src import strategies as sv  # noqa: E402
 from src import update_data as ud  # noqa: E402
 
@@ -382,6 +383,7 @@ strategia solo se supera i controlli e ha una logica che sai spiegare.
   attivano con lo stake già calcolato sul tuo bankroll.
 - **Registro**: annota le giocate reali (o importale dallo scanner), tieni i saldi dei conti e confronta
   ROI e CLV reali con quelli del backtest.
+- **Roadmap 2027**: il piano dell'anno per trimestri, con lo stato di ogni passo.
 - **Dati**: aggiorna il database quando vuoi (pulsante *Aggiorna Database*).
 """)
     st.info("Limiti dei dati: le quote tennis esistono solo per il circuito ATP (non per i Challenger) e sono una sola "
@@ -1141,6 +1143,73 @@ def page_ledger() -> None:
         ledger_accounts_tab(acc, mov)
 
 
+# --------------------------------------------------------------------------- pagina: roadmap
+def _rm_save_status(item_id: str) -> None:
+    rm.update_item(item_id, status=ss[f"rm_s_{item_id}"])
+
+
+def _rm_save_note(item_id: str) -> None:
+    rm.update_item(item_id, note=ss[f"rm_n_{item_id}"])
+
+
+def page_roadmap() -> None:
+    header("Roadmap 2027", "Il piano dell'anno, trimestre per trimestre: cosa aggiungere alla piattaforma e come usarla per decidere.")
+    if ss.get("_flash"):
+        st.success(ss.pop("_flash"))
+    all_items = rm.items()
+    prog = rm.progress(all_items)
+    done, total = prog["all"]
+    doing = sum(i["status"] == "doing" for i in all_items)
+    kpis([("Avanzamento", f"{done} / {total}", f"{done / total * 100:.0f}% delle voci completate", "good" if done else None),
+          ("In corso", str(doing), "voci avviate", None)]
+         + [(f"{q} · {rm.QUARTERS[q][1]}", f"{prog[q][0]} / {prog[q][1]}", rm.QUARTERS[q][0], "good" if prog[q][1] and prog[q][0] == prog[q][1] else None)
+            for q in rm.QUARTERS])
+    c1, c2 = st.columns([2, 3])
+    track = c1.radio("Mostra", ["Tutto"] + rm.TRACKS, horizontal=True, label_visibility="collapsed")
+    c2.caption("**Piattaforma**: funzioni da aggiungere allo strumento.  **Metodo**: cosa fare tu, con lo strumento, per arrivare a "
+               "puntare solo su ciò che i dati confermano. Aggiorna lo stato di ogni voce: viene salvato subito.")
+    color = {"todo": MUTED, "doing": BLUE, "done": GOOD}
+    for q, (months, name, goal) in rm.QUARTERS.items():
+        q_items = [i for i in all_items if i["quarter"] == q and track in ("Tutto", i["track"])]
+        st.subheader(f"{q} · {name}")
+        st.caption(f"{months} - {goal}")
+        d, t = prog[q]
+        st.progress(d / t if t else 0.0, text=f"{d} di {t} completate")
+        for it in q_items:
+            with st.container(border=True):
+                a, b = st.columns([5, 2])
+                tag = f'<span class="tag" style="min-width:0;border:1px solid {GRID};border-radius:10px;padding:1px 8px;margin-left:8px">{it["track"]}</span>'
+                a.markdown(f'<span class="dot" style="background:{color[it["status"]]};margin-right:8px"></span>'
+                           f'<b>{it["title"]}</b>{tag}', unsafe_allow_html=True)
+                a.caption(it["description"])
+                if it["needs"]:
+                    a.caption(f":material/link: {it['needs']}")
+                ss.setdefault(f"rm_s_{it['id']}", it["status"])
+                ss.setdefault(f"rm_n_{it['id']}", it["note"])
+                b.selectbox("Stato", rm.STATUSES, format_func=rm.STATUS_LABEL.get, key=f"rm_s_{it['id']}",
+                            on_change=_rm_save_status, args=(it["id"],), label_visibility="collapsed")
+                b.text_input("Nota", key=f"rm_n_{it['id']}", on_change=_rm_save_note, args=(it["id"],),
+                             label_visibility="collapsed", placeholder="nota personale...")
+                if it["custom"] and b.button("Elimina voce", key=f"rm_d_{it['id']}", width="stretch"):
+                    rm.delete_item(it["id"])
+                    _flash("Voce eliminata.")
+    with st.expander("Aggiungi una voce tua"), st.form("rm_add", clear_on_submit=True):
+        c = st.columns([1, 1, 3])
+        quarter = c[0].selectbox("Trimestre", list(rm.QUARTERS))
+        tr = c[1].selectbox("Binario", rm.TRACKS, index=1)
+        title = c[2].text_input("Titolo")
+        desc = st.text_input("Descrizione", placeholder="facoltativa")
+        if st.form_submit_button("Aggiungi", icon=":material/add:"):
+            try:
+                rm.add_item(quarter, tr, title, desc)
+                _flash("Voce aggiunta alla roadmap.")
+            except ValueError as exc:
+                st.error(str(exc).capitalize())
+    st.caption("La roadmap è un piano di lavoro, non una previsione di guadagno: nessun passo garantisce un profitto, e ogni "
+               "passaggio a stake reali va deciso sui risultati misurati nel Registro. Le voci con il simbolo del collegamento "
+               "dipendono da servizi o dati esterni ancora da scegliere.")
+
+
 # --------------------------------------------------------------------------- navigazione
 ensure_schema()
 PAGES = {
@@ -1148,6 +1217,7 @@ PAGES = {
     "risk": st.Page(page_risk, title="Rischio", icon=":material/casino:", url_path="risk"),
     "vault": st.Page(page_vault, title="Strategie", icon=":material/bookmark:", url_path="vault"),
     "ledger": st.Page(page_ledger, title="Registro", icon=":material/receipt_long:", url_path="registro"),
+    "roadmap": st.Page(page_roadmap, title="Roadmap 2027", icon=":material/flag:", url_path="roadmap"),
     "data": st.Page(page_data, title="Dati", icon=":material/database:", url_path="data"),
     "guide": st.Page(page_guide, title="Guida", icon=":material/help:", url_path="guide"),
 }
