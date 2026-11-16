@@ -23,6 +23,8 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 from src import analysis as an  # noqa: E402
 from src import backtester as bt  # noqa: E402
+from src import backup as bk  # noqa: E402
+from src import notify  # noqa: E402
 from src import cashout as co  # noqa: E402
 from src import config as C  # noqa: E402
 from src import fixtures as fx  # noqa: E402
@@ -634,6 +636,28 @@ def update_panel() -> None:
         st.fragment(body, run_every=1 if running else None)()
 
 
+def backup_panel() -> None:
+    st.subheader("Backup dei tuoi dati")
+    cfg = fx.load_settings()
+    last = bk.last_backup()
+    a, b = st.columns([3, 1.2])
+    folder = a.text_input("Seconda cartella per la copia (facoltativa)", value=cfg.get("backup_dir", ""),
+                          placeholder="es. ~/Library/Mobile Documents/com~apple~CloudDocs/SportsTradingLab",
+                          help="Una cartella fuori dal progetto, per esempio su iCloud Drive o su una chiavetta: lì il backup sopravvive "
+                               "anche se cancelli la cartella dell'app.")
+    if folder != cfg.get("backup_dir", ""):
+        fx.save_settings({"backup_dir": folder.strip()})
+    b.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
+    if b.button("Esegui backup ora", icon=":material/backup:", width="stretch"):
+        path, msg = bk.run_backup(folder.strip() or None)
+        (st.success if path else st.info)(msg)
+        last = bk.last_backup()
+    st.caption(f"Ultimo backup: {last.name if last else 'nessuno'}. Ne viene fatto uno al giorno in automatico all'apertura dell'app "
+               f"(si tengono gli ultimi {bk.KEEP}) nella cartella `data/backup`. Contiene registro delle giocate "
+               "(`data/gestionale.duckdb`), strategie (`strategies.json`), roadmap e impostazioni. Gli storici delle partite non "
+               "servono: si riscaricano. Per ripristinare, scompatta lo zip nella cartella del progetto.")
+
+
 def page_data() -> None:
     header("Dati", "Stato del database e aggiornamento degli storici.")
     if db_ready():
@@ -650,6 +674,7 @@ def page_data() -> None:
     else:
         st.info("Nessun database presente: premi *Aggiorna ora* per scaricare gli storici (un paio di minuti la prima volta).")
     update_panel()
+    backup_panel()
     st.caption("L'aggiornamento scarica solo i file della stagione in corso, in parallelo, e ricarica nel database soltanto quelli "
                "cambiati: di norma dura pochi secondi. Lavora su una copia e la sostituisce alla fine, quindi non blocca l'app.")
     if db_ready():
@@ -996,6 +1021,22 @@ def tab_robustness(cfg: dict, res: bt.BacktestResult, sel_args: tuple, bank: flo
     st.dataframe(table, hide_index=True, width="stretch")
     show(equity_chart(trades, cut))
 
+    st.subheader("Walk-forward sulle fasce di quota")
+    wf_table, wf = bt.walk_forward(trades)
+    if wf_table.empty:
+        st.caption("Servono almeno 200 operazioni distribuite su più di due anni.")
+    else:
+        kpis([("ROI scegliendo senza futuro", fmt(wf["roi_pct"], "{:+.2f}%"), f"{num_it(wf['trades'])} operazioni in {wf['years']} anni", sign_tone(wf["roi_pct"])),
+              ("ROI giocando tutte le fasce", fmt(wf["naive_roi_pct"], "{:+.2f}%"), "stessi anni, nessuna selezione", sign_tone(wf["naive_roi_pct"])),
+              ("Anni in utile", f"{wf['positive_years']} / {wf['years']}", "con le fasce scelte sul passato", None)])
+        st.dataframe(wf_table, hide_index=True, width="stretch", column_config={
+            "fasce_scelte": "fasce di quota scelte dagli anni precedenti", "roi_pct": st.column_config.NumberColumn("ROI %", format="%+.2f"),
+            "profitto": st.column_config.NumberColumn("profitto (u)", format="%+.1f"), "tutte_le_fasce_op": "op. tutte le fasce",
+            "tutte_le_fasce_roi_pct": st.column_config.NumberColumn("ROI % tutte le fasce", format="%+.2f")})
+        st.caption("Ogni anno si usano solo le fasce di quota che negli anni precedenti erano in utile, poi si misura il risultato "
+                   "nell'anno in corso: è ciò che avresti ottenuto senza conoscere il futuro. Se questo ROI è molto più basso di "
+                   "quello dell'intero periodo, il range di quote scelto è probabilmente adattato al passato.")
+
     st.subheader("Anno per anno")
     st.dataframe(yearly.rename(columns={"year": "anno"}), hide_index=True, width="stretch", column_config=STAT_COLS)
 
@@ -1165,9 +1206,54 @@ def history(book: str, version: float) -> an.History:
     return an.History(selections("football", "1x2", book, "open", version), selections("football", "ou25", book, "open", version))
 
 
+def today_tennis() -> None:
+    cfg = fx.load_settings()
+    a, b, c = st.columns([2.2, 1.2, 1.2])
+    api_key = a.text_input("Chiave di The Odds API", value=cfg.get("odds_api_key", ""), type="password", key="today_key",
+                           help="Gratuita (500 crediti al mese) registrandosi su the-odds-api.com. Ogni torneo scaricato costa 1 credito.")
+    book = b.selectbox("Quote", ["avg", "max", "ps"], format_func=bt.BOOK_LABELS.get, key="today_tbook")
+    c.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
+    if c.button("Scarica i match", type="primary", icon=":material/download:", width="stretch"):
+        if api_key.strip() != cfg.get("odds_api_key", ""):
+            fx.save_settings({"odds_api_key": api_key.strip()})
+        with st.spinner("Scarico le quote ATP e calcolo le variabili..."):
+            odds, msg = fx.fetch_tennis_odds(api_key, book)
+            board = pd.DataFrame()
+            if len(odds):
+                with closing(bt.connect()) as con:
+                    board = an.tennis_board(odds, con, sv.load_vault())
+        ss["today_tennis"] = (board, msg, pd.Timestamp.now().strftime("%d/%m %H:%M"))
+    st.caption("Per il tennis non esiste una fonte gratuita di quote senza registrazione (ne ho cercate, comprese quelle di "
+               "tipo moneyway): serve questa chiave personale gratuita. Ranking, form, precedenti e modello Elo vengono dallo storico.")
+    if "today_tennis" not in ss:
+        return
+    board, msg, when = ss["today_tennis"]
+    if msg:
+        (st.caption if len(board) else st.warning)(msg)
+    if board.empty:
+        return
+    kpis([("Match", str(len(board)), f"aggiornati alle {when}", None),
+          ("Con segnale", str(int((board["segnali"] != "").sum())), "strategie salvate attivate", None),
+          ("Modello oltre la quota", str(int((board["scarto modello"].abs() >= 5).sum())), "scarto di almeno 5 punti, in un senso o nell'altro", None)])
+    st.dataframe(board, hide_index=True, width="stretch", height=460, column_config={
+        "quota 1": st.column_config.NumberColumn(format="%.2f"), "quota 2": st.column_config.NumberColumn(format="%.2f"),
+        "rank 1": st.column_config.NumberColumn(format="%.0f"), "rank 2": st.column_config.NumberColumn(format="%.0f"),
+        "form 1": st.column_config.NumberColumn("form 1 %", format="%.0f"), "form 2": st.column_config.NumberColumn("form 2 %", format="%.0f"),
+        "implicita 1 %": st.column_config.NumberColumn(format="%.1f"), "modello 1 %": st.column_config.NumberColumn(format="%.1f"),
+        "scarto modello": st.column_config.NumberColumn("scarto modello (punti %)", format="%+.1f"), "segnali": "strategie attivate"})
+    st.caption("**Scarto modello**: probabilità Elo del giocatore 1 meno quella implicita nella quota. Nello storico il mercato è più "
+               "preciso del modello: uno scarto ampio segnala più spesso un'informazione che il modello non ha (infortunio, "
+               "stanchezza) che un'occasione.")
+
+
 def page_today() -> None:
     header("Oggi", "Le partite in programma analizzate con lo storico: variabili pre-partita, precedenti a quote simili, segnali delle tue strategie.")
     if need_db():
+        return
+    sport = st.segmented_control("Sport", ["football", "tennis"], format_func=SPORT_LABEL.get, default="football",
+                                 label_visibility="collapsed", key="today_sport") or "football"
+    if sport == "tennis":
+        today_tennis()
         return
     a, b, c, d = st.columns([1.3, 1.1, 1.2, 3])
     book = a.selectbox("Quote", ["avg", "max", "b365", "bfe"], format_func=bt.BOOK_LABELS.get, key="today_book")
@@ -1181,10 +1267,11 @@ def page_today() -> None:
         with st.spinner("Scarico e analizzo le partite in programma..."):
             fixtures, msg = fx.fetch_football_fixtures(book)
             board, detail = pd.DataFrame(), pd.DataFrame()
+            external, ext_msg = fx.fetch_clubelo() if len(fixtures) else (pd.DataFrame(), "")
             if len(fixtures):
                 with closing(bt.connect()) as con:
-                    board, detail = an.daily_board(fixtures, con, history(book, db_version()), vault, int(min_n))
-        ss["today"] = {"key": key, "board": board, "detail": detail, "fixtures": fixtures, "msg": msg,
+                    board, detail = an.daily_board(fixtures, con, history(book, db_version()), vault, int(min_n), external)
+        ss["today"] = {"key": key, "board": board, "detail": detail, "fixtures": fixtures, "msg": msg, "ext": len(external), "ext_msg": ext_msg,
                        "when": pd.Timestamp.now().strftime("%d/%m %H:%M")}
     t = ss["today"]
     if t["msg"]:
@@ -1194,8 +1281,9 @@ def page_today() -> None:
         st.info("Nessuna partita in programma disponibile in questo momento. La fonte (football-data.co.uk) pubblica le partite "
                 "dei prossimi giorni: riprova più tardi con *Aggiorna partite*.")
         return
-    d.caption(f"{len(board)} partite, aggiornate alle {t['when']}. Fonte: football-data.co.uk (calcio). "
-              "Per il tennis usa lo scanner nella pagina Strategie.")
+    covered_ext = int(detail.loc[detail["selection"] == "home", "clubelo_pct"].notna().sum()) if "clubelo_pct" in detail else 0
+    d.caption(f"{len(board)} partite, aggiornate alle {t['when']}. Fonte: football-data.co.uk. Incrocio esterno ClubElo: "
+              + (f"{covered_ext} partite abbinate." if t.get("ext") else "non disponibile ora (" + (t.get("ext_msg") or "nessun dato") + ")"))
     f1, f2, f3 = st.columns([2, 2, 1.4])
     days = sorted(board["data"].dropna().unique())
     day = f1.multiselect("Giorno", days, placeholder="tutti")
@@ -1223,7 +1311,12 @@ def page_today() -> None:
         "form_ospite": st.column_config.NumberColumn("punti/partita ospite", format="%.1f"),
         "gol_recenti": st.column_config.NumberColumn("gol recenti", format="%.1f"), "esito_migliore": "esito migliore",
         "scarto_pct": st.column_config.NumberColumn("scarto storico (punti %)", format="%+.1f"),
-        "precedenti": st.column_config.NumberColumn(format="%.0f"), "segnali": "strategie attivate"})
+        "precedenti": st.column_config.NumberColumn(format="%.0f"), "segnali": "strategie attivate",
+        "incrocio": st.column_config.TextColumn("incrocio modelli", help="Esito su cui il modello Elo interno e ClubElo vedono entrambi "
+                                                "almeno 3 punti di probabilità in più della quota (scarti interno / esterno).")})
+    st.caption("**Incrocio modelli**: esito 1X2 su cui il modello Elo interno e la fonte esterna ClubElo concordano nel dare più "
+               "probabilità di quanta ne implichi la quota. Nello storico, seguire il solo modello contro la quota non ha reso: "
+               "usalo come secondo parere su una strategia già validata, non come segnale a sé.")
     st.caption("**Scarto storico**: frequenza con cui quell'esito si è verificato nei precedenti a quota simile (±7%, stessa lega quando "
                "i precedenti bastano) meno la probabilità implicita nella quota senza margine. Uno scarto positivo è un indizio, non un "
                "vantaggio: il mercato è efficiente e scarti di pochi punti rientrano nel caso. Conta quando coincide con una tua "
@@ -1259,6 +1352,8 @@ def page_today() -> None:
     z.dataframe(last_away, hide_index=True, width="stretch")
     st.dataframe(dm.drop(columns=["row", "selection"]), hide_index=True, width="stretch", column_config={
         "quota": st.column_config.NumberColumn(format="%.2f"), "implicita_pct": st.column_config.NumberColumn("prob. implicita %", format="%.1f"),
+        "modello_pct": st.column_config.NumberColumn("modello Elo %", format="%.1f"),
+        "clubelo_pct": st.column_config.NumberColumn("ClubElo %", format="%.1f"),
         "storica_pct": st.column_config.NumberColumn("frequenza storica %", format="%.1f"),
         "scarto_pct": st.column_config.NumberColumn("scarto (punti %)", format="%+.1f"),
         "roi_storico_pct": st.column_config.NumberColumn("ROI storico a quote simili %", format="%+.1f"), "ambito": "precedenti da"})
@@ -1369,6 +1464,36 @@ def strategy_monitor_panel(vault: dict) -> None:
                    "diventa negativo o un drawdown vicino al massimo storico.")
 
 
+def alerts_panel() -> None:
+    with st.expander("Avvisi su Telegram quando scatta un segnale"):
+        cfg = fx.load_settings()
+        st.caption("Gratis, tre passi: 1) su Telegram cerca **@BotFather**, scrivi `/newbot` e copia il token che ricevi; "
+                   "2) apri la chat con il tuo nuovo bot e scrivi un messaggio qualsiasi; 3) incolla il token qui e premi *Trova il mio ID*.")
+        a, b, c = st.columns([3, 1.4, 1.2])
+        token = a.text_input("Token del bot", value=cfg.get("telegram_token", ""), type="password")
+        chat = b.text_input("ID della chat", value=cfg.get("telegram_chat_id", ""))
+        bank = c.number_input("Bankroll per lo stake", 1.0, 1e9, float(cfg.get("alert_bankroll") or 1000.0), 100.0)
+        if (token.strip(), chat.strip(), bank) != (cfg.get("telegram_token", ""), cfg.get("telegram_chat_id", ""), float(cfg.get("alert_bankroll") or 1000.0)):
+            fx.save_settings({"telegram_token": token.strip(), "telegram_chat_id": chat.strip(), "alert_bankroll": bank})
+        x, y, z, _ = st.columns([1.2, 1.2, 1.6, 2])
+        if x.button("Trova il mio ID", width="stretch"):
+            found, msg = notify.find_chat_id(token)
+            if found:
+                fx.save_settings({"telegram_chat_id": found})
+                st.success(f"ID trovato e salvato: {found}. Ricarica la pagina per vederlo nel campo.")
+            else:
+                st.warning(msg)
+        if y.button("Invia una prova", width="stretch"):
+            ok, msg = notify.send(token, chat, "Sports Trading Lab: avvisi configurati correttamente.")
+            (st.success if ok else st.warning)(msg)
+        if z.button("Controlla i segnali ora", icon=":material/notifications:", width="stretch"):
+            with st.spinner("Controllo le partite in programma..."):
+                st.info(notify.run_alerts())
+        st.caption("Per ricevere gli avvisi anche ad app chiusa, esegui una volta nel Terminale, dalla cartella del progetto: "
+                   "`bash attiva_avvisi_mac.sh` (controllo ogni 3 ore; `bash attiva_avvisi_mac.sh off` per disattivare). "
+                   "Ogni segnale viene inviato una sola volta. Il token resta solo sul tuo Mac, in `data/settings.json`.")
+
+
 def page_vault() -> None:
     header("Strategie", "Archivio delle strategie salvate e scanner delle quote del giorno.")
     vault = sv.load_vault()
@@ -1398,6 +1523,7 @@ def page_vault() -> None:
         save_form("save_vault")
     if vault and db_ready():
         strategy_monitor_panel(vault)
+    alerts_panel()
 
     st.subheader("Scanner delle partite in programma")
     sources = {"football": "Calcio - partite in programma", "tennis": "Tennis - quote ATP", "csv": "File CSV"}
@@ -1828,6 +1954,12 @@ def page_roadmap() -> None:
 collect_update()
 ensure_schema()
 auto_update()
+if not ss.get("_backup_checked"):     # un backup al giorno dei dati personali, senza interrompere l'uso
+    ss["_backup_checked"] = True
+    try:
+        bk.backup_if_due(fx.load_settings().get("backup_dir") or None)
+    except OSError:
+        pass
 PAGES = {
     "backtester": st.Page(page_backtester, title="Backtester", icon=":material/query_stats:", url_path="backtester", default=True),
     "today": st.Page(page_today, title="Oggi", icon=":material/today:", url_path="oggi"),

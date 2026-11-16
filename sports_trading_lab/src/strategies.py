@@ -294,6 +294,9 @@ def tennis_upload_selections(df: pd.DataFrame, con=None) -> pd.DataFrame:
             "srv_won10": feat(a, "srv_won10") * 100, "ret_won10": feat(a, "ret_won10") * 100,
             "ace10": feat(a, "ace10") * 100, "df10": feat(a, "df10") * 100,
             "opp_srv_won10": feat(b, "srv_won10") * 100, "opp_ret_won10": feat(b, "ret_won10") * 100,
+            "elo": feat(a, "elo"), "opp_elo": feat(b, "elo"),
+            "model_prob": bt.elo_win_prob(feat(a, "elo"), feat(b, "elo")) * 100,
+            "model_edge": bt.elo_win_prob(feat(a, "elo"), feat(b, "elo")) * 100 - (1 / odds) / (1 / odds + 1 / opp_odds) * 100,
             "odds": odds, "opp_odds": opp_odds,
             "selection": np.select([odds < opp_odds, odds > opp_odds], ["favourite", "underdog"], "pick"),
             "event": name["1"] + " vs " + name["2"], "pick": player,
@@ -334,8 +337,13 @@ def football_upload_selections(df: pd.DataFrame, market: str, con=None) -> pd.Da
     else:
         outcomes = [("over", _col(df, "odds_over25", True), "Over 2.5"), ("under", _col(df, "odds_under25", True), "Under 2.5")]
     parts = []
-    for name, odds, label in outcomes:
+    model = bt.football_model_probs(feat["home_elo"], feat["away_elo"]) * 100
+    imp = 1 / np.stack([oh.to_numpy(dtype=float), od.to_numpy(dtype=float), oa.to_numpy(dtype=float)], axis=1)
+    imp = imp / imp.sum(axis=1, keepdims=True) * 100
+    for k, (name, odds, label) in enumerate(outcomes):
         d = pd.DataFrame({**common, "selection": name, "odds": odds, "pick": label})
+        d["model_prob"] = model[:, k] if market == "1x2" else np.nan
+        d["model_edge"] = model[:, k] - imp[:, k] if market == "1x2" else np.nan
         if market == "1x2" and name != "draw":
             other = oa if name == "home" else oh
             d["role"] = np.select([odds < other, odds > other], ["favourite", "underdog"], "pick")

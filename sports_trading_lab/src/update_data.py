@@ -238,6 +238,63 @@ def _table_positions(long: pd.DataFrame) -> pd.Series:
     return pos
 
 
+# --------------------------------------------------------------------------- modello Elo
+ELO_START, ELO_HOME = 1500.0, 65.0
+ELO_TIER = {"E0": 0, "D1": 0, "I1": 0, "SP1": 0, "F1": 0, "N1": -60, "P1": -60, "B1": -90, "T1": -90, "SC0": -120, "G1": -120,
+            "E1": -150, "D2": -160, "I2": -170, "SP2": -160, "F2": -170, "E2": -290, "E3": -380}
+
+
+def football_elo(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    """Valutazione Elo delle due squadre PRIMA di ogni partita (ordine cronologico, nessun look-ahead).
+    Vantaggio del campo 65 punti, K = 20 moltiplicato per lo scarto di gol; le partite senza risultato
+    (in programma) ricevono la valutazione corrente e non la modificano."""
+    order = np.lexsort((df["match_id"].to_numpy(), pd.to_datetime(df["match_date"]).to_numpy()))
+    home, away = df["home_team"].to_numpy(), df["away_team"].to_numpy()
+    hg, ag = df["fthg"].to_numpy(dtype=float), df["ftag"].to_numpy(dtype=float)
+    div = df["div"].to_numpy() if "div" in df.columns else np.full(len(df), None)
+    rating: dict = {}
+    eh, ea = np.full(len(df), np.nan), np.full(len(df), np.nan)
+    for i in order:
+        start = ELO_START + ELO_TIER.get(div[i], -150)
+        rh, ra = rating.get(home[i], start), rating.get(away[i], start)
+        eh[i], ea[i] = rh, ra
+        if hg[i] != hg[i] or ag[i] != ag[i]:
+            continue
+        exp_h = 1 / (1 + 10 ** (-(rh + ELO_HOME - ra) / 400))
+        res = 1.0 if hg[i] > ag[i] else 0.5 if hg[i] == ag[i] else 0.0
+        k = 20 * (1 + abs(hg[i] - ag[i])) ** 0.5
+        rating[home[i]], rating[away[i]] = rh + k * (res - exp_h), ra - k * (res - exp_h)
+    return eh, ea
+
+
+def tennis_elo(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    """Elo dei due giocatori PRIMA di ogni match: media tra Elo generale ed Elo sulla superficie.
+    K decrescente con l'esperienza (250 / (match giocati + 5)^0.4). I match futuri non aggiornano nulla."""
+    dates = pd.to_datetime(df["match_date"]).to_numpy()
+    rnd = df["round_order"].fillna(0).to_numpy(dtype=float) if "round_order" in df.columns else np.zeros(len(df))
+    order = np.lexsort((df["match_id"].to_numpy(), rnd, dates))
+    w, l = df["winner_name"].to_numpy(), df["loser_name"].to_numpy()
+    surf = df["surface"].fillna("-").to_numpy() if "surface" in df.columns else np.full(len(df), "-")
+    future = df["is_future"].fillna(False).to_numpy(dtype=bool) if "is_future" in df.columns else np.zeros(len(df), dtype=bool)
+    gen: dict = {}
+    by_surf: dict = {}
+    played: dict = {}
+    ew, el = np.full(len(df), np.nan), np.full(len(df), np.nan)
+    for i in order:
+        gw, gl = gen.get(w[i], ELO_START), gen.get(l[i], ELO_START)
+        sw, sl = by_surf.get((w[i], surf[i]), gw), by_surf.get((l[i], surf[i]), gl)
+        ew[i], el[i] = (gw + sw) / 2, (gl + sl) / 2
+        if future[i]:
+            continue
+        kw, kl = 250 / (played.get(w[i], 0) + 5) ** 0.4, 250 / (played.get(l[i], 0) + 5) ** 0.4
+        exp_g = 1 / (1 + 10 ** ((gl - gw) / 400))
+        exp_s = 1 / (1 + 10 ** ((sl - sw) / 400))
+        gen[w[i]], gen[l[i]] = gw + kw * (1 - exp_g), gl - kl * (1 - exp_g)
+        by_surf[(w[i], surf[i])], by_surf[(l[i], surf[i])] = sw + kw * (1 - exp_s), sl - kl * (1 - exp_s)
+        played[w[i]], played[l[i]] = played.get(w[i], 0) + 1, played.get(l[i], 0) + 1
+    return ew, el
+
+
 def football_features(df: pd.DataFrame) -> pd.DataFrame:
     """Feature pre-partita senza look-ahead per squadra di casa e ospite:
     ppg5/gf5/ga5 (ultime 5 partite), venue_ppg5 (ultime 5 in casa / in trasferta), sot5/sota5 (tiri in porta
@@ -269,8 +326,10 @@ def football_features(df: pd.DataFrame) -> pd.DataFrame:
     for side in ("home", "away"):
         part = long[long["side"] == side].set_index("match_id")
         for k in C.FOOT_FEATURE_KEYS:
-            out[f"{side}_{k}"] = out["match_id"].map(part[k]).astype("float64")
-    return out
+            if k != "elo":
+                out[f"{side}_{k}"] = out["match_id"].map(part[k]).astype("float64")
+    out["home_elo"], out["away_elo"] = football_elo(df)
+    return out[["match_id"] + C.FOOT_FEATURES]
 
 
 # --------------------------------------------------------------------------- tennis
@@ -503,8 +562,10 @@ def tennis_features(df: pd.DataFrame) -> pd.DataFrame:
     for side in ("winner", "loser"):
         part = long[long["side"] == side].set_index("match_id")
         for k in C.TENNIS_FEATURE_KEYS:
-            out[f"{side}_{k}"] = out["match_id"].map(part[k]).astype("float64")
-    return out
+            if k != "elo":
+                out[f"{side}_{k}"] = out["match_id"].map(part[k]).astype("float64")
+    out["winner_elo"], out["loser_elo"] = tennis_elo(df)
+    return out[["match_id"] + C.TENNIS_FEATURES]
 
 
 # --------------------------------------------------------------------------- database

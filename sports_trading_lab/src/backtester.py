@@ -78,6 +78,8 @@ FILTERS = {
         ("opp_srv_won10", "% punti vinti al servizio (ult. 10)", "Avversario", "slider", 50, 80, 1),
         ("opp_ret_won10", "% punti vinti in risposta (ult. 10)", "Avversario", "slider", 25, 50, 1),
         ("opp_hand", "Mano", "Avversario", "cat"),
+        ("model_prob", "Probabilità di vittoria secondo il modello Elo (%)", "Modello", "slider", 0, 100, 5),
+        ("model_edge", "Vantaggio del modello sulla quota (punti %)", "Modello", "slider", -30, 30, 1),
         ("rank_adv", "Vantaggio di ranking (avversario - giocatore)", "Confronto diretto", "num"),
         ("form_adv", "Vantaggio di form (punti %)", "Confronto diretto", "slider", -100, 100, 5),
         ("h2h_wins", "Precedenti vinti (dal 2019)", "Confronto diretto", "slider", 0, 15, 1),
@@ -111,14 +113,34 @@ FILTERS = {
         ("away_sota5", "Tiri in porta subiti (media ult. 5)", "Squadra ospite", "slider", 0.0, 10.0, 0.5),
         ("away_corners5", "Calci d'angolo (media ult. 5)", "Squadra ospite", "slider", 0.0, 12.0, 0.5),
         ("away_rest_days", "Giorni di riposo", "Squadra ospite", "slider", 2, 30, 1),
+        ("model_prob", "Probabilità dell'esito secondo il modello Elo (%, solo 1X2)", "Modello", "slider", 0, 100, 5),
+        ("model_edge", "Vantaggio del modello sulla quota (punti %, solo 1X2)", "Modello", "slider", -30, 30, 1),
         ("pos_diff", "Posizioni di vantaggio della casa", "Confronto", "slider", -23, 23, 1),
         ("ppg_diff", "Differenza punti a partita ult. 5 (casa - ospite)", "Confronto", "slider", -3.0, 3.0, 0.2),
         ("goals5", "Gol totali medi nelle partite recenti", "Confronto", "slider", 0.0, 6.0, 0.2),
     ],
 }
 FILTER_COLUMNS = {sp: {f[0]: (f[1], f[3]) for f in specs} for sp, specs in FILTERS.items()}
-FILTER_LABELS = {sp: {f[0]: (f[1] if f[2] in ("Torneo", "Competizione", "Calendario", "Quote del match", "Confronto", "Confronto diretto")
+FILTER_LABELS = {sp: {f[0]: (f[1] if f[2] in ("Torneo", "Competizione", "Calendario", "Quote del match", "Confronto", "Confronto diretto", "Modello")
                             else f"{f[2]}: {f[1]}") for f in specs} for sp, specs in FILTERS.items()}
+
+
+DRAW_PEAK, DRAW_WIDTH, ELO_HOME, ELO_SCALE = 0.29, 250.0, 55.0, 0.75   # tarati sullo storico (minima log-loss)
+
+
+def elo_win_prob(elo, opp_elo):
+    """Probabilita' di vittoria dalla differenza Elo (formula logistica standard)."""
+    return 1 / (1 + 10 ** (-(np.asarray(elo, dtype=float) - np.asarray(opp_elo, dtype=float)) / 400))
+
+
+def football_model_probs(home_elo, away_elo, home_adv: float = ELO_HOME, scale: float = ELO_SCALE) -> np.ndarray:
+    """Probabilita' (1, X, 2) del modello Elo: il pareggio e' piu' probabile quanto piu' le squadre sono vicine.
+    `scale` riduce la differenza Elo: senza, il modello interno risulta troppo sicuro sulle favorite."""
+    dr = (np.asarray(home_elo, dtype=float) - np.asarray(away_elo, dtype=float)) * scale + home_adv
+    e = 1 / (1 + 10 ** (-dr / 400))
+    d = DRAW_PEAK * np.exp(-dr ** 2 / (2 * DRAW_WIDTH ** 2))
+    p = np.stack([np.clip(e - d / 2, 0.02, 0.96), d, np.clip(1 - e - d / 2, 0.02, 0.96)], axis=1)
+    return p / p.sum(axis=1, keepdims=True)
 
 
 def _get(m: pd.DataFrame, name: str) -> pd.Series:
@@ -174,6 +196,7 @@ def tennis_selections(matches: pd.DataFrame, price: str = "avg") -> pd.DataFrame
             "srv_won10": pct(f"{a}_srv_won10"), "ret_won10": pct(f"{a}_ret_won10"),
             "ace10": pct(f"{a}_ace10"), "df10": pct(f"{a}_df10"),
             "opp_srv_won10": pct(f"{b}_srv_won10"), "opp_ret_won10": pct(f"{b}_ret_won10"),
+            "elo": _get(m, f"{a}_elo"), "opp_elo": _get(m, f"{b}_elo"),
             "odds": m[f"{price}_{x}"], "opp_odds": m[f"{price}_{y}"],
             "close_odds": m[f"ps_{x}"], "_close_opp": m[f"ps_{y}"],
             "won": won, "set1_won": set1[won],
@@ -182,6 +205,8 @@ def tennis_selections(matches: pd.DataFrame, price: str = "avg") -> pd.DataFrame
     s["rank_adv"] = s["opp_rank"] - s["rank"]
     s["form_adv"] = s["form10"] - s["opp_form10"]
     s["h2h_diff"] = s["h2h_wins"] - s["h2h_losses"]
+    s["model_prob"] = elo_win_prob(s["elo"], s["opp_elo"]) * 100
+    s["model_edge"] = s["model_prob"] - (1 / s["odds"]) / (1 / s["odds"] + 1 / s["opp_odds"]) * 100   # modello meno quota senza margine
     inv = 1 / s["close_odds"] + 1 / s["_close_opp"]
     s["p_close"] = (1 / s["close_odds"]) / inv  # probabilita' di chiusura senza margine
     s["selection"] = np.select([s["odds"] < s["opp_odds"], s["odds"] > s["opp_odds"]], ["favourite", "underdog"], "pick")
@@ -234,9 +259,14 @@ def football_selections(matches: pd.DataFrame, market: str = "1x2", price: str =
         "close_source": close_src,
     }
     parts = []
-    for name, suf, won in outcomes:
+    model = football_model_probs(feats["home_elo"], feats["away_elo"]) * 100
+    imp = 1 / np.stack([oh.to_numpy(dtype=float), od.to_numpy(dtype=float), oa.to_numpy(dtype=float)], axis=1)
+    imp = imp / imp.sum(axis=1, keepdims=True) * 100
+    for k, (name, suf, won) in enumerate(outcomes):
         d = pd.DataFrame({**common, "selection": name, "odds": m[f"{price}_{pre}{suf}"],
                           "close_odds": close[suf], "p_close": (1 / close[suf]) / inv, "won": won.to_numpy()})
+        d["model_prob"] = model[:, k] if market == "1x2" else np.nan
+        d["model_edge"] = model[:, k] - imp[:, k] if market == "1x2" else np.nan
         if market == "1x2" and name != "draw":
             other = oa if name == "home" else oh
             d["role"] = np.select([d["odds"] < other, d["odds"] > other], ["favourite", "underdog"], "pick")
@@ -504,6 +534,43 @@ def segment_scan(trades: pd.DataFrame, sport: str, min_trades: int = 100, bucket
                          "roi_2": roi_h.loc[seg].get(2, np.nan) if seg in roi_h.index else np.nan, "rule": rule})
     out = pd.DataFrame(rows)
     return out.sort_values("t_stat", ascending=False).reset_index(drop=True) if len(out) else out
+
+
+def walk_forward(trades: pd.DataFrame, n_bands: int = 5, min_trades: int = 40) -> tuple[pd.DataFrame, dict]:
+    """Validazione walk-forward sulle fasce di quota.
+
+    Le operazioni vengono divise in `n_bands` fasce di quota. Per ogni anno, a partire dal terzo, si guardano
+    solo gli anni PRECEDENTI: si tengono le fasce che fin li' erano in utile (con almeno `min_trades`
+    operazioni) e si applicano all'anno in corso. Il risultato e' cio' che avresti ottenuto scegliendo le
+    fasce senza conoscere il futuro; il confronto e' giocare sempre tutte le fasce.
+    Ritorna (tabella per anno, riepilogo)."""
+    empty = {"trades": 0, "roi_pct": float("nan"), "naive_roi_pct": float("nan"), "years": 0}
+    if len(trades) < 200 or trades["odds"].nunique() < n_bands:
+        return pd.DataFrame(), empty
+    t = trades[["date", "odds", "pnl", "risk"]].copy()
+    t["year"] = t["date"].dt.year
+    t["band"] = pd.qcut(t["odds"], n_bands, duplicates="drop")
+    years = sorted(t["year"].unique())
+    rows, picked = [], []
+    for y in years[2:]:
+        past, now = t[t["year"] < y], t[t["year"] == y]
+        g = past.groupby("band", observed=True)[["pnl", "risk"]].sum().join(past.groupby("band", observed=True).size().rename("n"))
+        good = g[(g["pnl"] > 0) & (g["n"] >= min_trades)].index
+        use = now[now["band"].isin(good)]
+        picked.append(use)
+        roi = lambda x: float(x["pnl"].sum() / x["risk"].sum() * 100) if len(x) else float("nan")
+        rows.append({"anno": int(y), "fasce_scelte": ", ".join(f"{b.left:.2f}-{b.right:.2f}" for b in good) or "nessuna",
+                     "operazioni": len(use), "roi_pct": roi(use), "profitto": float(use["pnl"].sum()),
+                     "tutte_le_fasce_op": len(now), "tutte_le_fasce_roi_pct": roi(now)})
+    table = pd.DataFrame(rows)
+    allp = pd.concat(picked) if picked else t.iloc[0:0]
+    naive = t[t["year"].isin(years[2:])]
+    summary = {"trades": int(len(allp)), "years": len(rows),
+               "roi_pct": float(allp["pnl"].sum() / allp["risk"].sum() * 100) if len(allp) else float("nan"),
+               "profit": float(allp["pnl"].sum()),
+               "naive_roi_pct": float(naive["pnl"].sum() / naive["risk"].sum() * 100) if len(naive) else float("nan"),
+               "naive_profit": float(naive["pnl"].sum()), "positive_years": int((table["profitto"] > 0).sum()) if len(table) else 0}
+    return table, summary
 
 
 def roi_confidence(trades: pd.DataFrame, n_boot: int = 1000, seed: int = 7) -> dict:

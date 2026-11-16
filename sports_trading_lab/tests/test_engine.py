@@ -991,3 +991,129 @@ def test_daily_board_and_strategy_monitor(con):
     assert row["n_90"] <= row["n_365"] <= row["operazioni"] and row["dd_attuale"] <= row["dd_massimo"] + 1e-9
     assert row["stato"] in ("in linea", "utile ma CLV negativo", "al massimo drawdown", "in calo", "poche operazioni recenti")
     assert len(pool) == row["operazioni"] and pool["equity"].iloc[-1] == pytest.approx(ref.metrics["profit"])
+
+
+# ------------------------------------------------------------------ modello Elo, walk-forward, backup, avvisi
+def test_elo_ratings_use_only_past_results():
+    f = pd.DataFrame({"match_id": ["a", "b", "c"], "match_date": pd.to_datetime(["2024-01-01", "2024-01-08", "2024-01-15"]),
+                      "div": "I1", "home_team": ["X", "Y", "X"], "away_team": ["Y", "X", "Y"],
+                      "fthg": [3.0, 0.0, np.nan], "ftag": [0.0, 0.0, np.nan]})
+    eh, ea = ud.football_elo(f)
+    assert eh[0] == 1500 and ea[0] == 1500                               # prima partita: valori iniziali
+    exp = 1 / (1 + 10 ** (-65 / 400))
+    gain = 20 * 4 ** 0.5 * (1 - exp)
+    assert ea[1] == pytest.approx(1500 + gain) and eh[1] == pytest.approx(1500 - gain)   # X ha vinto 3-0 in casa
+    assert eh[2] > 1500 > ea[2] and eh[2] > ea[1]                        # pareggiare fuori casa vale piu' dell'atteso: X sale ancora
+    t = pd.DataFrame({"match_id": ["a", "b", "c"], "match_date": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]),
+                      "round_order": 4.0, "surface": ["Clay", "Clay", "Hard"], "winner_name": ["P", "P", "Q"], "loser_name": ["Q", "Q", "P"],
+                      "is_future": [False, False, True]})
+    ew, el = ud.tennis_elo(t)
+    assert ew[0] == el[0] == 1500 and ew[1] > 1500 > el[1]
+    assert ew[2] < el[2]                                                  # match futuro: Q ha Elo piu' basso di P
+    p = bt.football_model_probs([1600, 1500], [1500, 1500])
+    assert np.allclose(p.sum(axis=1), 1) and p[0, 0] > p[1, 0] > p[1, 2] and 0.2 < p[1, 1] < 0.33
+    assert bt.elo_win_prob(1700, 1500) == pytest.approx(1 / (1 + 10 ** -0.5))
+
+
+def test_walk_forward_only_uses_previous_years():
+    rng = np.random.default_rng(2)
+    n = 3000
+    odds = np.round(rng.uniform(1.5, 3.5, n), 2)
+    dates = pd.date_range("2019-01-01", periods=n, freq="D")
+    good = odds < 2.0                                                     # vantaggio solo sulle quote basse
+    won = rng.random(n) < np.where(good, 1.12, 0.88) / odds
+    t = bt.settle(make_sel(odds.tolist(), won.tolist(), dates=dates.strftime("%Y-%m-%d").tolist()))
+    table, s = bt.walk_forward(t, n_bands=4, min_trades=30)
+    assert table["anno"].tolist() == sorted(t["date"].dt.year.unique())[2:]
+    assert s["roi_pct"] > s["naive_roi_pct"] and s["trades"] < len(t)
+    first = table.iloc[0]
+    past = t[t["date"].dt.year < first["anno"]]
+    assert first["operazioni"] <= (t["date"].dt.year == first["anno"]).sum() and len(past) > 0
+    assert bt.walk_forward(t.head(50))[0].empty
+
+
+def test_clubelo_parsing_and_matching():
+    raw = b"Rank,Club,Country,Level,Elo,From,To\n1,Man City,ENG,1,2050.5,2026-11-01,2026-11-20\n2,Inter,ITA,1,1980,2026-11-01,2026-11-20\n" \
+          b"None,Forest,ENG,1,1750,2026-11-01,2026-11-20\n3,Atletico,ESP,1,1900,2026-11-01,2026-11-20\n"
+    r = fx.parse_clubelo(raw)
+    assert len(r) == 4 and r.loc[r["club"] == "Inter", "elo"].iloc[0] == 1980
+    got = fx.clubelo_ratings(pd.Series(["Man City", "Inter", "Nott'm Forest", "Ath Madrid", "Sconosciuta"]), r)
+    assert got.tolist()[:4] == [2050.5, 1980.0, 1750.0, 1900.0] and np.isnan(got.iloc[4])
+    assert fx.parse_clubelo(b"errore").empty and fx.clubelo_ratings(pd.Series(["Inter"]), pd.DataFrame()).isna().all()
+
+
+def test_backup_and_restore(tmp_path):
+    from datetime import date
+    from src import backup as bk
+    root = tmp_path / "proj"
+    (root / "data").mkdir(parents=True)
+    assert bk.run_backup(root=root, backup_dir=root / "data" / "backup")[0] is None       # niente da salvare
+    (root / "strategies.json").write_text('{"s": 1}')
+    (root / "data" / "gestionale.duckdb").write_bytes(b"registro")
+    (root / "data" / "trading_db.duckdb").write_bytes(b"storici")
+    extra = tmp_path / "icloud"
+    for d in range(1, 18):
+        path, msg = bk.run_backup(extra, root, root / "data" / "backup", date(2026, 1, d))
+    assert path.name == "backup_20260117.zip" and (extra / path.name).exists()
+    assert len(list((root / "data" / "backup").glob("*.zip"))) == bk.KEEP                 # tiene solo gli ultimi
+    import zipfile
+    assert sorted(zipfile.ZipFile(path).namelist()) == ["data/gestionale.duckdb", "strategies.json"]   # gli storici non entrano
+    (root / "strategies.json").write_text("perso")
+    assert bk.restore(path, root) == ["data/gestionale.duckdb", "strategies.json"]
+    assert (root / "strategies.json").read_text() == '{"s": 1}'
+
+
+def test_telegram_alerts_without_network(tmp_path):
+    from src import notify
+
+    class Resp:
+        def __init__(self, data):
+            self._d, self.status_code = data, 200
+        def json(self):
+            return self._d
+
+    class Fake:
+        sent = []
+        def post(self, url, json=None, timeout=None):
+            Fake.sent.append((url, json))
+            return Resp({"ok": True})
+        def get(self, url, timeout=None):
+            return Resp({"ok": True, "result": [{"message": {"chat": {"id": 111}}}, {"message": {"chat": {"id": 987654}}}]})
+
+    ok, _ = notify.send("TOKEN", "42", "ciao", Fake())
+    assert ok and Fake.sent[0][0].endswith("/botTOKEN/sendMessage") and Fake.sent[0][1] == {"chat_id": "42", "text": "ciao"}
+    assert notify.send("", "42", "x", Fake())[0] is False
+    assert notify.find_chat_id("TOKEN", Fake())[0] == "987654"
+
+    class Refused(Fake):
+        def post(self, url, json=None, timeout=None):
+            return Resp({"ok": False, "description": "chat not found"})
+    assert "chat not found" in notify.send("T", "1", "x", Refused())[1]
+    sig = pd.DataFrame({"strategia": ["A", "A"], "data": ["2026-11-21", "2026-11-21"], "evento": ["X - Y", "Z - W"], "selezione": ["X", "Z"],
+                        "lato": "PUNTA", "quota": [2.0, 1.8], "importo_rischio": [10.0, 10.0]})
+    seen = tmp_path / "n.json"
+    assert len(notify.new_signals(sig, seen)) == 2 and len(notify.new_signals(sig, seen)) == 0   # ogni segnale una volta sola
+    more = pd.concat([sig, sig.assign(evento="K - J")]).reset_index(drop=True)
+    fresh = notify.new_signals(more, seen)
+    assert fresh["evento"].tolist() == ["K - J", "K - J"] and "X - Y" not in notify.format_signals(fresh)
+    assert "2 nuovi segnali" in notify.format_signals(sig) and "@ 2.00" in notify.format_signals(sig)
+
+
+@needs_db
+def test_model_filters_and_boards(con):
+    r = bt.run_backtest({"sport": "tennis", "selection": ["favourite", "underdog"], "price": "avg",
+                         "filters": {"model_edge": {"min": 5, "max": None}}}, con)
+    assert r.metrics["trades"] > 500 and (r.trades["model_edge"] >= 5).all()
+    assert (r.trades["model_prob"].between(0, 100)).all()
+    f = bt.load_selections("football", "1x2", "avg", "open", con)
+    ok = f["model_prob"].notna()
+    assert ok.mean() > 0.95 and np.allclose(f[ok].groupby("match_id")["model_prob"].sum(), 100, atol=1e-6)
+    cal = f[ok & (f["model_prob"] > 55)]
+    assert abs(cal["won"].mean() * 100 - cal["model_prob"].mean()) < 4          # modello calibrato entro pochi punti
+    assert bt.load_selections("football", "ou25", "avg", "open", con)["model_prob"].isna().all()
+    t = con.execute("SELECT * FROM tennis_matches WHERE has_odds AND match_id NOT LIKE 'TD:%' ORDER BY match_date DESC LIMIT 8").df()
+    odds = pd.DataFrame({"date": pd.to_datetime(t["match_date"]).dt.strftime("%Y-%m-%d"), "time": "12:00", "tournament": t["tourney_name"],
+                         "player1": t["winner_name"], "player2": t["loser_name"], "odds1": t["avg_w"], "odds2": t["avg_l"]})
+    board = an.tennis_board(odds, con, {"s": {"config": {"sport": "tennis", "selection": ["favourite", "underdog"]}, "metrics": {}}})
+    assert len(board) == 8 and (board["segnali"] == "s").all()
+    assert np.allclose(board["modello 1 %"], bt.elo_win_prob(t["winner_elo"], t["loser_elo"]) * 100)

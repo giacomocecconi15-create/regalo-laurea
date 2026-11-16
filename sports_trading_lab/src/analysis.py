@@ -48,7 +48,8 @@ class History:
                 "roi_pct": float((won * (o - 1) - (1 - won)).mean() * 100)}   # rendimento storico puntando a quelle quote
 
 
-def daily_board(fixtures: pd.DataFrame, con, history: History, vault: dict | None = None, min_n: int = 150) -> tuple[pd.DataFrame, pd.DataFrame]:
+def daily_board(fixtures: pd.DataFrame, con, history: History, vault: dict | None = None, min_n: int = 150,
+                external: pd.DataFrame | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Analisi delle partite in programma. Ritorna (tabellone, dettaglio):
     - dettaglio: una riga per partita ed esito con quota, probabilita' implicita senza margine, frequenza
       storica dei precedenti simili, scarto tra le due e numerosita';
@@ -68,10 +69,20 @@ def daily_board(fixtures: pd.DataFrame, con, history: History, vault: dict | Non
                 s = history.similar(n, r["odds"], r["league"], min_n=min_n)
                 implied = fair.iloc[i, k] * 100 if np.isfinite(fair.iloc[i, k]) else np.nan
                 rows.append({"row": i, "esito": OUTCOME_LABEL[n], "selection": n, "quota": r["odds"], "implicita_pct": implied,
+                             "modello_pct": r.get("model_prob", np.nan),
                              "storica_pct": s["hit_pct"], "scarto_pct": s["hit_pct"] - implied if s["n"] else np.nan,
                              "roi_storico_pct": s["roi_pct"], "precedenti": s["n"], "ambito": s["scope"]})
     detail = pd.DataFrame(rows)
     one = parts[0][parts[0]["selection"] == "home"].reset_index(drop=True)
+    # incrocio con la fonte esterna (ClubElo): probabilita' 1X2 dalle sue valutazioni, stessa formula del modello interno
+    detail["clubelo_pct"] = np.nan
+    if external is not None and len(external):
+        from src import fixtures as fx
+        eh, ea = fx.clubelo_ratings(one["home_team"], external), fx.clubelo_ratings(one["away_team"], external)
+        ext = bt.football_model_probs(eh, ea, home_adv=65.0, scale=1.0) * 100     # ClubElo e' gia' sulla scala standard
+        for k, n in enumerate(("home", "draw", "away")):
+            m = detail["selection"] == n
+            detail.loc[m, "clubelo_pct"] = pd.Series(ext[:, k]).reindex(detail.loc[m, "row"]).to_numpy()
     board = pd.DataFrame({
         "row": fixtures.index, "data": fixtures["date"], "ora": fixtures.get("time"), "lega": one["league"], "partita": one["event"],
         "1": one["odds_home"], "X": one["odds_draw"], "2": one["odds_away"], "over": fixtures.get("odds_over25"),
@@ -83,6 +94,12 @@ def daily_board(fixtures: pd.DataFrame, con, history: History, vault: dict | Non
     board["esito_migliore"] = board["row"].map(best["esito"])
     board["scarto_pct"] = board["row"].map(best["scarto_pct"])
     board["precedenti"] = board["row"].map(best["precedenti"])
+    # esito su cui modello interno e fonte esterna concordano nel vedere piu' probabilita' della quota (almeno 3 punti)
+    d = detail[detail["selection"].isin(["home", "draw", "away"])].copy()
+    d["m"], d["e"] = d["modello_pct"] - d["implicita_pct"], d["clubelo_pct"] - d["implicita_pct"]
+    agree = d[(d["m"] >= 3) & (d["e"] >= 3)].sort_values("m", ascending=False).drop_duplicates("row").set_index("row")
+    labels = {r: f"{x.esito} ({x.m:+.0f} / {x.e:+.0f})" for r, x in agree.iterrows()}
+    board["incrocio"] = [labels.get(r, "") for r in board["row"]]
     board["segnali"] = ""
     if vault:
         signals, _ = sv.scan(fixtures, vault, 1000.0, con)
@@ -90,6 +107,29 @@ def daily_board(fixtures: pd.DataFrame, con, history: History, vault: dict | Non
             names = signals.groupby("evento")["strategia"].agg(lambda s: ", ".join(dict.fromkeys(s)))
             board["segnali"] = board["partita"].map(names).fillna("")
     return board, detail
+
+
+def tennis_board(odds: pd.DataFrame, con, vault: dict | None = None) -> pd.DataFrame:
+    """Match di tennis in programma: quote, ranking, form, precedenti e probabilita' del modello Elo contro la quota."""
+    if odds is None or odds.empty:
+        return pd.DataFrame()
+    s = sv.tennis_upload_selections(odds, con)
+    a = s.iloc[:len(odds)].reset_index(drop=True)          # prospettiva del primo giocatore
+    board = pd.DataFrame({
+        "data": odds["date"].to_numpy(), "ora": odds.get("time", pd.Series("", index=odds.index)).to_numpy(), "torneo": a["competition"],
+        "superficie": a["surface"], "giocatore 1": a["player"], "giocatore 2": a["opponent"], "quota 1": a["odds"], "quota 2": a["opp_odds"],
+        "rank 1": a["rank"], "rank 2": a["opp_rank"], "form 1": a["form10"], "form 2": a["opp_form10"],
+        "precedenti": a["h2h_wins"].map("{:.0f}".format) + "-" + a["h2h_losses"].map("{:.0f}".format),
+        "implicita 1 %": (1 / a["odds"]) / (1 / a["odds"] + 1 / a["opp_odds"]) * 100, "modello 1 %": a["model_prob"],
+        "scarto modello": a["model_edge"],
+    })
+    board["segnali"] = ""
+    if vault:
+        signals, _ = sv.scan(odds, vault, 1000.0, con)
+        if len(signals):
+            names = signals.groupby("evento")["strategia"].agg(lambda x: ", ".join(dict.fromkeys(x)))
+            board["segnali"] = a["event"].map(names).fillna("")
+    return board
 
 
 def team_recent(con, team: str, n: int = 6) -> pd.DataFrame:

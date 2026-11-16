@@ -10,7 +10,7 @@ RAW_DIR = DATA_DIR / "raw"
 DB_PATH = DATA_DIR / "trading_db.duckdb"
 STRATEGIES_PATH = ROOT / "strategies.json"
 
-SCHEMA_VERSION = "3"  # da incrementare quando cambiano le feature calcolate
+SCHEMA_VERSION = "4"  # da incrementare quando cambiano le feature calcolate
 FIRST_YEAR = 2019  # primo anno / stagione scaricata (>= 5 anni di storico)
 
 # --------------------------------------------------------------------------- calcio
@@ -74,7 +74,7 @@ FOOT_ODDS_MAP = football_odds_map()
 FOOT_INT_COLS = ["fthg", "ftag", "hthg", "htag"]
 FOOT_TEXT_COLS = ["match_id", "div", "country", "league", "season", "kickoff", "home_team", "away_team", "ftr", "htr"]
 # feature pre-partita (senza look-ahead) calcolate da update_data.refresh_features
-FOOT_FEATURE_KEYS = ["ppg5", "gf5", "ga5", "venue_ppg5", "sot5", "sota5", "corners5", "pos", "sppg", "rest_days"]
+FOOT_FEATURE_KEYS = ["ppg5", "gf5", "ga5", "venue_ppg5", "sot5", "sota5", "corners5", "pos", "sppg", "rest_days", "elo"]
 FOOT_FEATURES = [f"{side}_{k}" for side in ("home", "away") for k in FOOT_FEATURE_KEYS]
 FOOT_FLOAT_COLS = (
     FOOT_INT_COLS + list(FOOT_STATS) + list(FOOT_ODDS_MAP) + ["ah_line", "ah_cline", "total_goals"] + FOOT_FEATURES
@@ -114,7 +114,7 @@ TENNIS_TEXT_COLS = [
     "winner_name", "loser_name", "winner_id", "loser_id", "winner_hand", "loser_hand", "winner_ioc",
     "loser_ioc", "score", "status",
 ]
-TENNIS_FEATURE_KEYS = ["form10", "form_surf", "rest_days", "matches14", "h2h_wins", "srv_won10", "ret_won10", "ace10", "df10"]
+TENNIS_FEATURE_KEYS = ["form10", "form_surf", "rest_days", "matches14", "h2h_wins", "srv_won10", "ret_won10", "ace10", "df10", "elo"]
 TENNIS_FEATURES = [f"{side}_{k}" for side in ("winner", "loser") for k in TENNIS_FEATURE_KEYS]
 TENNIS_FLOAT_COLS = (
     ["draw_size", "best_of", "minutes", "winner_rank", "loser_rank", "winner_rank_points", "loser_rank_points",

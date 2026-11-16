@@ -26,7 +26,7 @@ Uso manuale:
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python src/update_data.py        # scarica / aggiorna il database
-.venv/bin/python -m pytest tests -q        # 60 test
+.venv/bin/python -m pytest tests -q        # 66 test
 .venv/bin/python -m streamlit run app.py   # dashboard
 ```
 
@@ -41,6 +41,9 @@ src/risk.py            Monte Carlo: stake fisso vs Kelly frazionario
 src/strategies.py      Strategy Vault (strategies.json) e Pre-Match Scanner
 src/ledger.py          gestionale: conti, movimenti e registro delle giocate reali
 src/roadmap.py         roadmap 2027 (voci predefinite e stato salvato)
+src/backup.py          backup e ripristino dei dati personali
+src/notify.py          avvisi Telegram sui nuovi segnali
+attiva_avvisi_mac.sh   attiva il controllo automatico dei segnali su Mac
 src/analysis.py        partite del giorno, punto di pareggio, monitor delle strategie, calcolatore di copertura
 src/cashout.py         simulazione del cash out (regole manuali e modello intelligente)
 src/fixtures.py        partite in programma con quote (calcio gratis, tennis con chiave gratuita) e impostazioni
@@ -124,6 +127,30 @@ curve, rendimenti mensili. Ogni operazione rischia 1 unità.
 - **Lay**: responsabilità fissa 1u (puntata del banco `1/(quota-1)`) oppure puntata fissa 1u. Il prezzo di banca è la
   quota back scelta: il risultato reale sull'exchange è un po' peggiore (spread).
 - **CLV %**: back `quota/chiusura - 1`, lay `1 - quota/chiusura`.
+
+### Modello di probabilità e incroci
+
+- **Elo interno.** Tennis: media tra Elo generale ed Elo sulla superficie, calcolato su tutti i match (Challenger
+  compresi). Calcio: Elo con vantaggio del campo e scarto di gol, tradotto in probabilità 1-X-2 con parametri tarati
+  sullo storico. Sempre calcolato prima del match, senza look-ahead.
+- **Filtri *Modello***: probabilità del modello e *vantaggio del modello sulla quota* (modello meno probabilità
+  implicita senza margine). Sullo storico il mercato è più preciso del modello (tennis: 66% di vincitori indovinati
+  contro il 68% delle quote Pinnacle) e puntare dove il modello vede più valore della quota non ha reso: va usato
+  come secondo parere, non come segnale.
+- **Incrocio esterno (ClubElo).** Nella pagina Oggi le valutazioni pubbliche di clubelo.com danno una seconda stima
+  indipendente; la colonna *incrocio modelli* segnala gli esiti su cui le due stime concordano contro la quota.
+- **Walk-forward** (vista Robustezza): ogni anno usa solo le fasce di quota che negli anni precedenti erano in utile
+  e misura il risultato nell'anno in corso.
+
+### Backup e avvisi
+
+- **Dove stanno i tuoi dati**: `data/gestionale.duckdb` (giocate, conti), `strategies.json` (strategie),
+  `data/roadmap.json`, `data/settings.json`. Gli storici (`data/trading_db.duckdb`) si riscaricano e non vanno salvati.
+- **Backup**: uno zip al giorno in `data/backup/` all'apertura dell'app (ultimi 14) e, se indicata nella pagina
+  Dati, copia in una seconda cartella (iCloud Drive, chiavetta). Per ripristinare, scompatta lo zip nella cartella
+  del progetto.
+- **Avvisi Telegram**: pagina Strategie. Serve un bot personale creato con @BotFather (gratis). `bash
+  attiva_avvisi_mac.sh` attiva il controllo ogni 3 ore anche ad app chiusa; `off` lo disattiva.
 
 ### Cash out
 

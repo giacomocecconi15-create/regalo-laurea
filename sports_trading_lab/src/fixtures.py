@@ -155,3 +155,50 @@ def fetch_tennis_odds(api_key: str, book: str = "avg", session=None) -> tuple[pd
         df["odds2"] = pd.to_numeric(df["ps2"], errors="coerce").fillna(df["odds2"])
     msg = f"Crediti rimasti questo mese: {remaining}" if remaining is not None else ""
     return df.sort_values(["date", "time"], kind="stable").reset_index(drop=True), msg
+
+
+# --------------------------------------------------------------------------- fonte esterna di previsioni: ClubElo
+CLUBELO_URL = "http://api.clubelo.com/{day}"     # CSV pubblico e gratuito: Rank,Club,Country,Level,Elo,From,To
+# nomi che differiscono tra football-data.co.uk e ClubElo (gli altri si abbinano per somiglianza)
+CLUBELO_ALIASES = {"nottmforest": "forest", "athmadrid": "atletico", "athbilbao": "bilbao", "mgladbach": "gladbach",
+                   "einfrankfurt": "frankfurt", "bayernmunich": "bayern", "stetienne": "saintetienne", "splisbon": "sporting",
+                   "spbraga": "braga", "psveindhoven": "psv", "manunited": "manunited", "mancity": "mancity",
+                   "sheffieldunited": "sheffieldunited", "sheffieldweds": "sheffieldweds", "parissg": "parissg", "fckoln": "koeln",
+                   "mainz": "mainz", "rbleipzig": "rbleipzig", "hertha": "hertha", "wolves": "wolves", "qpr": "qpr",
+                   "westbrom": "westbrom", "lacoruna": "depor", "spgijon": "gijon", "vallecano": "rayovallecano"}
+
+
+def parse_clubelo(raw: bytes) -> pd.DataFrame:
+    df = ud.read_csv_loose(raw)
+    if df.empty or not {"Club", "Elo"} <= set(df.columns):
+        return pd.DataFrame(columns=["club", "elo", "key"])
+    out = pd.DataFrame({"club": df["Club"], "elo": ud.num(df["Elo"])}).dropna()
+    out["key"] = out["club"].map(ud.norm_key)
+    return out.drop_duplicates("key").reset_index(drop=True)
+
+
+def fetch_clubelo(day: str | None = None) -> tuple[pd.DataFrame, str]:
+    """Valutazioni Elo dei club da clubelo.com per la data indicata (oggi se assente)."""
+    day = day or pd.Timestamp.today().strftime("%Y-%m-%d")
+    raw = ud.http_get(CLUBELO_URL.format(day=day), retries=2)
+    df = parse_clubelo(raw) if raw else pd.DataFrame()
+    return (df, "") if len(df) else (pd.DataFrame(columns=["club", "elo", "key"]), "ClubElo non raggiungibile in questo momento.")
+
+
+def clubelo_ratings(teams: pd.Series, ratings: pd.DataFrame) -> pd.Series:
+    """Elo esterno per ogni squadra (NaN se non abbinata). Abbinamento per nome normalizzato, alias noti,
+    poi contenimento ('inter' in 'intermilan')."""
+    if ratings is None or ratings.empty:
+        return pd.Series(np.nan, index=teams.index)
+    table = dict(zip(ratings["key"], ratings["elo"]))
+    keys = list(table)
+
+    def find(name: str) -> float:
+        k = ud.norm_key(name)
+        k = CLUBELO_ALIASES.get(k, k)
+        if k in table:
+            return table[k]
+        hits = [x for x in keys if len(k) >= 4 and (k in x or x in k)]
+        return table[min(hits, key=lambda x: abs(len(x) - len(k)))] if hits else np.nan
+
+    return teams.map(find).astype("float64")
