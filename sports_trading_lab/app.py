@@ -21,6 +21,7 @@ from plotly.subplots import make_subplots
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
+from src import analysis as an  # noqa: E402
 from src import backtester as bt  # noqa: E402
 from src import cashout as co  # noqa: E402
 from src import config as C  # noqa: E402
@@ -519,6 +520,7 @@ strategia solo se supera i controlli e ha una logica che sai spiegare.
 ### 5 · Dal test alla pratica
 - **Cash out**: nel pannello laterale puoi simulare le chiusure anticipate, a mano (quante giocate chiudi prima
   e a quanto) o in automatico dal risultato all'intervallo / primo set. La vista *Cash out* mostra l'effetto.
+- **Oggi**: le partite in programma con classifica, form e precedenti a quote simili, e le strategie che attivano.
 - **Rischio**: simula 1.000 futuri possibili e confronta stake fisso e Kelly frazionario.
 - **Strategie**: salva le strategie valide, poi scarica con un clic le partite in programma (calcio) e ottieni
   i match che le attivano, con lo stake già calcolato sul tuo bankroll.
@@ -953,13 +955,53 @@ def tab_robustness(cfg: dict, res: bt.BacktestResult, sel_args: tuple, bank: flo
                    "Il *massimo mercato* è il tetto raggiungibile avendo conti su molti bookmaker.")
 
 
+def breakeven_panel(trades: pd.DataFrame) -> None:
+    """Quanto bisogna spingersi con le chiusure perche' la strategia vada in utile."""
+    be = an.breakeven(trades)
+    st.subheader("Punto di pareggio")
+    need = be["need"].dropna()
+    if be["profit_hold"] >= 0:
+        headline, note, tone = "Già in utile", "anche tenendo tutto fino alla fine", "good"
+    elif need.empty:
+        headline, note, tone = "Non raggiungibile", "nemmeno tagliando tutte le perdenti con l'80% di recupero", "bad"
+    else:
+        mid = need.iloc[(need["recupero_pct"] - 50).abs().argmin()]
+        headline = f"{mid['quota_perdenti_da_tagliare_pct']:.0f}% delle perdenti"
+        note, tone = f"da tagliare recuperando il {mid['recupero_pct']:.0f}% della puntata", None
+    kpis([("ROI tenendo tutto", f"{be['roi_hold_pct']:+.2f}%", f"{be['profit_hold']:+.1f} u su {num_it(be['total_risk'])} u", sign_tone(be["roi_hold_pct"])),
+          ("Per andare in pari", headline, note, tone),
+          ("Perdenti", num_it(be["n_lost"]), f"{num_it(be['lost_risk'])} u perse tenendole", None),
+          ("Vincenti", num_it(be["n_won"]), f"{num_it(be['won_profit'])} u vinte tenendole", None)])
+    a, b = st.columns([3, 2])
+    with a:
+        st.caption("ROI atteso (%) tagliando una quota delle giocate perdenti (colonne) e recuperando una parte della puntata (righe).")
+        st.dataframe(be["grid"].style.format("{:+.1f}").map(
+            lambda v: f"color:{GOOD}" if v > 0 else f"color:{MUTED}"), width="stretch")
+    with b:
+        st.caption("Prova una combinazione (valore atteso, senza sorte):")
+        c1, c2 = st.columns(2)
+        cut = c1.number_input("Perdenti tagliate %", 0.0, 100.0, 20.0, 5.0, key="be_cut")
+        rec = c2.number_input("Puntata recuperata %", 0.0, 100.0, 50.0, 5.0, key="be_rec")
+        early = c1.number_input("Vincenti incassate prima %", 0.0, 100.0, 0.0, 5.0, key="be_early")
+        keep = c2.number_input("Profitto incassato %", 0.0, 100.0, 70.0, 5.0, key="be_keep")
+        roi = an.breakeven_custom(be, cut, rec, early, keep)
+        kpis([("ROI atteso", f"{roi:+.2f}%", f"contro {be['roi_hold_pct']:+.2f}% tenendo tutto", sign_tone(roi))])
+    st.caption(":material/warning: Questa è la soglia teorica: presume che tu chiuda solo giocate che avrebbero perso. Nella realtà, per "
+               "tagliare le perdenti chiudi per errore anche alcune vincenti: usa il campo *vincenti incassate prima* (o le regole "
+               "manuali nel pannello laterale, che includono anche le vincenti chiuse in perdita) per vedere quanto margine ti resta. "
+               "Se il pareggio richiede di riconoscere in anticipo gran parte delle perdenti, la strategia non ha un vantaggio suo.")
+
+
 def tab_cashout(cfg: dict, res: bt.BacktestResult, sel_args: tuple, bank: float) -> None:
     trades = res.trades
+    breakeven_panel(trades)
+    st.divider()
     if "cashout" not in trades.columns:
-        st.info("Il cash out non è attivo. Accendilo nel pannello laterale, sezione **4 · Cash out**: "
+        st.info("Per simulare le chiusure sull'intero storico accendi il cash out nel pannello laterale, sezione **4 · Cash out**: "
                 "*Manuale* per riprodurre le tue chiusure abituali, *Intelligente* per farle decidere dal risultato "
                 "all'intervallo (calcio) o dal primo set (tennis).")
         return
+    st.subheader("Simulazione con le regole impostate")
     hold = trades.assign(pnl=trades["pnl_hold"])
     hold["equity"] = hold["pnl"].cumsum()
     mh, m = bt.compute_metrics(hold, bank), res.metrics
@@ -1043,7 +1085,9 @@ def page_backtester() -> None:
         st.warning("Nessun match soddisfa i filtri selezionati: allarga i criteri nel pannello laterale o premi *Azzera*.")
         return
     ss.setdefault("bt_view", VIEWS[0])
-    view = st.segmented_control("Vista", VIEWS, key="bt_view", label_visibility="collapsed") or VIEWS[0]
+    # un secondo clic sulla vista attiva la deseleziona: in quel caso resta aperta l'ultima vista scelta
+    view = st.segmented_control("Vista", VIEWS, key="bt_view", label_visibility="collapsed") or ss.get("_bt_view_last", VIEWS[0])
+    ss["_bt_view_last"] = view
     if view == "Riepilogo":
         tab_summary(cfg, res, bank)
     elif view == "Analisi":
@@ -1057,6 +1101,111 @@ def page_backtester() -> None:
     else:
         st.caption("Salva la strategia per ritrovarla nella pagina Strategie e usarla nello scanner delle partite in programma.")
         save_form("save_bt")
+
+
+# --------------------------------------------------------------------------- pagina: oggi
+@st.cache_resource(show_spinner="Preparo lo storico per i confronti...", max_entries=2)
+def history(book: str, version: float) -> an.History:
+    return an.History(selections("football", "1x2", book, "open", version), selections("football", "ou25", book, "open", version))
+
+
+def page_today() -> None:
+    header("Oggi", "Le partite in programma analizzate con lo storico: variabili pre-partita, precedenti a quote simili, segnali delle tue strategie.")
+    if need_db():
+        return
+    a, b, c, d = st.columns([1.3, 1.1, 1.2, 3])
+    book = a.selectbox("Quote", ["avg", "max", "b365", "bfe"], format_func=bt.BOOK_LABELS.get, key="today_book")
+    min_n = b.number_input("Precedenti minimi", 50, 2000, 150, 50, key="today_min",
+                           help="Sotto questa numerosità lo scarto storico non viene considerato.")
+    c.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
+    refresh = c.button("Aggiorna partite", icon=":material/refresh:", width="stretch")
+    vault = sv.load_vault()
+    key = json.dumps([book, int(min_n), db_version(), sorted(vault)], default=str)
+    if refresh or "today" not in ss or ss["today"]["key"] != key:
+        with st.spinner("Scarico e analizzo le partite in programma..."):
+            fixtures, msg = fx.fetch_football_fixtures(book)
+            board, detail = pd.DataFrame(), pd.DataFrame()
+            if len(fixtures):
+                with closing(bt.connect()) as con:
+                    board, detail = an.daily_board(fixtures, con, history(book, db_version()), vault, int(min_n))
+        ss["today"] = {"key": key, "board": board, "detail": detail, "fixtures": fixtures, "msg": msg,
+                       "when": pd.Timestamp.now().strftime("%d/%m %H:%M")}
+    t = ss["today"]
+    if t["msg"]:
+        st.warning(t["msg"])
+    board, detail = t["board"], t["detail"]
+    if board.empty:
+        st.info("Nessuna partita in programma disponibile in questo momento. La fonte (football-data.co.uk) pubblica le partite "
+                "dei prossimi giorni: riprova più tardi con *Aggiorna partite*.")
+        return
+    d.caption(f"{len(board)} partite, aggiornate alle {t['when']}. Fonte: football-data.co.uk (calcio). "
+              "Per il tennis usa lo scanner nella pagina Strategie.")
+    f1, f2, f3 = st.columns([2, 2, 1.4])
+    days = sorted(board["data"].dropna().unique())
+    day = f1.multiselect("Giorno", days, placeholder="tutti")
+    leagues = sorted(board["lega"].dropna().unique())
+    covered = [x for x in leagues if x in {v[1] for v in C.FOOTBALL_LEAGUES.values()}]
+    league = f2.multiselect("Lega", leagues, placeholder="tutte")
+    only = f3.radio("Mostra", ["Tutte", "Con segnale", "Scarto di almeno 3 punti"], horizontal=False, label_visibility="collapsed")
+    view = board
+    if day:
+        view = view[view["data"].isin(day)]
+    if league:
+        view = view[view["lega"].isin(league)]
+    if only == "Con segnale":
+        view = view[view["segnali"] != ""]
+    elif only == "Scarto di almeno 3 punti":
+        view = view[view["scarto_pct"] >= 3]
+    kpis([("Partite", str(len(view)), f"{len(covered)} leghe coperte dallo storico", None),
+          ("Con segnale", str(int((view["segnali"] != "").sum())), f"{len(vault)} strategie salvate", None),
+          ("Scarto di almeno 3 punti", str(int((view["scarto_pct"] >= 3).sum())), f"con almeno {int(min_n)} precedenti", None)])
+    st.dataframe(view.drop(columns=["row"]).sort_values(["data", "ora"], kind="stable"), hide_index=True, width="stretch", height=380, column_config={
+        "1": st.column_config.NumberColumn(format="%.2f"), "X": st.column_config.NumberColumn(format="%.2f"),
+        "2": st.column_config.NumberColumn(format="%.2f"), "over": st.column_config.NumberColumn("over 2.5", format="%.2f"),
+        "pos_casa": st.column_config.NumberColumn("pos. casa", format="%.0f"), "pos_ospite": st.column_config.NumberColumn("pos. ospite", format="%.0f"),
+        "form_casa": st.column_config.NumberColumn("punti/partita casa", format="%.1f"),
+        "form_ospite": st.column_config.NumberColumn("punti/partita ospite", format="%.1f"),
+        "gol_recenti": st.column_config.NumberColumn("gol recenti", format="%.1f"), "esito_migliore": "esito migliore",
+        "scarto_pct": st.column_config.NumberColumn("scarto storico (punti %)", format="%+.1f"),
+        "precedenti": st.column_config.NumberColumn(format="%.0f"), "segnali": "strategie attivate"})
+    st.caption("**Scarto storico**: frequenza con cui quell'esito si è verificato nei precedenti a quota simile (±7%, stessa lega quando "
+               "i precedenti bastano) meno la probabilità implicita nella quota senza margine. Uno scarto positivo è un indizio, non un "
+               "vantaggio: il mercato è efficiente e scarti di pochi punti rientrano nel caso. Conta quando coincide con una tua "
+               "strategia validata.")
+    if view.empty:
+        return
+    st.subheader("Scheda partita")
+    labels = {int(r.row): f"{r.data} {r.ora or ''}  {r.partita}  ({r.lega})" for r in view.itertuples()}
+    row = st.selectbox("Partita", list(labels), format_func=labels.get, label_visibility="collapsed")
+    m = board[board["row"] == row].iloc[0]
+    dm = detail[detail["row"] == row]
+    kpis([(f"Esito {r.esito}", f"{r.quota:.2f}" if pd.notna(r.quota) else "n/d",
+           (f"storica {r.storica_pct:.0f}% contro {r.implicita_pct:.0f}% ({r.scarto_pct:+.1f}), {int(r.precedenti)} prec."
+            if r.precedenti >= min_n and pd.notna(r.scarto_pct) else "precedenti insufficienti"),
+           sign_tone(r.scarto_pct) if r.precedenti >= min_n else None) for r in dm.itertuples()])
+    if m["segnali"]:
+        st.success(f"Attiva le strategie: {m['segnali']}", icon=":material/bolt:")
+    home, away = t["fixtures"].loc[row, "home_team"], t["fixtures"].loc[row, "away_team"]
+    with closing(bt.connect()) as con:
+        feats = sv.football_upload_selections(t["fixtures"].loc[[row]], "1x2", con).iloc[0]
+        last_home, last_away = an.team_recent(con, home), an.team_recent(con, away)
+    rows = [("Posizione in classifica", "pos", "{:.0f}"), ("Punti a partita in stagione", "sppg", "{:.2f}"),
+            ("Punti a partita, ultime 5", "ppg5", "{:.1f}"), ("Punti a partita, ultime 5 in casa / fuori", "venue_ppg5", "{:.1f}"),
+            ("Gol fatti, media ultime 5", "gf5", "{:.1f}"), ("Gol subiti, media ultime 5", "ga5", "{:.1f}"),
+            ("Tiri in porta fatti, media ultime 5", "sot5", "{:.1f}"), ("Tiri in porta subiti, media ultime 5", "sota5", "{:.1f}"),
+            ("Calci d'angolo, media ultime 5", "corners5", "{:.1f}"), ("Giorni di riposo", "rest_days", "{:.0f}")]
+    x, y, z = st.columns([2.2, 1.4, 1.4])
+    x.dataframe(pd.DataFrame({"variabile": [r[0] for r in rows], home: [fmt(float(feats[f"home_{r[1]}"]), r[2]) for r in rows],
+                              away: [fmt(float(feats[f"away_{r[1]}"]), r[2]) for r in rows]}), hide_index=True, width="stretch")
+    y.caption(f"Ultime partite: {home}")
+    y.dataframe(last_home, hide_index=True, width="stretch")
+    z.caption(f"Ultime partite: {away}")
+    z.dataframe(last_away, hide_index=True, width="stretch")
+    st.dataframe(dm.drop(columns=["row", "selection"]), hide_index=True, width="stretch", column_config={
+        "quota": st.column_config.NumberColumn(format="%.2f"), "implicita_pct": st.column_config.NumberColumn("prob. implicita %", format="%.1f"),
+        "storica_pct": st.column_config.NumberColumn("frequenza storica %", format="%.1f"),
+        "scarto_pct": st.column_config.NumberColumn("scarto (punti %)", format="%+.1f"),
+        "roi_storico_pct": st.column_config.NumberColumn("ROI storico a quote simili %", format="%+.1f"), "ambito": "precedenti da"})
 
 
 # --------------------------------------------------------------------------- pagina: rischio
@@ -1119,6 +1268,51 @@ def page_risk() -> None:
 
 
 # --------------------------------------------------------------------------- pagina: strategie
+MONITOR_STATE = {"in linea": "ok", "utile ma CLV negativo": "warn", "poche operazioni recenti": "warn",
+                 "al massimo drawdown": "bad", "in calo": "bad", "nessuna operazione": "warn"}
+
+
+def strategy_monitor_panel(vault: dict) -> None:
+    st.subheader("Monitor delle strategie")
+    st.caption("Riesegue ogni strategia salvata sui dati aggiornati e confronta gli ultimi 12 mesi e 90 giorni con lo storico: "
+               "serve ad accorgersi quando un vantaggio si sta spegnendo.")
+    key = json.dumps([vault, db_version()], sort_keys=True, default=str)
+    if st.button("Analizza le strategie", icon=":material/monitoring:") or ss.get("_mon_key") == key:
+        if ss.get("_mon_key") != key:
+            with st.spinner("Rieseguo le strategie..."):
+                ss["_mon"] = an.strategy_monitor(vault, lambda sp, m, p, t: selections(sp, m, p, t, db_version()))
+            ss["_mon_key"] = key
+        table, pool = ss["_mon"]
+        if table.empty:
+            st.info("Nessuna strategia analizzabile.")
+            return
+        checklist([(r["strategia"], MONITOR_STATE.get(r["stato"], "warn"),
+                    r["stato"].capitalize() + (f" - ultimi 12 mesi: ROI {r['roi_365_pct']:+.1f}% su {int(r['n_365'])} operazioni, "
+                                               f"CLV {fmt(r['clv_365_pct'], '{:+.1f}')}%" if r.get("operazioni") else ""))
+                   for _, r in table.iterrows()])
+        st.dataframe(table.drop(columns=["stato"]), hide_index=True, width="stretch", column_config={
+            "roi_pct": st.column_config.NumberColumn("ROI % storico", format="%+.2f"),
+            "roi_365_pct": st.column_config.NumberColumn("ROI % 12 mesi", format="%+.2f"), "n_365": "op. 12 mesi",
+            "roi_90_pct": st.column_config.NumberColumn("ROI % 90 giorni", format="%+.2f"), "n_90": "op. 90 giorni",
+            "clv_365_pct": st.column_config.NumberColumn("CLV % 12 mesi", format="%+.2f"),
+            "dd_attuale": st.column_config.NumberColumn("drawdown attuale (u)", format="%.1f"),
+            "dd_massimo": st.column_config.NumberColumn("drawdown massimo (u)", format="%.1f"), "ultima": "ultima operazione"})
+        if len(pool) and pool["strategia"].nunique() > 1:
+            st.markdown("**Portafoglio: tutte le strategie insieme**")
+            pm = bt.compute_metrics(pool.assign(ev_close_pct=np.nan), 100.0)
+            kpis([("ROI complessivo", f"{pm['roi_pct']:+.2f}%", f"{num_it(pm['trades'])} operazioni", sign_tone(pm["roi_pct"])),
+                  ("Profitto", f"{pm['profit']:+.1f} u", "1 u per operazione", sign_tone(pm["profit"])),
+                  ("Max drawdown", f"-{pm['max_dd_units']:.1f} u", "delle strategie sommate", None)])
+            show(equity_chart(pool).update_layout(title_text="Profitto cumulato del portafoglio (unità)"))
+            corr = an.monthly_correlation(pool)
+            if not corr.empty:
+                st.caption("Correlazione dei profitti mensili: valori vicini a 1 indicano strategie che salgono e scendono insieme "
+                           "(non diversificano), vicini a 0 strategie indipendenti.")
+                st.dataframe(corr, width="stretch")
+        st.caption("ROI recente negativo su poche operazioni è normale oscillazione; il segnale da prendere sul serio è un CLV che "
+                   "diventa negativo o un drawdown vicino al massimo storico.")
+
+
 def page_vault() -> None:
     header("Strategie", "Archivio delle strategie salvate e scanner delle quote del giorno.")
     vault = sv.load_vault()
@@ -1146,6 +1340,8 @@ def page_vault() -> None:
         if ss.get("last"):
             st.caption(describe(ss["last"]["cfg"]))
         save_form("save_vault")
+    if vault and db_ready():
+        strategy_monitor_panel(vault)
 
     st.subheader("Scanner delle partite in programma")
     sources = {"football": "Calcio - partite in programma", "tennis": "Tennis - quote ATP", "csv": "File CSV"}
@@ -1386,6 +1582,20 @@ def ledger_bets_tab(acc: pd.DataFrame, allb: pd.DataFrame, vault: dict) -> None:
             except ValueError as exc:
                 st.error(str(exc).capitalize())
 
+    with st.expander("Calcolatore di copertura: quanto vale chiudere adesso"):
+        c = st.columns(5)
+        h_side = c[0].selectbox("Posizione", ["back", "lay"], format_func={"back": "Ho puntato", "lay": "Ho bancato"}.get, key="h_side")
+        h_odds = c[1].number_input("Quota presa", 1.01, 1000.0, 2.50, 0.01, key="h_odds")
+        h_stake = c[2].number_input("Puntata" if h_side == "back" else "Puntata del banco", 0.01, 1e9, 10.0, 1.0, key="h_stake")
+        h_live = c[3].number_input("Quota attuale", 1.01, 1000.0, 1.80, 0.01, key="h_live")
+        h_comm = c[4].number_input("Commissione %", 0.0, 20.0, 0.0, 0.5, key="h_comm")
+        h = an.hedge(h_side, h_odds, h_stake, h_live, h_comm / 100)
+        kpis([("Per chiudere", f"{h['hedge_side']} {num_it(h['hedge_stake'], 2)}", f"a quota {h_live:.2f}", None),
+              ("Risultato bloccato", signed_it(h["profit"]), "uguale qualunque sia l'esito", sign_tone(h["profit"])),
+              ("Sul rischio iniziale", f"{h['profit_pct']:+.1f}%", f"rischio {num_it(h['risk'], 2)}", sign_tone(h["profit_pct"]))])
+        st.caption("Copri la posizione con la giocata opposta alla quota attuale. Il *risultato bloccato* è l'importo da inserire "
+                   "quando chiudi la giocata come *Cash out* qui sotto.")
+
     opened = allb[allb["status"] == "open"]
     st.subheader(f"Giocate aperte ({len(opened)})")
     if opened.empty:
@@ -1564,6 +1774,7 @@ ensure_schema()
 auto_update()
 PAGES = {
     "backtester": st.Page(page_backtester, title="Backtester", icon=":material/query_stats:", url_path="backtester", default=True),
+    "today": st.Page(page_today, title="Oggi", icon=":material/today:", url_path="oggi"),
     "risk": st.Page(page_risk, title="Rischio", icon=":material/casino:", url_path="risk"),
     "vault": st.Page(page_vault, title="Strategie", icon=":material/bookmark:", url_path="vault"),
     "ledger": st.Page(page_ledger, title="Registro", icon=":material/receipt_long:", url_path="registro"),

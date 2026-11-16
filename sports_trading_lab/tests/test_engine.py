@@ -908,3 +908,86 @@ def test_cashout_model_is_calibrated_on_real_matches(con):
     fair = bt.run_backtest({**base, "cashout": {"mode": "smart", "tp_pct": 20, "stop_loss": True, "sl_pct": 30, "margin_pct": 0}}, con).metrics["roi_pct"]
     costly = bt.run_backtest({**base, "cashout": {"mode": "smart", "tp_pct": 20, "stop_loss": True, "sl_pct": 30, "margin_pct": 10}}, con).metrics["roi_pct"]
     assert abs(fair - hold) < 2.0 and costly < fair
+
+
+# ------------------------------------------------------------------ analisi operativa
+from src import analysis as an  # noqa: E402
+
+
+def test_hedge_calculator():
+    h = an.hedge("back", 2.5, 40, 1.6)                       # quota scesa: profitto bloccato
+    assert h["hedge_stake"] == pytest.approx(62.5) and h["profit"] == pytest.approx(22.5) and h["hedge_side"] == "banca"
+    assert 40 * 1.5 - 62.5 * 0.6 == pytest.approx(62.5 - 40)  # stesso risultato nei due esiti
+    assert an.hedge("back", 2.5, 40, 4.0)["profit"] == pytest.approx(-15.0)          # quota salita: perdita bloccata
+    lay = an.hedge("lay", 3.0, 10, 6.0)
+    assert lay["hedge_stake"] == pytest.approx(5.0) and lay["profit"] == pytest.approx(5.0) and lay["risk"] == 20.0
+    c = an.hedge("back", 2.5, 40, 1.6, commission=0.05)
+    win, lose = 40 * 1.5 - c["hedge_stake"] * 0.6, c["hedge_stake"] - 40
+    assert win * 0.95 == pytest.approx(lose * 0.95, abs=1e-6) and c["profit"] == pytest.approx(22.5 * 0.95)
+    with pytest.raises(ValueError):
+        an.hedge("back", 1.0, 10, 2.0)
+
+
+def test_cashout_breakeven_matches_simulation():
+    rng = np.random.default_rng(11)
+    n = 6000
+    odds = np.round(rng.uniform(1.6, 2.6, n), 2)
+    sel = make_sel(odds.tolist(), (rng.random(n) < 0.93 / odds).tolist(),
+                   dates=pd.date_range("2010-01-01", periods=n, freq="D").strftime("%Y-%m-%d").tolist())
+    t = bt.settle(sel)
+    be = an.breakeven(t)
+    assert be["roi_hold_pct"] < 0 and be["n_won"] + be["n_lost"] == n
+    assert be["grid"].iloc[0, 0] == pytest.approx(be["roi_hold_pct"])                 # nessun taglio = tenere tutto
+    need = be["need"].set_index("recupero_pct")["quota_perdenti_da_tagliare_pct"]
+    assert need[80] < need[50] < need[20]                                             # piu' recuperi, meno devi tagliare
+    assert an.breakeven_custom(be, need[50], 50) == pytest.approx(0.0, abs=1e-9)      # alla soglia il ROI atteso e' zero
+    # il valore atteso coincide con la simulazione manuale (a meno della sorte)
+    sim = bt.backtest_selections(sel, {"cashout": {"mode": "manual", "lose_cut_share": 40, "lose_cut_recover": 50,
+                                                   "win_early_share": 30, "win_early_keep": 70}}).metrics["roi_pct"]
+    assert an.breakeven_custom(be, 40, 50, 30, 70) == pytest.approx(sim, abs=1.0)
+    winning = an.breakeven(bt.settle(make_sel([2.0, 2.0, 2.0], [True, True, False])))
+    assert (winning["need"]["quota_perdenti_da_tagliare_pct"] == 0).all()
+    hopeless = an.breakeven(bt.settle(make_sel([1.05] * 10, [True] + [False] * 9)))
+    assert hopeless["need"].iloc[0].isna().any()                                      # col 20% di recupero non basta tagliarle tutte
+
+
+def test_history_finds_similar_odds():
+    sel = pd.DataFrame({"selection": ["home"] * 6 + ["draw"] * 2, "odds": [2.0, 2.05, 1.95, 2.1, 3.0, 2.0, 3.4, 3.5],
+                        "won": [True, False, True, True, False, False, True, False],
+                        "league": ["A", "A", "A", "B", "A", "B", "A", "A"]})
+    h = an.History(sel)
+    s = h.similar("home", 2.0, "A", tol=0.07, min_n=3)
+    assert s["n"] == 3 and s["scope"] == "A" and s["hit_pct"] == pytest.approx(200 / 3)
+    wide = h.similar("home", 2.0, "A", tol=0.07, min_n=10)                             # pochi nella lega: tutte le leghe
+    assert wide["n"] == 5 and wide["scope"] == "tutte le leghe" and wide["hit_pct"] == pytest.approx(60.0)
+    assert wide["roi_pct"] == pytest.approx((1.0 - 1 + 0.95 + 1.1 - 1) / 5 * 100)
+    assert h.similar("home", 9.0)["n"] == 0 and h.similar("over", 2.0)["n"] == 0
+
+
+@needs_db
+def test_daily_board_and_strategy_monitor(con):
+    last = con.execute("SELECT * FROM football_matches WHERE div = 'I1' AND avg_o25 IS NOT NULL ORDER BY match_date DESC LIMIT 10").df()
+    fixtures = pd.DataFrame({"date": pd.to_datetime(last["match_date"]).dt.strftime("%Y-%m-%d"), "time": "20:45", "div": "I1",
+                             "league": "Serie A", "home_team": last["home_team"], "away_team": last["away_team"],
+                             "odds_home": last["avg_h"], "odds_draw": last["avg_d"], "odds_away": last["avg_a"],
+                             "odds_over25": last["avg_o25"], "odds_under25": last["avg_u25"], "ah_line": last["ah_line"]})
+    hist = an.History(bt.load_selections("football", "1x2", "avg", "open", con), bt.load_selections("football", "ou25", "avg", "open", con))
+    vault = {"casa": {"config": {"sport": "football", "market": "1x2", "selection": ["home"], "price": "avg", "odds_min": 1.01, "odds_max": 50},
+                      "metrics": {"roi_pct": 1.0}}}
+    board, detail = an.daily_board(fixtures, con, hist, vault, min_n=100)
+    assert len(board) == 10 and len(detail) == 50 and (board["segnali"] == "casa").all()
+    assert np.allclose(board["pos_casa"], last["home_pos"], equal_nan=True)            # stesse variabili del backtest
+    g = detail.groupby("row")
+    assert np.allclose(detail[detail["selection"].isin(["home", "draw", "away"])].groupby("row")["implicita_pct"].sum(), 100)
+    assert (detail["precedenti"] > 100).all() and detail["storica_pct"].between(0, 100).all()
+    assert (detail["scarto_pct"].abs() < 20).all() and g.ngroups == 10                 # a quote simili la frequenza segue la quota
+    recent = an.team_recent(con, last.loc[0, "home_team"])
+    assert len(recent) == 6 and set(recent["esito"]) <= {"V", "N", "P"}
+
+    table, pool = an.strategy_monitor(vault, lambda s, m, p, t: bt.load_selections(s, m, p, t, con))
+    row = table.iloc[0]
+    ref = bt.run_backtest(vault["casa"]["config"], con)
+    assert row["operazioni"] == ref.metrics["trades"] and row["roi_pct"] == pytest.approx(ref.metrics["roi_pct"])
+    assert row["n_90"] <= row["n_365"] <= row["operazioni"] and row["dd_attuale"] <= row["dd_massimo"] + 1e-9
+    assert row["stato"] in ("in linea", "utile ma CLV negativo", "al massimo drawdown", "in calo", "poche operazioni recenti")
+    assert len(pool) == row["operazioni"] and pool["equity"].iloc[-1] == pytest.approx(ref.metrics["profit"])

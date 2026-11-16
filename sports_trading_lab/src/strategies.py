@@ -166,7 +166,7 @@ def upcoming_football_features(con, home: pd.Series, away: pd.Series, div: pd.Se
     known = dict(zip(key(hist), hist["match_id"]))
     future["_known"] = key(future).map(known)
     todo = future[future["_known"].isna()].drop(columns="_known")
-    feats = ud.football_features(pd.concat([hist, todo], ignore_index=True)).set_index("match_id")
+    feats = ud.football_features(pd.concat([hist, todo], ignore_index=True) if len(todo) else hist).set_index("match_id")
     ids = future.set_index("match_id")["_known"].fillna(pd.Series(future["match_id"].to_numpy(), index=future["match_id"].to_numpy()))
     order = pd.Series(["__up" + str(i) for i in range(len(home))]).map(ids)
     return feats.reindex(order.to_numpy()).reset_index(drop=True)
@@ -194,7 +194,8 @@ def upcoming_tennis_features(con, p1: pd.Series, p2: pd.Series, surface: pd.Seri
     near = lambda m: m[(m["_d"] - m["_d_h"]).dt.days.abs() <= 1].drop_duplicates("match_id")
     straight, swapped = near(straight), near(swapped)
     done = set(straight["match_id"]) | set(swapped["match_id"])
-    feats = ud.tennis_features(pd.concat([hist, future[~future["match_id"].isin(done)]], ignore_index=True)).set_index("match_id")
+    new = future[~future["match_id"].isin(done)]
+    feats = ud.tennis_features(pd.concat([hist, new], ignore_index=True) if len(new) else hist).set_index("match_id")
     out = feats.reindex(ids)
     if len(straight):
         out.loc[straight["match_id"].to_numpy()] = feats.reindex(straight["match_id_h"].to_numpy()).to_numpy()

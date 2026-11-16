@@ -26,14 +26,14 @@ Uso manuale:
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python src/update_data.py        # scarica / aggiorna il database
-.venv/bin/python -m pytest tests -q        # 56 test
+.venv/bin/python -m pytest tests -q        # 60 test
 .venv/bin/python -m streamlit run app.py   # dashboard
 ```
 
 ## Struttura
 
 ```
-app.py                 dashboard Streamlit (Backtester, Rischio, Strategie, Registro, Roadmap, Dati, Guida)
+app.py                 dashboard Streamlit (Backtester, Oggi, Rischio, Strategie, Registro, Roadmap, Dati, Guida)
 src/config.py          percorsi, sorgenti dati, leghe, schema delle tabelle
 src/update_data.py     download, pulizia, caricamento incrementale in DuckDB
 src/backtester.py      motore di backtesting vettorizzato
@@ -41,6 +41,7 @@ src/risk.py            Monte Carlo: stake fisso vs Kelly frazionario
 src/strategies.py      Strategy Vault (strategies.json) e Pre-Match Scanner
 src/ledger.py          gestionale: conti, movimenti e registro delle giocate reali
 src/roadmap.py         roadmap 2027 (voci predefinite e stato salvato)
+src/analysis.py        partite del giorno, punto di pareggio, monitor delle strategie, calcolatore di copertura
 src/cashout.py         simulazione del cash out (regole manuali e modello intelligente)
 src/fixtures.py        partite in programma con quote (calcio gratis, tennis con chiave gratuita) e impostazioni
 assets/                icona dell'app
@@ -144,6 +145,11 @@ Sul database le probabilità stimate sono in linea con le frequenze reali (scart
 da un test), ma resta una stima: le quote reali in corso di partita possono differire e il cash out vero può
 scattare in altri momenti. Chiudere prima costa il margine, quindi in media riduce il rendimento.
 
+**Punto di pareggio.** La vista *Cash out* calcola quanto bisogna spingersi con le chiusure perché la strategia vada
+in utile: quale quota di giocate perdenti va tagliata, per ogni livello di puntata recuperata, e una griglia del ROI
+atteso. È la soglia teorica (presume di chiudere solo giocate che avrebbero perso); un campo permette di aggiungere il
+costo delle vincenti chiuse per errore.
+
 Nel **Registro** una giocata reale si può chiudere come *Cash out* indicando a mano il profitto o la perdita
 effettivamente incassati.
 
@@ -160,17 +166,26 @@ effettivamente incassati.
    - *Operazioni*: tabella esportabile in CSV.  *Salva*: archivia la strategia.
 
    Ogni vista viene calcolata solo quando la apri, e il backtest si ricalcola solo se cambia la strategia.
-2. **Rischio** – 1.000 simulazioni bootstrap su 500/1.000 operazioni: stake fisso vs Kelly frazionario,
+2. **Oggi** – le partite in programma (calcio) analizzate con lo storico: classifica, form, gol recenti; per ogni
+   esito la frequenza con cui si è verificato nei precedenti a quota simile contro la probabilità implicita nella
+   quota (*scarto storico*); le strategie salvate che la partita attiva; scheda partita con le variabili delle due
+   squadre e le ultime gare.
+3. **Rischio** – 1.000 simulazioni bootstrap su 500/1.000 operazioni: stake fisso vs Kelly frazionario,
    risk of ruin, distribuzione del drawdown.
-3. **Strategie** – archivio in `strategies.json` (riapribili nel Backtester) e scanner delle partite in programma:
+4. **Strategie** – include il *Monitor*: riesegue ogni strategia sui dati aggiornati, confronta ultimi 12 mesi e
+   90 giorni con lo storico, segnala quelle in calo o al massimo drawdown, e mostra il portafoglio complessivo
+   con la correlazione tra strategie.
+   Inoltre: archivio in `strategies.json` (riapribili nel Backtester) e scanner delle partite in programma:
    calcio scaricato con un clic, tennis con chiave gratuita o da CSV; segnali con lo stake calcolato sul bankroll.
-4. **Registro** – gestionale delle giocate reali: conti per bookmaker/exchange con depositi e prelievi, giocate
+5. **Registro** – con *calcolatore di copertura*: data la quota presa e quella attuale, dice quanto puntare o
+   bancare per chiudere e il risultato bloccato.
+   Inoltre: gestionale delle giocate reali: conti per bookmaker/exchange con depositi e prelievi, giocate
    aperte e chiuse (anche importate dai segnali dello scanner), saldo e disponibile, ROI e CLV reali confrontati
    con quelli del backtest per strategia. I dati stanno in `data/gestionale.duckdb`, separato dagli storici.
-5. **Roadmap 2027** – il piano dell'anno per trimestri, su due binari (funzioni della piattaforma e metodo di
+6. **Roadmap 2027** – il piano dell'anno per trimestri, su due binari (funzioni della piattaforma e metodo di
    lavoro); lo stato di ogni voce, le note e le voci aggiunte si salvano in `data/roadmap.json`.
-6. **Dati** – stato del database e pulsante di aggiornamento con barra di avanzamento.
-7. **Guida** – come si usa, in cinque passi.
+7. **Dati** – stato del database e pulsante di aggiornamento con barra di avanzamento.
+8. **Guida** – come si usa, in cinque passi.
 
 Un backtest positivo non garantisce risultati futuri: più filtri si provano, più è probabile trovare un risultato
 buono per caso. Guarda numero di operazioni, t-stat e CLV prima di fidarti di un ROI.
