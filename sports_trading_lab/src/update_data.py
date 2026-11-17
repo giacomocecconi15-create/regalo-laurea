@@ -847,6 +847,15 @@ def run(sport: str = "all", full: bool = False, db_path: Path | None = None) -> 
             summary["tennis"] = update_tennis(con, full, progress)
         if needs_feature_refresh(con):
             refresh_features(con)
+        if sport in ("all", "tennis"):      # punti del Match Charting Project per lo scalping (riscaricati al massimo ogni 7 giorni)
+            try:
+                from src import scalping
+                cached = C.RAW_DIR / "points" / scalping.FILES["p2020"]
+                stale = (not cached.exists()) or (time.time() - cached.stat().st_mtime > 7 * 86400)
+                progress("tennis punto per punto", 1, 1)
+                summary["points"] = scalping.update_points(con, refresh=full or stale)
+            except Exception as exc:  # una fonte secondaria non deve bloccare l'aggiornamento
+                summary["points"] = {"games": 0, "matches": 0, "note": f"non aggiornati ({exc})"}
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         con.execute("INSERT OR REPLACE INTO meta VALUES ('last_update', ?)", [now])
         summary["changed"] = any(summary.get(k, {}).get("changed") for k in ("football", "tennis"))
@@ -889,6 +898,8 @@ def main() -> int:
         log(f"TENNIS  anni aggiornati: {t['years']}, righe caricate: {t['rows']}, quote abbinate: {t['matched']}/{t['odds_rows']}")
         for n in t["notes"]:
             log("        " + n)
+    if "points" in s:
+        log(f"PUNTI   game di servizio: {s['points']['games']}, match: {s['points']['matches']} ({s['points']['note']})")
     log("NOVITA' " + ("nuovi dati caricati" if s["changed"] else "nessuna: i dati erano gia' aggiornati"))
     log(f"TOTALI  {s['counts']}")
     log("VALIDAZIONE " + ("OK" if not s["problems"] else "PROBLEMI: " + "; ".join(s["problems"])))

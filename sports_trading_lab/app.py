@@ -31,6 +31,7 @@ from src import fixtures as fx  # noqa: E402
 from src import ledger as lg  # noqa: E402
 from src import risk  # noqa: E402
 from src import roadmap as rm  # noqa: E402
+from src import scalping as sc  # noqa: E402
 from src import strategies as sv  # noqa: E402
 from src import update_data as ud  # noqa: E402
 
@@ -1359,6 +1360,100 @@ def page_today() -> None:
         "roi_storico_pct": st.column_config.NumberColumn("ROI storico a quote simili %", format="%+.1f"), "ambito": "precedenti da"})
 
 
+# --------------------------------------------------------------------------- pagina: scalping
+@st.cache_resource(show_spinner="Carico i game di servizio...", max_entries=1)
+def service_games(version: float) -> pd.DataFrame:
+    with closing(bt.connect()) as con:
+        return sc.load_games(con)
+
+
+def page_scalping() -> None:
+    header("Scalping sul servizio", "Punti chi serve a un dato punteggio e chiudi dopo pochi punti: simulazione su game reali punto per punto.")
+    if need_db():
+        return
+    games = service_games(db_version())
+    if games.empty:
+        st.info("I dati punto per punto non sono ancora stati scaricati. Vai nella pagina **Dati** e premi *Aggiorna ora*: "
+                "la prima volta scarica circa 90 MB dal Match Charting Project (qualche minuto).")
+        return
+    with st.container(border=True):
+        c = st.columns([1.1, 1.5, 1, 1.4, 1, 1])
+        entry = c[0].selectbox("Ingresso al punteggio", sc.ENTRY_SCORES, help="Punteggio del game dal punto di vista di chi serve (battitore-risposta).")
+        mode = c[1].radio("Uscita", ["points", "game"], horizontal=True, format_func={"points": "Dopo N punti", "game": "A fine game"}.get)
+        n_pts = c[2].number_input("N punti", 1, 6, 2, 1, disabled=mode != "points")
+        stop = c[3].checkbox("Esci alla prima palla break", value=False, help="Chiude in perdita appena chi risponde è a un punto dal break.")
+        spread = c[4].number_input("Spread %", 0.0, 5.0, 0.5, 0.1, help="Quanto peggio della quota teorica entri ed esci: un tick vale circa 0,5-1%.")
+        comm = c[5].number_input("Commissione %", 0.0, 20.0, 2.0, 0.5)
+        c = st.columns([1.6, 1.4, 2, 1.4])
+        surf = c[0].multiselect("Superficie", sorted(games["surface"].unique()), placeholder="tutte")
+        sets = c[1].multiselect("Set", sorted(int(x) for x in games["set_no"].unique()), placeholder="tutti")
+        lo, hi = c[2].slider("Probabilità pre-match di chi serve (%)", 0, 100, (0, 100), 5)
+        real = c[3].checkbox("Solo match con quote reali", value=False, help="Esclude i match dove il prezzo di partenza viene dall'Elo.")
+    filters = {"surface": surf, "set_no": sets, "pre_prob": (lo / 100 if lo > 0 else None, hi / 100 if hi < 100 else None),
+               "price_source": ["quote"] if real else None}
+    exit_points = int(n_pts) if mode == "points" else None
+    key = json.dumps([entry, exit_points, stop, spread, comm, filters, db_version()], default=str)
+    if ss.get("_sc_key") != key:
+        ss["_sc"] = sc.simulate(games, entry, exit_points, stop, spread, comm / 100, filters)
+        ss["_sc_key"] = key
+    t = ss["_sc"]
+    if t.empty:
+        st.warning("Nessun game soddisfa i criteri scelti.")
+        return
+    m = bt.compute_metrics(t, 100.0)
+    r = t["pnl"].to_numpy()
+    kpis([("Rendimento per operazione", f"{r.mean() * 100:+.3f}%", f"profitto totale {m['profit']:+.1f} u su {num_it(m['trades'])} operazioni", sign_tone(r.mean())),
+          ("Operazioni vinte", f"{m['win_rate_pct']:.1f}%", f"t-stat {fmt(m['t_stat'])}", None),
+          ("Vincita media", f"{r[r > 0].mean() * 100:+.2f}%" if (r > 0).any() else "n/d", "sulle operazioni chiuse in utile", None),
+          ("Perdita media", f"{r[r < 0].mean() * 100:.2f}%" if (r < 0).any() else "n/d", "sulle operazioni chiuse in perdita", None),
+          ("Max drawdown", f"-{m['max_dd_units']:.1f} u", f"serie negativa max {m['longest_losing_streak']}", None)],
+         hero_spark=t["equity"].to_numpy())
+    st.caption(f"{num_it(games['match_id'].nunique())} match e {num_it(len(games))} game di servizio dal {games['match_date'].min():%Y}. "
+               "Ogni operazione punta 1 unità su chi serve nel mercato vincente match; il rendimento è la variazione della quota tra "
+               "ingresso e uscita, meno spread e commissione.")
+    show(equity_chart(t).update_layout(title_text="Profitto cumulato (unità puntate)"))
+    st.subheader("Per superficie")
+    by = t.groupby("surface")["pnl"].agg(operazioni="size", roi_pct=lambda x: x.mean() * 100, vinte_pct=lambda x: (x > 0).mean() * 100,
+                                         vincita_media_pct=lambda x: x[x > 0].mean() * 100, perdita_media_pct=lambda x: x[x < 0].mean() * 100).reset_index()
+    pct = lambda label: st.column_config.NumberColumn(label, format="%+.2f")
+    cols = {"surface": "superficie", "roi_pct": st.column_config.NumberColumn("rendimento per operazione %", format="%+.3f"),
+            "vinte_pct": st.column_config.NumberColumn("vinte %", format="%.1f"), "vincita_media_pct": pct("vincita media %"),
+            "perdita_media_pct": pct("perdita media %"), "t_stat": st.column_config.NumberColumn("t-stat", format="%+.1f")}
+    st.dataframe(by, hide_index=True, width="stretch", column_config=cols)
+    st.dataframe(t.groupby("exit")["pnl"].agg(operazioni="size", roi_pct=lambda x: x.mean() * 100).reset_index().rename(columns={"exit": "uscita"}),
+                 hide_index=True, width="stretch", column_config=cols)
+
+    st.subheader("Dove rende: tutti i punteggi di ingresso")
+    if st.toggle("Confronta tutti i punteggi di ingresso con la stessa regola di uscita", help="Qualche secondo di calcolo."):
+        gkey = json.dumps([exit_points, stop, spread, comm, filters, db_version()], default=str)
+        if ss.get("_scg_key") != gkey:
+            with st.spinner("Simulo ogni punteggio di ingresso..."):
+                ss["_scg"] = sc.entry_grid(games, exit_points, stop, spread, comm / 100, filters)
+            ss["_scg_key"] = gkey
+        st.dataframe(ss["_scg"].sort_values("roi_pct", ascending=False), hide_index=True, width="stretch", height=420, column_config=cols)
+    st.subheader("Punti reali contro modello")
+    stats = sc.state_stats(games if not surf else games[games["surface"].isin(surf)])
+    st.dataframe(stats, hide_index=True, width="stretch", height=380, column_config={
+        "game": st.column_config.NumberColumn("game passati dal punteggio"), "tenuti_pct": st.column_config.NumberColumn("servizio tenuto %", format="%.1f"),
+        "modello_pct": st.column_config.NumberColumn("previsto dal modello %", format="%.1f"),
+        "scarto": st.column_config.NumberColumn("scarto (punti %)", format="%+.1f")})
+    st.caption("Da ogni punteggio: quante volte chi serve ha davvero tenuto il servizio contro quanto prevede il modello. Scarto negativo: "
+               "da lì chi serve fa peggio del previsto, quindi puntarlo è sfavorevole; positivo: fa meglio.")
+    st.caption(":material/warning: Gli esiti dei punti sono reali, le quote no: in mancanza di quote in diretta gratuite, il prezzo a ogni "
+               "punteggio viene da un modello tarato sulla quota pre-match e sulla quota di servizi tenuti di ogni superficie. La "
+               "simulazione mostra quindi dove i punti reali si scostano dal modello e quanto pesano spread e commissione, non come "
+               "si muoveva il mercato vero né se c'era liquidità. Rendimenti di pochi decimi di punto per operazione sono dello stesso "
+               "ordine dello spread.")
+    with st.expander("Operazioni"):
+        view = t[["date", "tournament", "surface", "event", "set_no", "game_no", "odds", "exit_odds", "points", "exit", "held", "pnl"]].copy()
+        view["date"] = view["date"].dt.date
+        st.dataframe(view.tail(MAX_TABLE_ROWS), hide_index=True, width="stretch", height=360, column_config={
+            "odds": st.column_config.NumberColumn("quota ingresso", format="%.3f"), "exit_odds": st.column_config.NumberColumn("quota uscita", format="%.3f"),
+            "pnl": st.column_config.NumberColumn("rendimento", format="%+.4f"), "held": "servizio tenuto", "exit": "uscita", "points": "punti"})
+        st.download_button("Esporta tutte le operazioni (CSV)", view.to_csv(index=False).encode("utf-8"),
+                           f"scalping_{date.today():%Y%m%d}.csv", "text/csv", icon=":material/download:")
+
+
 # --------------------------------------------------------------------------- pagina: rischio
 def page_risk() -> None:
     header("Rischio", "Simulazione Monte Carlo del bankroll sull'ultima strategia testata.")
@@ -1963,6 +2058,7 @@ if not ss.get("_backup_checked"):     # un backup al giorno dei dati personali, 
 PAGES = {
     "backtester": st.Page(page_backtester, title="Backtester", icon=":material/query_stats:", url_path="backtester", default=True),
     "today": st.Page(page_today, title="Oggi", icon=":material/today:", url_path="oggi"),
+    "scalping": st.Page(page_scalping, title="Scalping", icon=":material/sports_tennis:", url_path="scalping"),
     "risk": st.Page(page_risk, title="Rischio", icon=":material/casino:", url_path="risk"),
     "vault": st.Page(page_vault, title="Strategie", icon=":material/bookmark:", url_path="vault"),
     "ledger": st.Page(page_ledger, title="Registro", icon=":material/receipt_long:", url_path="registro"),

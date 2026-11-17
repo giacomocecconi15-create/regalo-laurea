@@ -26,14 +26,14 @@ Uso manuale:
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python src/update_data.py        # scarica / aggiorna il database
-.venv/bin/python -m pytest tests -q        # 66 test
+.venv/bin/python -m pytest tests -q        # 70 test
 .venv/bin/python -m streamlit run app.py   # dashboard
 ```
 
 ## Struttura
 
 ```
-app.py                 dashboard Streamlit (Backtester, Oggi, Rischio, Strategie, Registro, Roadmap, Dati, Guida)
+app.py                 dashboard Streamlit (Backtester, Oggi, Scalping, Rischio, Strategie, Registro, Roadmap, Dati, Guida)
 src/config.py          percorsi, sorgenti dati, leghe, schema delle tabelle
 src/update_data.py     download, pulizia, caricamento incrementale in DuckDB
 src/backtester.py      motore di backtesting vettorizzato
@@ -45,6 +45,7 @@ src/backup.py          backup e ripristino dei dati personali
 src/notify.py          avvisi Telegram sui nuovi segnali
 attiva_avvisi_mac.sh   attiva il controllo automatico dei segnali su Mac
 src/analysis.py        partite del giorno, punto di pareggio, monitor delle strategie, calcolatore di copertura
+src/scalping.py        scalping sul servizio: dati punto per punto, modello delle quote, simulatore
 src/cashout.py         simulazione del cash out (regole manuali e modello intelligente)
 src/fixtures.py        partite in programma con quote (calcio gratis, tennis con chiave gratuita) e impostazioni
 assets/                icona dell'app
@@ -151,6 +152,24 @@ curve, rendimenti mensili. Ogni operazione rischia 1 unità.
   del progetto.
 - **Avvisi Telegram**: pagina Strategie. Serve un bot personale creato con @BotFather (gratis). `bash
   attiva_avvisi_mac.sh` attiva il controllo ogni 3 ore anche ad app chiusa; `off` lo disattiva.
+
+### Scalping sul servizio (tennis)
+
+Pagina *Scalping*: punti chi serve a un punteggio scelto (0-0, 0-30, 15-30...) e chiudi dopo N punti oppure a fine
+game, con uscita opzionale alla prima palla break. Filtri per superficie, set e probabilità pre-match di chi serve;
+spread e commissione configurabili.
+
+- **Dati**: Match Charting Project di Jeff Sackmann (pubblico): circa 3.400 match ATP dal 2019 con ogni punto
+  registrato, pari a quasi 89.000 game di servizio. Scaricati con l'aggiornamento dati (circa 90 MB la prima volta,
+  poi al massimo una volta a settimana) nella tabella `tennis_service_games`.
+- **Quote**: non esistono quote in diretta gratuite, quindi il prezzo a ogni punteggio viene dal modello standard del
+  tennis (punti, game, tie-break, set, match). La probabilità di vincere il punto al servizio dei due giocatori è
+  tarata sulla quota pre-match e sulla quota reale di servizi tenuti di ogni superficie.
+- **Cosa misura**: gli esiti dei punti sono reali, i prezzi sono di modello. La simulazione mostra dove i punti reali
+  si scostano dall'ipotesi di punti indipendenti e quanto pesano spread e commissione; non riproduce i movimenti del
+  mercato vero né la liquidità.
+- La tabella *Punti reali contro modello* confronta, da ogni punteggio, quante volte chi serve tiene davvero il
+  servizio con quanto previsto; *Dove rende* prova la stessa regola di uscita da tutti i punteggi di ingresso.
 
 ### Cash out
 

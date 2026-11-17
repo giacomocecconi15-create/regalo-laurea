@@ -1117,3 +1117,90 @@ def test_model_filters_and_boards(con):
     board = an.tennis_board(odds, con, {"s": {"config": {"sport": "tennis", "selection": ["favourite", "underdog"]}, "metrics": {}}})
     assert len(board) == 8 and (board["segnali"] == "s").all()
     assert np.allclose(board["modello 1 %"], bt.elo_win_prob(t["winner_elo"], t["loser_elo"]) * 100)
+
+
+# ------------------------------------------------------------------ scalping sul servizio
+from src import scalping as sc  # noqa: E402
+
+
+def test_tennis_point_model():
+    assert sc.hold_prob(0.5) == pytest.approx(0.5)
+    assert sc.hold_prob(0.6) == pytest.approx(0.7357, abs=1e-3)                     # valore noto del modello a punti indipendenti
+    t = sc.game_table(np.array([0.6]))[0]
+    assert t[0, 0] == pytest.approx(sc.hold_prob(0.6)) and t[3, 3] == pytest.approx(0.36 / 0.52)
+    assert t[4, 3] == pytest.approx(0.6 + 0.4 * 0.36 / 0.52) and t[3, 4] == pytest.approx(0.6 * 0.36 / 0.52)
+    assert t[0, 0] == pytest.approx(0.6 * t[1, 0] + 0.4 * t[0, 1])                  # ogni stato e' la media dei due successivi
+    assert t[3, 0] > t[2, 0] > t[0, 0] > t[0, 2] > t[0, 3]
+    same = np.array([0.64])
+    assert sc.match_prob(same, same, np.array([3]))[0] == pytest.approx(0.5)
+    assert sc.tiebreak_prob(same, same)[0] == pytest.approx(0.5)
+    w = sc.set_table(np.array([0.68]), np.array([0.60]))[0]
+    assert w[5, 4, 0] > w[4, 4, 0] > w[4, 5, 0] and w[6, 4, 0] == 1 and w[5, 7, 1] == 0
+    assert sc.match_prob(np.array([0.68]), np.array([0.60]), np.array([5]))[0] > sc.match_prob(np.array([0.68]), np.array([0.60]), np.array([3]))[0] > 0.5
+    pre = np.array([0.5, 0.8, 0.25, 0.65])
+    pa, pb = sc.solve_serve_probs(pre, np.full(4, 0.63), np.array([3, 3, 5, 5]))
+    assert sc.match_prob(pa, pb, np.array([3, 3, 5, 5])) == pytest.approx(pre, abs=4e-3)   # il modello riproduce la quota pre-match
+    assert np.allclose(pa + pb, 1.26)
+
+
+def test_service_game_sequences():
+    def game(mid, s1, s2, g1, g2, svr, winners, start):
+        return [{"match_id": mid, "Pt": start + i, "Set1": s1, "Set2": s2, "Gm1": g1, "Gm2": g2, "Svr": svr, "PtWinner": w} for i, w in enumerate(winners)]
+    rows = (game("m", 0, 0, 0, 0, 1, [1, 1, 2, 1, 1], 1)                # tenuto a 15
+            + game("m", 0, 0, 1, 0, 2, [1, 2, 1, 2, 1, 2, 1, 1], 6)     # break ai vantaggi (vince il giocatore 1 in risposta)
+            + game("m", 0, 0, 6, 6, 1, [1, 2, 1, 1, 1, 1, 1, 1], 13)    # tie-break: escluso
+            + game("m", 0, 0, 2, 0, 1, [1, 1, 1], 30))                  # game incompleto: scartato
+    g = sc._sequences(pd.DataFrame(rows).astype(str))
+    assert g["seq"].tolist() == ["11011", "01010100"] and g["held"].tolist() == [True, False] and g["server"].tolist() == [1, 2]
+
+
+def scalp_games(seqs, **kw):
+    n = len(seqs)
+    base = {"match_id": [f"m{i}" for i in range(n)], "match_date": pd.to_datetime("2024-05-01"), "tournament": "T", "round": "R32",
+            "surface": kw.get("surface", ["Clay"] * n), "best_of": 3, "server": "S", "returner": "R", "set_no": 1, "game_no": 1,
+            "srv_games": 0, "ret_games": 0, "srv_sets": 0, "ret_sets": 0, "seq": seqs,
+            "held": [s.count("1") > s.count("0") for s in seqs], "p_srv": 0.6, "v_hold": 0.55, "v_break": 0.40, "pre_prob": 0.5, "price_source": "quote"}
+    return pd.DataFrame(base)
+
+
+def test_scalping_simulation_matches_hand_calculation():
+    t = sc.game_table(np.array([0.6]))[0]
+    price = lambda a, b: t[a, b] * 0.55 + (1 - t[a, b]) * 0.40           # probabilita' match di chi serve a quel punteggio
+    g = scalp_games(["1111", "0000", "001111", "110011", "10101000"])
+    two = sc.simulate(g, "0-0", 2, False, spread_pct=0.0)
+    assert two["pnl"].tolist() == pytest.approx([price(2, 0) / price(0, 0) - 1, price(0, 2) / price(0, 0) - 1, price(0, 2) / price(0, 0) - 1,
+                                                 price(2, 0) / price(0, 0) - 1, price(1, 1) / price(0, 0) - 1])
+    end = sc.simulate(g, "0-0", None, False, spread_pct=0.0)
+    assert end["pnl"].tolist() == pytest.approx([0.55 / price(0, 0) - 1, 0.40 / price(0, 0) - 1, 0.55 / price(0, 0) - 1,
+                                                 0.55 / price(0, 0) - 1, 0.40 / price(0, 0) - 1])
+    stop = sc.simulate(g, "0-0", None, True, spread_pct=0.0)
+    assert stop["exit"].tolist() == ["fine game", "palla break", "fine game", "fine game", "palla break"]   # lo 0-30 non e' palla break
+    assert stop["pnl"].iloc[1] == pytest.approx(price(0, 3) / price(0, 0) - 1)       # uscita allo 0-40
+    assert stop["pnl"].iloc[4] == pytest.approx(price(3, 4) / price(0, 0) - 1)       # 30-40 dopo due parita': vantaggio risposta
+    assert stop["pnl"].iloc[4] > end["pnl"].iloc[4]                                  # uscire alla palla break costa meno del break
+    late = sc.simulate(g, "0-30", 2, False, spread_pct=0.0)                          # solo i game passati dallo 0-30
+    assert len(late) == 2 and late["pnl"].tolist() == pytest.approx([0.40 / price(0, 2) - 1, price(2, 2) / price(0, 2) - 1])
+    cost = sc.simulate(g, "0-0", 2, False, spread_pct=1.0, commission=0.05)
+    gross = (price(2, 0) / price(0, 0)) * 0.99 / 1.01 - 1
+    assert cost["pnl"].iloc[0] == pytest.approx(gross * 0.95) and cost["pnl"].iloc[1] < two["pnl"].iloc[1]
+    assert sc.simulate(g, "0-0", 2, filters={"surface": ["Grass"]}).empty
+    m = bt.compute_metrics(two)
+    assert m["trades"] == 5 and m["profit"] == pytest.approx(two["pnl"].sum())
+    stats = sc.state_stats(pd.concat([g] * 10, ignore_index=True)).set_index(["punteggio", "superficie"])
+    assert stats.loc[("0-0", "Tutte"), "game"] == 50 and stats.loc[("0-0", "Tutte"), "tenuti_pct"] == pytest.approx(60.0)
+    assert stats.loc[("0-0", "Tutte"), "modello_pct"] == pytest.approx(t[0, 0] * 100)
+
+
+@needs_db
+def test_service_games_table_is_calibrated(con):
+    g = sc.load_games(con)
+    if g.empty:
+        pytest.skip("dati punto per punto non scaricati")
+    assert len(g) > 50000 and g["match_id"].nunique() > 2000 and set(g["surface"]) == {"Clay", "Grass", "Hard"}
+    assert g["p_srv"].between(0.3, 0.92).all() and g["v_hold"].between(0, 1).all() and (g["v_hold"] >= g["v_break"] - 1e-9).all()
+    for surface, x in g.groupby("surface"):
+        assert abs(sc.hold_prob(x["p_srv"]).mean() - x["held"].mean()) < 0.004, surface      # servizi tenuti: modello = realta'
+    assert g.groupby("surface")["held"].mean()["Clay"] < g.groupby("surface")["held"].mean()["Grass"]
+    t = sc.simulate(g, "0-0", 2, False, spread_pct=0.0)
+    assert len(t) > 50000 and abs(t["pnl"].mean()) < 0.003            # senza costi il modello e' quasi equo sull'ingresso a inizio game
+    assert sc.simulate(g, "0-0", 2, False, spread_pct=0.5)["pnl"].mean() < t["pnl"].mean() - 0.008     # lo spread si paga due volte
