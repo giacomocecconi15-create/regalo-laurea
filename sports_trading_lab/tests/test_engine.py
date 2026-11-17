@@ -589,7 +589,7 @@ def test_roadmap_state_is_saved_and_merged(tmp_path):
     from src import roadmap as rm
     p = tmp_path / "roadmap.json"
     base = rm.items(p)
-    assert len(base) == len(rm.DEFAULT_ITEMS) and all(i["status"] == "todo" for i in base)
+    assert len(base) == len(rm.DEFAULT_ITEMS) and all(i["status"] == rm.BUILT.get(i["id"], "todo") for i in base)
     assert {i["quarter"] for i in base} == set(rm.QUARTERS) and {i["track"] for i in base} == set(rm.TRACKS)
     assert len({i["id"] for i in base}) == len(base)
     rm.update_item("q1-paper", status="doing", note="partito il 7 gennaio", path=p)
@@ -600,7 +600,8 @@ def test_roadmap_state_is_saved_and_merged(tmp_path):
     assert now["q1-paper"]["status"] == "doing" and now["q1-paper"]["note"] == "partito il 7 gennaio"
     assert now[mine]["custom"] and now[mine]["status"] == "done" and now[mine]["quarter"] == "Q2"
     prog = rm.progress(list(now.values()))
-    assert prog["all"] == (2, len(base) + 1) and prog["Q1"][0] == 1 and prog["Q2"][0] == 1
+    built = sum(v == "done" for v in rm.BUILT.values())
+    assert prog["all"] == (built + 2, len(base) + 1) and prog["Q1"][0] == 3 and prog["Q2"][0] == 2
     with pytest.raises(ValueError):
         rm.update_item("q1-paper", status="boh", path=p)
     with pytest.raises(ValueError):
@@ -1204,3 +1205,73 @@ def test_service_games_table_is_calibrated(con):
     t = sc.simulate(g, "0-0", 2, False, spread_pct=0.0)
     assert len(t) > 50000 and abs(t["pnl"].mean()) < 0.003            # senza costi il modello e' quasi equo sull'ingresso a inizio game
     assert sc.simulate(g, "0-0", 2, False, spread_pct=0.5)["pnl"].mean() < t["pnl"].mean() - 0.008     # lo spread si paga due volte
+
+
+# ------------------------------------------------------------------ quote reali Betfair
+def _bf_market(mid, names, winner, pre, path, event_type="2", market_type="MATCH_ODDS"):
+    """Flusso sintetico nel formato dei dati storici Betfair: definizione, prezzi pre-partita, in-play, chiusura."""
+    import json as _json
+    runners = [{"id": 100 + i, "name": n, "status": "ACTIVE"} for i, n in enumerate(names)]
+    base = {"marketType": market_type, "eventTypeId": event_type, "eventName": " v ".join(names[:2]), "marketTime": "2026-05-10T12:00:00.000Z"}
+    lines = [{"op": "mcm", "pt": 1000, "mc": [{"id": mid, "marketDefinition": {**base, "inPlay": False, "status": "OPEN", "runners": runners}}]},
+             {"op": "mcm", "pt": 2000, "mc": [{"id": mid, "rc": [{"id": 100 + i, "ltp": p} for i, p in enumerate(pre)]}]},
+             {"op": "mcm", "pt": 60000, "mc": [{"id": mid, "marketDefinition": {**base, "inPlay": True, "status": "OPEN", "runners": runners}}]}]
+    for k, prices in enumerate(path, start=1):
+        lines.append({"op": "mcm", "pt": 60000 + k * 60000, "mc": [{"id": mid, "rc": [{"id": 100 + i, "ltp": p} for i, p in enumerate(prices) if p]}]})
+    final = [{**r, "status": "WINNER" if r["name"] == winner else "LOSER"} for r in runners]
+    lines.append({"op": "mcm", "pt": 9000000, "mc": [{"id": mid, "marketDefinition": {**base, "inPlay": True, "status": "CLOSED", "runners": final}}]})
+    return "\n".join(_json.dumps(x) for x in lines).encode()
+
+
+def test_betfair_import_and_real_cashout(tmp_path):
+    import bz2, io, tarfile
+    from contextlib import closing
+    from src import betfair as bf
+    # A parte favorito a 1.50, scende a 1.20 (profitto), poi perde;  C sfavorito a 3.0 sale a 6.0 e perde;  pareggio nel calcio
+    m1 = _bf_market("1.1", ["A", "B"], "B", [1.5, 3.0], [[1.4, 3.4], [1.2, 5.5], [2.5, 1.6], [8.0, 1.1]])
+    m2 = _bf_market("1.2", ["C", "D"], "D", [3.0, 1.45], [[3.5, 1.35], [6.0, 1.15], [20.0, 1.03]])
+    m3 = _bf_market("1.3", ["Inter", "Milan", "The Draw"], "Inter", [2.0, 4.0, 3.5], [[1.6, 6.0, 4.0], [1.1, 30.0, 12.0]], event_type="1")
+    other = _bf_market("1.4", ["E", "F"], "E", [2.0, 2.0], [[1.5, 3.0]], market_type="SET_BETTING")
+    tar_path = tmp_path / "data.tar"
+    with tarfile.open(tar_path, "w") as tar:
+        for name, raw in (("BASIC/2026/1.1.bz2", bz2.compress(m1)), ("BASIC/2026/1.2.bz2", bz2.compress(m2)), ("BASIC/2026/1.4.bz2", bz2.compress(other))):
+            info = tarfile.TarInfo(name)
+            info.size = len(raw)
+            tar.addfile(info, io.BytesIO(raw))
+    (tmp_path / "plain").mkdir()
+    (tmp_path / "plain" / "1.3").write_bytes(m3)
+    (tmp_path / "plain" / "rotto.bz2").write_bytes(b"BZhnon valido")
+    with closing(bf.connect(tmp_path / "bf.duckdb")) as con:
+        s = bf.import_path(tar_path, con)
+        assert (s["imported"], s["ignored"], s["skipped"]) == (2, 1, 0)                 # il mercato non Match Odds viene ignorato
+        assert bf.import_path(tar_path, con)["skipped"] == 2                            # reimportare non duplica
+        s2 = bf.import_path(tmp_path / "plain", con)
+        assert s2["imported"] == 1 and s2["ignored"] == 1
+        runners, prices = bf.load(con)
+        assert len(runners) == 7 and bf.summary(con)["by_sport"] == {"football": 1, "tennis": 2}
+    r = runners.set_index("runner")
+    assert r.loc["A", "entry_odds"] == 1.5 and r.loc["A", "role"] == "favourite" and not r.loc["A", "won"]
+    assert r.loc["The Draw", "role"] == "draw" and r.loc["Inter", "won"] and r.loc["A", "n_prices"] == 4
+    assert prices[(prices["market_id"] == "1.1") & (prices["runner_id"] == 100)]["t_sec"].tolist() == [60.0, 120.0, 180.0, 240.0]
+
+    tennis = {"sport": ["tennis"], "role": ["favourite"]}
+    hold = bf.simulate(runners, prices, "back", None, None, None, 0.0, 0.0, tennis).set_index("selection")
+    assert hold.loc["A", "pnl"] == -1.0 and hold.loc["D", "pnl"] == pytest.approx(0.45)
+    tp = bf.simulate(runners, prices, "back", 20.0, None, None, 0.0, 0.0, tennis).set_index("selection")
+    assert tp.loc["A", "cashout"] == "tp" and tp.loc["A", "pnl"] == pytest.approx(1.5 / 1.2 - 1) and tp.loc["A", "exit_minute"] == 2
+    assert tp.loc["D", "pnl"] == pytest.approx(1.45 / 1.15 - 1) and tp.loc["A", "pnl_hold"] == -1.0   # il cash out salva la giocata persa
+    sl = bf.simulate(runners, prices, "back", None, 30.0, None, 0.0, 0.0, tennis).set_index("selection")
+    assert sl.loc["A", "cashout"] == "sl" and sl.loc["A", "pnl"] == pytest.approx(1.5 / 2.5 - 1) and sl.loc["D", "cashout"] == ""
+    timed = bf.simulate(runners, prices, "back", None, None, 1.0, 0.0, 0.0, tennis).set_index("selection")
+    assert timed.loc["A", "cashout"] == "time" and timed.loc["A", "pnl"] == pytest.approx(1.5 / 1.4 - 1)
+    cost = bf.simulate(runners, prices, "back", 20.0, None, None, 1.0, 0.05, tennis).set_index("selection")
+    assert cost.loc["A", "pnl"] == pytest.approx(((1.5 * 0.99) / (1.2 * 1.01) - 1) * 0.95)
+    lay = bf.simulate(runners, prices, "lay", 20.0, None, None, 0.0, 0.0, {"sport": ["tennis"], "role": ["underdog"]}).set_index("selection")
+    assert lay.loc["C", "cashout"] == "tp" and lay.loc["C", "pnl"] == pytest.approx((1 - 3.0 / 6.0) / 2.0)   # banca a 3.0, chiude a 6.0
+    assert lay.loc["C", "pnl_hold"] == pytest.approx(0.5)
+    foot = bf.simulate(runners, prices, "back", None, None, None, 0.0, 0.0, {"sport": ["football"], "role": ["draw"]})
+    assert len(foot) == 1 and foot["pnl"].iloc[0] == -1.0
+    grid = bf.threshold_grid(runners, prices, "back", 0.0, 0.0, tennis)
+    none = grid[(grid["incassa_da"] == "mai") & (grid["taglia_da"] == "mai")].iloc[0]
+    assert none["profit"] == pytest.approx(-0.55) and none["chiuse_pct"] == 0 and len(grid) == 30
+    assert bt.compute_metrics(tp.reset_index())["profit"] == pytest.approx(tp["pnl"].sum())

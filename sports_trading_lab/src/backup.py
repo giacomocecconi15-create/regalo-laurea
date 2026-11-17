@@ -5,6 +5,7 @@ Dove stanno i tuoi dati (tutto dentro la cartella del progetto):
     strategies.json          strategie salvate
     data/roadmap.json        stato della roadmap
     data/settings.json       impostazioni (aggiornamento automatico, chiavi, avvisi)
+    data/betfair.duckdb      quote Betfair importate (si reimportano dagli archivi scaricati)
     data/trading_db.duckdb   storici scaricati: NON va salvato, si ricostruisce con un aggiornamento
 
 Ogni backup e' un file zip in data/backup/ (uno al giorno, si tengono gli ultimi 14) e, se indicata,

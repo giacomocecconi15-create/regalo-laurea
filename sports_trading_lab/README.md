@@ -26,14 +26,14 @@ Uso manuale:
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python src/update_data.py        # scarica / aggiorna il database
-.venv/bin/python -m pytest tests -q        # 70 test
+.venv/bin/python -m pytest tests -q        # 71 test
 .venv/bin/python -m streamlit run app.py   # dashboard
 ```
 
 ## Struttura
 
 ```
-app.py                 dashboard Streamlit (Backtester, Oggi, Scalping, Rischio, Strategie, Registro, Roadmap, Dati, Guida)
+app.py                 dashboard Streamlit (Backtester, Oggi, Scalping, Quote reali, Rischio, Strategie, Registro, Roadmap, Dati, Guida)
 src/config.py          percorsi, sorgenti dati, leghe, schema delle tabelle
 src/update_data.py     download, pulizia, caricamento incrementale in DuckDB
 src/backtester.py      motore di backtesting vettorizzato
@@ -46,6 +46,7 @@ src/notify.py          avvisi Telegram sui nuovi segnali
 attiva_avvisi_mac.sh   attiva il controllo automatico dei segnali su Mac
 src/analysis.py        partite del giorno, punto di pareggio, monitor delle strategie, calcolatore di copertura
 src/scalping.py        scalping sul servizio: dati punto per punto, modello delle quote, simulatore
+src/betfair.py         importazione dei dati storici Betfair e cash out su prezzi reali
 src/cashout.py         simulazione del cash out (regole manuali e modello intelligente)
 src/fixtures.py        partite in programma con quote (calcio gratis, tennis con chiave gratuita) e impostazioni
 assets/                icona dell'app
@@ -170,6 +171,20 @@ spread e commissione configurabili.
   mercato vero né la liquidità.
 - La tabella *Punti reali contro modello* confronta, da ogni punteggio, quante volte chi serve tiene davvero il
   servizio con quanto previsto; *Dove rende* prova la stessa regola di uscita da tutti i punteggi di ingresso.
+
+### Quote reali (Betfair Exchange)
+
+Pagina *Quote reali*: il cash out simulato su prezzi veri in corso di partita, invece che stimati da un modello.
+
+- **Come avere i dati (gratis)**: con un account Betfair, su historicdata.betfair.com → *My Data* scegli sport
+  (Tennis o Soccer), piano **BASIC**, periodo e mercato **Match Odds**, poi scarica l'archivio `.tar`. Nella pagina
+  indica dove l'hai salvato (anche una cartella con più archivi) e premi *Importa*. Reimportare non duplica nulla.
+- **Cosa si simula**: ingresso all'ultimo prezzo scambiato prima dell'inizio, poi il percorso reale della quota;
+  chiusura alla prima rilevazione che supera la soglia di incasso o di taglio, oppure dopo un numero di minuti.
+  Back o lay, su favorito, sfavorito o pareggio, con spread e commissione. Confronto con il tenere fino alla fine e
+  griglia di tutte le combinazioni di soglie.
+- **Limite**: il piano BASIC registra circa un prezzo al minuto, quindi va bene per il cash out ma non per lo scalping
+  punto per punto. I dati restano in `data/betfair.duckdb`.
 
 ### Cash out
 

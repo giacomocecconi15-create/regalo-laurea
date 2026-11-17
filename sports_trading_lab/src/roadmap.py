@@ -77,6 +77,11 @@ DEFAULT_ITEMS = [
 ]
 
 
+# voci gia' realizzate nell'app: partono come "Fatto" (o "In corso") finche' non le cambi tu
+BUILT = {"q1-auto-update": "done", "q1-backup": "done", "q2-alerts": "done", "q3-model": "done", "q3-walk-forward": "done",
+         "q3-portfolio": "done", "q2-odds-feed": "doing"}
+
+
 def _load_state(path: Path | None = None) -> dict:
     path = Path(path or ROADMAP_PATH)
     try:
@@ -100,7 +105,7 @@ def items(path: Path | None = None) -> list[dict]:
     for iid, quarter, track, title, desc, needs in DEFAULT_ITEMS:
         s = saved.get(iid, {})
         out.append({"id": iid, "quarter": quarter, "track": track, "title": title, "description": desc, "needs": needs,
-                    "status": s.get("status", "todo") if s.get("status") in STATUSES else "todo",
+                    "status": s.get("status") if s.get("status") in STATUSES else BUILT.get(iid, "todo"),
                     "note": s.get("note", ""), "custom": False})
     for c in state.get("custom", []):
         if c.get("quarter") in QUARTERS and c.get("id"):

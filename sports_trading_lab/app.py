@@ -24,6 +24,7 @@ sys.path.insert(0, str(ROOT))
 from src import analysis as an  # noqa: E402
 from src import backtester as bt  # noqa: E402
 from src import backup as bk  # noqa: E402
+from src import betfair as bf  # noqa: E402
 from src import notify  # noqa: E402
 from src import cashout as co  # noqa: E402
 from src import config as C  # noqa: E402
@@ -461,10 +462,12 @@ def thin(trades: pd.DataFrame) -> pd.DataFrame:
     return trades.iloc[idx].assign(_n=idx + 1)
 
 
-def equity_chart(trades: pd.DataFrame, cut: pd.Timestamp | None = None) -> go.Figure:
+def equity_chart(trades: pd.DataFrame, cut: pd.Timestamp | None = None, by_trade: bool = False) -> go.Figure:
+    """Curva del profitto. `by_trade`: asse orizzontale = numero di operazione (utile quando molte operazioni
+    cadono nello stesso giorno e la curva per data si schiaccerebbe)."""
     t = thin(trades)
     fig = go.Figure(go.Scatter(
-        x=t["date"], y=t["equity"], mode="lines", line=dict(color=BLUE, width=2, shape="hv"),
+        x=t["_n"] if by_trade else t["date"], y=t["equity"], mode="lines", line=dict(color=BLUE, width=2, shape="hv"),
         fill="tozeroy", fillcolor="rgba(57,135,229,0.10)",
         customdata=t["_n"], hovertemplate="%{y:+.2f} u  (operazione n. %{customdata})<extra></extra>"))
     base_layout(fig, 360, "Equity curve - profitto cumulato (unità)")
@@ -1454,6 +1457,86 @@ def page_scalping() -> None:
                            f"scalping_{date.today():%Y%m%d}.csv", "text/csv", icon=":material/download:")
 
 
+# --------------------------------------------------------------------------- pagina: quote reali (Betfair)
+def page_live() -> None:
+    header("Quote reali", "Cash out simulato sui prezzi veri in corso di partita, dai dati storici di Betfair Exchange.")
+    if ss.get("_flash"):
+        st.success(ss.pop("_flash"))
+    with st.expander("Importa i dati di Betfair", expanded=not bf.DB_PATH.exists()):
+        st.markdown("1. Vai su **historicdata.betfair.com** con il tuo account Betfair, sezione *My Data*.\n"
+                    "2. Scegli lo sport (*Tennis* o *Soccer*), il piano **BASIC** (gratuito), il periodo e il mercato **Match Odds**.\n"
+                    "3. Scarica l'archivio `.tar` e indica qui sotto dove l'hai salvato (va bene anche una cartella con più archivi).")
+        a, b = st.columns([4, 1.2])
+        where = a.text_input("File o cartella sul Mac", placeholder="es. ~/Downloads/data.tar", label_visibility="collapsed")
+        if b.button("Importa", type="primary", icon=":material/upload:", width="stretch"):
+            target = Path(where).expanduser() if where.strip() else None
+            if target is None or not target.exists():
+                st.warning("Percorso non trovato: controlla il nome del file o della cartella.")
+            else:
+                with st.spinner("Leggo i mercati (può richiedere qualche minuto per archivi grandi)..."):
+                    stats = bf.import_path(target)
+                _flash(f"{stats['imported']} mercati importati, {stats['skipped']} già presenti, {stats['ignored']} ignorati "
+                       f"(non Match Odds, non conclusi o senza fase in-play) su {stats['files']} file.")
+        st.caption("Il piano BASIC riporta l'ultimo prezzo scambiato circa una volta al minuto: basta per il cash out, non per "
+                   "lo scalping punto per punto. I dati importati restano in `data/betfair.duckdb`.")
+    runners, prices = bf.load()
+    if runners.empty:
+        st.info("Nessun dato importato. Finché non importi i dati di Betfair, il cash out del Backtester usa il modello "
+                "stimato (intervallo / primo set); qui potrai verificarlo sui prezzi reali.")
+        return
+    with st.container(border=True):
+        c = st.columns([1.3, 1.6, 1, 1, 1])
+        sport = c[0].multiselect("Sport", sorted(runners["sport"].unique()), format_func=SPORT_LABEL.get, placeholder="tutti")
+        role = c[1].multiselect("Selezione", ["favourite", "underdog", "draw"], default=["favourite"],
+                                format_func={"favourite": "Favorito", "underdog": "Sfavorito", "draw": "Pareggio"}.get)
+        side = c[2].radio("Modalità", ["back", "lay"], format_func={"back": "Back", "lay": "Lay"}.get, horizontal=True)
+        omin = c[3].number_input("Quota min", 1.01, 1000.0, 1.01, 0.05)
+        omax = c[4].number_input("Quota max", 1.01, 1000.0, 50.0, 0.05)
+        c = st.columns([1.2, 1, 1.2, 1, 1.4, 1, 1])
+        use_tp = c[0].checkbox("Incassa in profitto", value=True)
+        tp = c[1].number_input("da +%", 1.0, 500.0, 30.0, 5.0, disabled=not use_tp)
+        use_sl = c[2].checkbox("Taglia in perdita", value=False)
+        sl = c[3].number_input("da -%", 1.0, 99.0, 50.0, 5.0, disabled=not use_sl)
+        minutes = c[4].number_input("Esci dopo minuti (0 = mai)", 0, 300, 0, 5)
+        spread = c[5].number_input("Spread %", 0.0, 5.0, 0.5, 0.1)
+        comm = c[6].number_input("Commissione %", 0.0, 20.0, 2.0, 0.5)
+    filters = {"sport": sport, "role": role, "odds_min": omin, "odds_max": omax}
+    t = bf.simulate(runners, prices, side, tp if use_tp else None, sl if use_sl else None, minutes or None, spread, comm / 100, filters)
+    if t.empty:
+        st.warning("Nessuna selezione soddisfa i criteri.")
+        return
+    hold = t.assign(pnl=t["pnl_hold"])
+    hold["equity"] = hold["pnl"].cumsum()
+    m, mh = bt.compute_metrics(t, 100.0), bt.compute_metrics(hold, 100.0)
+    closed = int((t["cashout"] != "").sum())
+    kpis([("ROI con cash out", f"{m['roi_pct']:+.2f}%", f"tenendo fino alla fine: {mh['roi_pct']:+.2f}%", sign_tone(m["roi_pct"])),
+          ("Effetto sul profitto", f"{m['profit'] - mh['profit']:+.2f} u", f"su {num_it(m['trades'])} operazioni", sign_tone(m["profit"] - mh["profit"])),
+          ("Chiuse in anticipo", f"{closed / len(t) * 100:.0f}%", f"{num_it(closed)} operazioni", None),
+          ("Max drawdown", f"-{m['max_dd_units']:.1f} u", f"tenendo: -{mh['max_dd_units']:.1f} u", "good" if m["max_dd_units"] < mh["max_dd_units"] else None),
+          ("Mercati importati", num_it(runners["market_id"].nunique()), f"{runners['n_prices'].mean():.0f} prezzi in media per selezione", None)],
+         hero_spark=t["equity"].to_numpy())
+    show(equity_chart(t, by_trade=True).update_layout(title_text="Profitto cumulato con cash out (unità), per operazione"))
+    labels = {"": "Tenuta fino alla fine", "tp": "Incassata in profitto", "sl": "Tagliata in perdita", "time": "Chiusa a tempo"}
+    by = t.groupby("cashout").agg(operazioni=("pnl", "size"), profitto=("pnl", "sum"), tenendole=("pnl_hold", "sum"),
+                                  minuto_medio=("exit_minute", "mean")).reset_index()
+    by["cashout"] = by["cashout"].map(labels)
+    st.subheader("Per tipo di chiusura")
+    st.dataframe(by.rename(columns={"cashout": "esito"}), hide_index=True, width="stretch", column_config={
+        "profitto": st.column_config.NumberColumn("profitto (u)", format="%+.2f"), "tenendole": st.column_config.NumberColumn("tenendole (u)", format="%+.2f"),
+        "minuto_medio": st.column_config.NumberColumn("minuto medio di chiusura", format="%.0f")})
+    st.subheader("Confronto delle soglie")
+    if st.toggle("Prova tutte le combinazioni di incasso e taglio", help="Qualche secondo di calcolo."):
+        grid = bf.threshold_grid(runners, prices, side, spread, comm / 100, filters)
+        st.dataframe(grid.sort_values("roi_pct", ascending=False), hide_index=True, width="stretch", height=420, column_config={
+            "incassa_da": "incassa da", "taglia_da": "taglia da", "chiuse_pct": st.column_config.NumberColumn("chiuse %", format="%.0f"),
+            "roi_pct": st.column_config.NumberColumn("ROI %", format="%+.2f"), "profit": st.column_config.NumberColumn("profitto (u)", format="%+.1f"),
+            "max_dd": st.column_config.NumberColumn("max drawdown (u)", format="%.1f")})
+    st.caption("Ingresso all'ultimo prezzo scambiato prima dell'inizio; il cash out scatta alla prima rilevazione in cui il suo "
+               "valore supera la soglia. Con una rilevazione al minuto il prezzo di uscita reale può essere stato migliore o "
+               "peggiore di quello registrato. Pochi mercati importati danno risultati molto variabili: servono centinaia di "
+               "partite prima di trarre conclusioni.")
+
+
 # --------------------------------------------------------------------------- pagina: rischio
 def page_risk() -> None:
     header("Rischio", "Simulazione Monte Carlo del bankroll sull'ultima strategia testata.")
@@ -2059,6 +2142,7 @@ PAGES = {
     "backtester": st.Page(page_backtester, title="Backtester", icon=":material/query_stats:", url_path="backtester", default=True),
     "today": st.Page(page_today, title="Oggi", icon=":material/today:", url_path="oggi"),
     "scalping": st.Page(page_scalping, title="Scalping", icon=":material/sports_tennis:", url_path="scalping"),
+    "live": st.Page(page_live, title="Quote reali", icon=":material/show_chart:", url_path="quote-reali"),
     "risk": st.Page(page_risk, title="Rischio", icon=":material/casino:", url_path="risk"),
     "vault": st.Page(page_vault, title="Strategie", icon=":material/bookmark:", url_path="vault"),
     "ledger": st.Page(page_ledger, title="Registro", icon=":material/receipt_long:", url_path="registro"),
