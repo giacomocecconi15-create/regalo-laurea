@@ -428,6 +428,8 @@ def scan(upload: pd.DataFrame, vault: dict, bankroll: float, con=None, method: s
                 p = cashout.tennis_checkpoint_prob(hit.assign(set1_won=1.0 if set_states[0] == "Vinto" else 0.0,
                                                               best_of=hit["best_of"].fillna(3)))
                 live_q = bt.live_odds(p, "lay" if lay else "back", float(cfg.get("live_margin", bt.LIVE_MARGIN)))
+            if cfg.get("live_odds_override"):
+                live_q = np.full(len(hit), float(cfg["live_odds_override"]))
         rows.append(pd.DataFrame({
             "strategia": name, "data": hit["date"].dt.strftime("%Y-%m-%d").to_numpy(), "evento": hit["event"].to_numpy(),
             "competizione": hit["competition"].to_numpy(), "selezione": hit["pick"].to_numpy(),

@@ -48,9 +48,9 @@ DEFAULTS = {
     "stop_loss": False, "sl_pct": 50.0,                  # taglia se il cash out vale al massimo -sl% del rischio
     "margin_pct": 5.0,                                   # margine trattenuto sul cash out
 }
-REASONS = {"": "Tenuta fino alla fine", "tp": "Incassata in profitto", "sl": "Tagliata in perdita",
-           "win_early": "Vincente incassata prima", "win_panic": "Vincente chiusa in perdita",
-           "lose_saved": "Perdente chiusa in profitto", "lose_cut": "Perdente tagliata"}
+REASONS = {"": "Tenuta fino alla fine", "tp": "Take profit (soglia)", "sl": "Stop loss (soglia)", "time": "Chiusa a tempo",
+           "win_early": "Take profit", "win_panic": "Uscita errata in perdita",
+           "lose_saved": "Uscita anticipata in utile", "lose_cut": "Stop loss"}
 
 
 def settings(cfg: dict | None) -> dict:

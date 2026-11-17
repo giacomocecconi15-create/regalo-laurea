@@ -26,7 +26,7 @@ Uso manuale:
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python src/update_data.py        # scarica / aggiorna il database
-.venv/bin/python -m pytest tests -q        # 77 test
+.venv/bin/python -m pytest tests -q        # 79 test
 .venv/bin/python -m streamlit run app.py   # dashboard
 ```
 
@@ -237,6 +237,16 @@ scattare in altri momenti. Chiudere prima costa il margine, quindi in media ridu
 in utile: quale quota di giocate perdenti va tagliata, per ogni livello di puntata recuperata, e una griglia del ROI
 atteso. È la soglia teorica (presume di chiudere solo giocate che avrebbero perso); un campo permette di aggiungere il
 costo delle vincenti chiuse per errore.
+
+**Terminologia e mappa.** Le regole manuali usano i termini del trading: *Frequenza Take Profit* e *% Profitto Incassato*,
+*Frequenza Stop Loss* e *% Rischio Recuperato*, più le uscite errate e le uscite anticipate in utile; ogni campo ha una
+spiegazione (?). Nella vista *Cash out* la mappa di calore incrocia % Profitto Incassato (orizzontale) e % Rischio
+Recuperato (verticale), con le due frequenze regolabili da cursori: verde = utile, rosso = perdita, e un bordo bianco
+segna la frontiera di pareggio.
+
+**Quota di ingresso.** Senza filtri live ogni operazione entra alla propria quota pre-partita (il Riepilogo lo indica,
+con la quota mediana del campione). Con filtri live la quota stimata si può sostituire con una quota fissa scelta a mano
+(*Modifica manualmente quota live stimata*); se si discosta di oltre il 10% dalla stima compare un avviso.
 
 Nel **Registro** una giocata reale si può chiudere come *Cash out* indicando a mano il profitto o la perdita
 effettivamente incassati.

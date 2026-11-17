@@ -539,12 +539,15 @@ def backtest_selections(sel: pd.DataFrame, cfg: dict, bankroll: float = 100.0) -
     point = entry_point(cfg)
     live = None
     side = cfg.get("side", "back")
+    override = cfg.get("live_odds_override")
+    override = float(override) if override not in (None, "", 0) and float(override) > 1 else None
     if point is not None and len(picked):
         p = live_prob(picked, point)
         picked = picked.assign(pre_odds=picked["odds"], live_prob=p)[np.isfinite(p)]
         p = picked["live_prob"].to_numpy()
-        picked = picked.assign(odds=live_odds(p, side, float(cfg.get("live_margin", LIVE_MARGIN))),
-                               close_odds=np.nan, p_close=np.nan)
+        # quota live: stimata dal modello, oppure quella inserita a mano (uguale per tutte le operazioni)
+        odds = np.full(len(picked), override) if override else live_odds(p, side, float(cfg.get("live_margin", LIVE_MARGIN)))
+        picked = picked.assign(odds=odds, close_odds=np.nan, p_close=np.nan)
     trades = settle(picked, side, float(cfg.get("commission") or 0.0),
                     cfg.get("lay_mode", "liability"), float(cfg.get("stake") or 1.0))
     smart_skipped = False
@@ -558,7 +561,9 @@ def backtest_selections(sel: pd.DataFrame, cfg: dict, bankroll: float = 100.0) -
         live = {"entry": point, "label": ENTRY_LABEL[point], "avg_pre_odds": float(trades["pre_odds"].mean()),
                 "avg_live_odds": float(trades["odds"].median()), "real_win_pct": float(trades["won"].mean() * 100),
                 "est_prob_pct": float(trades["live_prob"].mean() * 100), "pre_implied_pct": float(pre_p.mean() * 100),
-                "margin_pct": float(cfg.get("live_margin", LIVE_MARGIN)), "smart_cashout_skipped": smart_skipped}
+                "margin_pct": float(cfg.get("live_margin", LIVE_MARGIN)), "smart_cashout_skipped": smart_skipped,
+                "override": override,
+                "est_live_odds": float(np.median(live_odds(trades["live_prob"].to_numpy(), side, float(cfg.get("live_margin", LIVE_MARGIN)))))}
     return BacktestResult(cfg, trades, compute_metrics(trades, bankroll), monthly_returns(trades), live)
 
 

@@ -1396,3 +1396,30 @@ def test_live_estimates_match_real_frequencies(con):
     o = bt.load_selections("football", "ou25", "avg", "open", con)
     for _, r in bt.conditional_stats(bt.apply_filters(o, {"selection": ["over"]}), "football")["Gol nel primo tempo"].iterrows():
         assert abs(r["vince_pct"] - r["stimata_live_pct"]) < 1.5, r["situazione"]
+
+
+# ------------------------------------------------------------------ mappa del cash out e quota live manuale
+def test_breakeven_matrix():
+    t = bt.settle(make_sel([2.0, 2.0, 3.0, 1.5], [True, False, False, True]))      # profitto tenendo: +1 -1 -1 +0.5 = -0.5
+    be = an.breakeven(t)
+    grid = an.breakeven_matrix(be, tp_freq=50, sl_freq=40)
+    assert list(grid.index) == list(range(0, 101, 10)) and list(grid.columns) == list(range(0, 101, 10))
+    assert grid.loc[0, 100] == pytest.approx(be["roi_hold_pct"])                      # niente recupero, profitto pieno = tenere
+    assert grid.loc[50, 70] == pytest.approx(an.breakeven_custom(be, 40, 50, 50, 70))
+    expected = (-0.5 + 0.4 * 0.5 * 2.0 - 0.5 * 0.3 * 1.5) / 4 * 100
+    assert grid.loc[50, 70] == pytest.approx(expected)
+    assert (grid.diff(axis=0).iloc[1:] >= 0).all().all() and (grid.diff(axis=1).iloc[:, 1:] >= 0).all().all()   # piu' recuperi/incassi, meglio
+
+
+def test_manual_live_odds_override():
+    m = tennis_frame().assign(score=["6-4 6-2", "6-1 6-1", "6-4 3-6 6-2"], status="Completed")
+    s = bt.tennis_selections(m, "avg")
+    cfg = {"sport": "tennis", "selection": ["underdog"], "odds_min": 2.6, "odds_max": 4.0, "filters": {"ip_set1": {"in": ["Vinto"]}}}
+    auto = bt.backtest_selections(s, cfg)
+    manual = bt.backtest_selections(s, {**cfg, "live_odds_override": 1.80})
+    assert manual.trades["odds"].tolist() == [1.80] and manual.trades["pnl"].iloc[0] == pytest.approx(0.80)
+    assert manual.live["override"] == 1.80 and manual.live["est_live_odds"] == pytest.approx(auto.trades["odds"].iloc[0])
+    assert manual.trades["live_prob"].iloc[0] == pytest.approx(auto.trades["live_prob"].iloc[0])   # la stima resta visibile
+    assert bt.backtest_selections(s, {**cfg, "live_odds_override": None}).live["override"] is None
+    no_live = bt.backtest_selections(s, {**cfg, "filters": {}, "live_odds_override": 1.80})
+    assert no_live.live is None and sorted(no_live.trades["odds"]) == sorted(s[s["selection"] == "underdog"].query("odds >= 2.6 and odds <= 4")["odds"])

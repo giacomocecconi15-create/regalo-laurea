@@ -180,6 +180,14 @@ def breakeven_custom(be: dict, cut_share: float, recover: float, early_share: fl
     return profit / be["total_risk"] * 100
 
 
+def breakeven_matrix(be: dict, tp_freq: float, sl_freq: float, keeps=range(0, 101, 10), recovers=range(0, 101, 10)) -> pd.DataFrame:
+    """ROI atteso (%) per ogni coppia (% profitto incassato, % rischio recuperato), con frequenze fisse di
+    take profit (quota delle vincenti chiuse prima) e di stop loss (quota delle perdenti tagliate).
+    Righe = % rischio recuperato, colonne = % profitto incassato."""
+    return pd.DataFrame([[breakeven_custom(be, sl_freq, r, tp_freq, k) for k in keeps] for r in recovers],
+                        index=list(recovers), columns=list(keeps))
+
+
 # --------------------------------------------------------------------------- monitor delle strategie
 def strategy_monitor(vault: dict, load_selections, bankroll: float = 100.0) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Riesegue ogni strategia salvata sui dati correnti e confronta il periodo recente con lo storico.

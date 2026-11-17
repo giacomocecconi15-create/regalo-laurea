@@ -180,6 +180,9 @@ def apply_pending() -> None:
     ss["bt_omax"] = float(cfg.get("odds_max") or 50.0)
     ss["bt_excl"] = bool(cfg.get("exclude_retirements"))
     ss["bt_live_margin"] = float(cfg.get("live_margin", bt.LIVE_MARGIN))
+    ss["bt_live_override_on"] = bool(cfg.get("live_odds_override"))
+    if cfg.get("live_odds_override"):
+        ss["bt_live_override"] = float(cfg["live_odds_override"])
     saved = cfg.get("cashout") or {}
     ss["bt_co_mode"] = saved.get("mode") if saved.get("mode") in ("off", "manual", "smart") else "off"
     for k, v in saved.items():
@@ -709,10 +712,10 @@ def _load_preset() -> None:
 def describe_cashout(cfg: dict) -> str:
     c = co.settings(cfg)
     if c["mode"] == "manual":
-        parts = [f"{title.lower()} {c[sk]:g}%" for sk, _, title, _ in CO_MANUAL if c[sk] > 0]
+        parts = [f"{title.lower()} {c[sk]:g}%" for sk, _, title, *_ in CO_MANUAL if c[sk] > 0]
         return "cash out manuale: " + (", ".join(parts) if parts else "nessuna regola attiva")
     if c["mode"] == "smart":
-        parts = ([f"incassa da +{c['tp_pct']:g}%"] if c["take_profit"] else []) + ([f"taglia da -{c['sl_pct']:g}%"] if c["stop_loss"] else [])
+        parts = ([f"take profit da +{c['tp_pct']:g}%"] if c["take_profit"] else []) + ([f"stop loss da -{c['sl_pct']:g}%"] if c["stop_loss"] else [])
         return "cash out intelligente: " + (", ".join(parts) if parts else "nessuna regola attiva") + f", margine {c['margin_pct']:g}%"
     return ""
 
@@ -748,11 +751,19 @@ def _filter_widget(sport: str, spec: tuple, sel: pd.DataFrame) -> dict | None:
 
 
 CO_MODES = {"off": "No", "manual": "Manuale", "smart": "Intelligente"}
-CO_MANUAL = [  # (chiave quota, chiave importo, titolo, etichetta importo)
-    ("win_early_share", "win_early_keep", "Vincenti incassate prima", "% del profitto incassata"),
-    ("win_panic_share", "win_panic_loss", "Vincenti chiuse in perdita", "% della puntata persa"),
-    ("lose_saved_share", "lose_saved_gain", "Perdenti chiuse in profitto", "% del profitto potenziale"),
-    ("lose_cut_share", "lose_cut_recover", "Perdenti tagliate", "% della puntata recuperata"),
+CO_MANUAL = [  # (chiave frequenza, chiave importo, titolo, etichetta frequenza, etichetta importo, aiuto frequenza, aiuto importo)
+    ("win_early_share", "win_early_keep", "Take profit", "Frequenza Take Profit (%)", "% Profitto Incassato",
+     "Su 100 giocate che sarebbero state vinte, quante chiudi prima incassando il profitto.",
+     "Quanto del profitto pieno incassi chiudendo prima: 70 = incassi il 70% di quello che avresti vinto tenendo."),
+    ("lose_cut_share", "lose_cut_recover", "Stop loss", "Frequenza Stop Loss (%)", "% Rischio Recuperato",
+     "Su 100 giocate che sarebbero state perse, quante tagli prima della fine.",
+     "Quanto dell'importo a rischio recuperi tagliando: 40 = perdi il 60% invece del 100%."),
+    ("win_panic_share", "win_panic_loss", "Uscita errata", "Frequenza uscita errata (%)", "% Rischio perso",
+     "Su 100 giocate che sarebbero state vinte, quante chiudi per errore in perdita (per esempio dopo un break subito).",
+     "Quanto dell'importo a rischio perdi in quelle chiusure sbagliate."),
+    ("lose_saved_share", "lose_saved_gain", "Uscita anticipata in utile", "Frequenza uscita in utile (%)", "% Profitto incassato",
+     "Su 100 giocate che sarebbero state perse, quante riesci a chiudere in utile prima che girino.",
+     "Quanto del profitto potenziale incassi in quei casi."),
 ]
 
 
@@ -766,14 +777,14 @@ def cashout_controls(sb, sport: str) -> dict:
     out = {"mode": mode}
     if mode == "manual":
         with sb.expander("Regole manuali", expanded=True):
-            st.caption("Per ogni caso: quante giocate su 100 chiudi così, e a quanto.")
-            for share_k, amount_k, title, amount_label in CO_MANUAL:
+            st.caption("Per ogni regola: la frequenza (quante giocate su 100) e l'importo della chiusura.")
+            for share_k, amount_k, title, share_label, amount_label, share_help, amount_help in CO_MANUAL:
                 st.markdown(f"<small><b>{title}</b></small>", unsafe_allow_html=True)
                 a, b = st.columns(2)
                 ss.setdefault(f"bt_co_{share_k}", float(co.DEFAULTS[share_k]))
                 ss.setdefault(f"bt_co_{amount_k}", float(co.DEFAULTS[amount_k]))
-                out[share_k] = a.number_input("% di giocate", 0.0, 100.0, step=5.0, key=f"bt_co_{share_k}")
-                out[amount_k] = b.number_input(amount_label, 0.0, 100.0, step=5.0, key=f"bt_co_{amount_k}")
+                out[share_k] = a.number_input(share_label, 0.0, 100.0, step=5.0, key=f"bt_co_{share_k}", help=share_help)
+                out[amount_k] = b.number_input(amount_label, 0.0, 100.0, step=5.0, key=f"bt_co_{amount_k}", help=amount_help)
             ss.setdefault("bt_co_seed", 1)
             out["seed"] = int(st.number_input("Seme della scelta casuale", 1, 9999, step=1, key="bt_co_seed",
                                               help="Quali giocate vengono chiuse è casuale ma ripetibile. Cambia il seme per vedere "
@@ -784,13 +795,17 @@ def cashout_controls(sb, sport: str) -> dict:
             st.caption(f"Il valore del cash out è stimato {point}, dal risultato reale a quel punto.")
             ss.setdefault("bt_co_take_profit", True)
             ss.setdefault("bt_co_tp_pct", float(co.DEFAULTS["tp_pct"]))
-            out["take_profit"] = st.checkbox("Incassa se sei in profitto", key="bt_co_take_profit")
-            out["tp_pct"] = st.number_input("Profitto minimo per incassare (% del rischio)", 1.0, 500.0, step=5.0, key="bt_co_tp_pct",
+            out["take_profit"] = st.checkbox("Take Profit automatico", key="bt_co_take_profit",
+                                             help="Chiude in utile quando il cash out vale almeno la soglia indicata.")
+            out["tp_pct"] = st.number_input("Soglia Take Profit (% del rischio)", 1.0, 500.0, step=5.0, key="bt_co_tp_pct",
+                                            help="30 = chiude quando incasseresti almeno il 30% dell'importo a rischio.",
                                             disabled=not out["take_profit"])
             ss.setdefault("bt_co_stop_loss", False)
             ss.setdefault("bt_co_sl_pct", float(co.DEFAULTS["sl_pct"]))
-            out["stop_loss"] = st.checkbox("Taglia se sei in perdita", key="bt_co_stop_loss")
-            out["sl_pct"] = st.number_input("Perdita che fa scattare il taglio (% del rischio)", 1.0, 99.0, step=5.0, key="bt_co_sl_pct",
+            out["stop_loss"] = st.checkbox("Stop Loss automatico", key="bt_co_stop_loss",
+                                           help="Chiude in perdita quando il cash out scende sotto la soglia indicata.")
+            out["sl_pct"] = st.number_input("Soglia Stop Loss (% del rischio)", 1.0, 99.0, step=5.0, key="bt_co_sl_pct",
+                                            help="50 = chiude quando la perdita raggiunge il 50% dell'importo a rischio (ne recuperi il 50%).",
                                             disabled=not out["stop_loss"])
             ss.setdefault("bt_co_margin_pct", float(co.DEFAULTS["margin_pct"]))
             out["margin_pct"] = st.number_input("Margine del cash out (%)", 0.0, 30.0, step=1.0, key="bt_co_margin_pct",
@@ -860,6 +875,12 @@ def sidebar_config() -> dict:
                 if rule:
                     filters[spec[0]] = rule
             if group == "In partita":
+                ss.setdefault("bt_live_override_on", False)
+                on = st.toggle("Modifica manualmente quota live stimata", key="bt_live_override_on",
+                               help="Sostituisce la quota live stimata con una quota fissa scelta da te, uguale per tutte le "
+                                    "operazioni. Ha effetto solo con almeno un filtro in partita attivo.")
+                ss.setdefault("bt_live_override", 1.50)
+                st.number_input("Quota live di entrata", 1.01, 1000.0, step=0.05, key="bt_live_override", disabled=not on)
                 ss.setdefault("bt_live_margin", bt.LIVE_MARGIN)
                 st.number_input("Margine sulle quote in partita (%)", 0.0, 15.0, step=0.5, key="bt_live_margin",
                                 help="Quanto la quota live disponibile è peggiore di quella equa stimata. Su Betfair 1-3%, "
@@ -882,6 +903,7 @@ def sidebar_config() -> dict:
         "odds_min": odds_min, "odds_max": odds_max, "date_from": str(d_from), "date_to": str(d_to),
         "exclude_retirements": bool(excl), "filters": filters, "cashout": cash,
         "live_margin": float(ss.get("bt_live_margin", bt.LIVE_MARGIN)),
+        "live_odds_override": float(ss["bt_live_override"]) if ss.get("bt_live_override_on") else None,
     }
 
 
@@ -954,16 +976,28 @@ def tab_summary(cfg: dict, res: bt.BacktestResult, bank: float) -> None:
            f"quota live mediana {trades['odds'].median():.2f}" if res.live else f"quota media {m['avg_odds']:.2f}", None),
           ("Operazioni", num_it(m["trades"]), f"serie negativa max {m['longest_losing_streak']}", None)],
          hero_spark=trades["equity"].to_numpy())
+    if not res.live:
+        st.info(f"**Info:** nessun filtro live (Set/Break/Intervallo) attivo: ogni operazione entra alla propria quota "
+                f"iniziale pre-partita. Quota iniziale mediana del campione: **{trades['odds'].median():.2f}**.", icon=":material/info:")
     if res.live:
         L = res.live
         kpis([("Quota media pre-partita", f"{L['avg_pre_odds']:.2f}", f"probabilità implicita {L['pre_implied_pct']:.1f}%", None),
-              ("Quota live di entrata (stimata)", f"{L['avg_live_odds']:.2f}", f"mediana, {L['label'].split(' (')[0]}, margine {L['margin_pct']:g}%", None),
+              (("Quota live di entrata (manuale)", f"{L['override']:.2f}", f"stimata dal modello: {L['est_live_odds']:.2f} (mediana)", None)
+               if L.get("override") else
+               ("Quota live di entrata (stimata)", f"{L['avg_live_odds']:.2f}", f"mediana, {L['label'].split(' (')[0]}, margine {L['margin_pct']:g}%", None)),
               ("Vittorie reali", f"{L['real_win_pct']:.1f}%", "frequenza esatta nello storico", None),
               ("Probabilità stimata al momento", f"{L['est_prob_pct']:.1f}%", "quella che la quota live sconta",
                sign_tone(L["real_win_pct"] - L["est_prob_pct"]))])
         st.caption(f":material/schedule: Ingresso **{L['label']}**: i filtri di quota valgono sulle quote pre-partita, ma l'operazione "
                    "si apre al prezzo live stimato in quel momento, quindi ROI e profitto non usano informazioni future. Le vittorie "
                    "sono conteggi esatti; la quota live è una stima tarata sui risultati reali (vedi vista *In partita*).")
+        if L.get("override") and abs(L["override"] / L["est_live_odds"] - 1) > 0.10:
+            st.warning(f"La quota live manuale ({L['override']:.2f}) è lontana dalla stima del modello ({L['est_live_odds']:.2f}). "
+                       "Il ROI risultante vale solo se nella realtà trovi davvero quella quota in quel momento della partita: "
+                       "con una quota più alta della stima il risultato è ottimistico.")
+        if L.get("override"):
+            st.caption(f":material/edit: Quota live impostata a mano a {L['override']:.2f} per tutte le operazioni, al posto della stima "
+                       f"del modello (mediana {L['est_live_odds']:.2f}). Le vittorie restano quelle reali.")
         if L.get("smart_cashout_skipped"):
             st.warning("Il cash out intelligente non viene applicato: il suo punto di controllo (intervallo / primo set) coincide "
                        "con l'ingresso live. Usa il cash out manuale per simulare chiusure successive.")
@@ -1085,6 +1119,31 @@ def tab_robustness(cfg: dict, res: bt.BacktestResult, sel_args: tuple, bank: flo
                    "Il *massimo mercato* è il tetto raggiungibile avendo conti su molti bookmaker.")
 
 
+def roi_heatmap(grid: pd.DataFrame, roi_hold: float) -> go.Figure:
+    """Mappa di calore del ROI atteso: rosso per i valori negativi, verde per i positivi, grigio intorno allo zero."""
+    z = grid.to_numpy(dtype=float)
+    lim = max(float(np.nanmax(np.abs(z))), 1.0)
+    fig = go.Figure(go.Heatmap(
+        z=z, x=[f"{k}%" for k in grid.columns], y=[f"{r}%" for r in grid.index], zmid=0, zmin=-lim, zmax=lim,
+        colorscale=[[0.0, "#b3261e"], [0.35, "#7a2f2b"], [0.5, "#2a3140"], [0.65, "#1f6b2a"], [1.0, "#16a34a"]],
+        text=[[f"{v:+.1f}" for v in row] for row in z], texttemplate="%{text}", textfont=dict(size=11, color=INK),
+        xgap=2, ygap=2, colorbar=dict(title=dict(text="ROI %", font=dict(color=MUTED, size=11)), tickfont=dict(color=MUTED), ticksuffix="%"),
+        hovertemplate="profitto incassato %{x}<br>rischio recuperato %{y}<br>ROI atteso %{z:+.2f}%<extra></extra>"))
+    base_layout(fig, 470, f"ROI atteso (%) - tenendo tutto fino alla fine: {roi_hold:+.2f}%")
+    fig.update_layout(hovermode="closest", margin=dict(l=70, r=20, t=52, b=56))
+    fig.update_xaxes(title_text="% Profitto Incassato (take profit)", title_font=dict(color=MUTED, size=11), type="category",
+                     showgrid=False, ticks="")
+    fig.update_yaxes(title_text="% Rischio Recuperato (stop loss)", title_font=dict(color=MUTED, size=11), type="category",
+                     showgrid=False)
+    # frontiera di pareggio: per ogni riga, la prima cella (da sinistra) in cui il ROI diventa >= 0
+    for i, row in enumerate(z):
+        hit = np.flatnonzero(row >= 0)
+        if len(hit):
+            j = int(hit[0])
+            fig.add_shape(type="rect", x0=j - 0.5, x1=j + 0.5, y0=i - 0.5, y1=i + 0.5, line=dict(color=INK, width=2), xref="x", yref="y")
+    return fig
+
+
 def breakeven_panel(trades: pd.DataFrame) -> None:
     """Quanto bisogna spingersi con le chiusure perche' la strategia vada in utile."""
     be = an.breakeven(trades)
@@ -1102,22 +1161,19 @@ def breakeven_panel(trades: pd.DataFrame) -> None:
           ("Per andare in pari", headline, note, tone),
           ("Perdenti", num_it(be["n_lost"]), f"{num_it(be['lost_risk'])} u perse tenendole", None),
           ("Vincenti", num_it(be["n_won"]), f"{num_it(be['won_profit'])} u vinte tenendole", None)])
-    a, b = st.columns([3, 2])
-    with a:
-        st.caption("ROI atteso (%) tagliando una quota delle giocate perdenti (colonne) e recuperando una parte della puntata (righe).")
-        st.dataframe(be["grid"].style.format("{:+.1f}").map(
-            lambda v: f"color:{GOOD}" if v > 0 else f"color:{MUTED}"), width="stretch")
-    with b:
-        st.caption("Prova una combinazione (valore atteso, senza sorte):")
-        c1, c2 = st.columns(2)
-        cut = c1.number_input("Perdenti tagliate %", 0.0, 100.0, 20.0, 5.0, key="be_cut")
-        rec = c2.number_input("Puntata recuperata %", 0.0, 100.0, 50.0, 5.0, key="be_rec")
-        early = c1.number_input("Vincenti incassate prima %", 0.0, 100.0, 0.0, 5.0, key="be_early")
-        keep = c2.number_input("Profitto incassato %", 0.0, 100.0, 70.0, 5.0, key="be_keep")
-        roi = an.breakeven_custom(be, cut, rec, early, keep)
-        kpis([("ROI atteso", f"{roi:+.2f}%", f"contro {be['roi_hold_pct']:+.2f}% tenendo tutto", sign_tone(roi))])
+    st.subheader("Mappa del ROI con cash out")
+    c1, c2 = st.columns(2)
+    tp_freq = c1.slider("Frequenza Take Profit (%)", 0, 100, 30, 5, key="be_tp",
+                        help="Su 100 giocate che sarebbero state vinte, quante chiudi prima incassando il profitto.")
+    sl_freq = c2.slider("Frequenza Stop Loss (%)", 0, 100, 20, 5, key="be_sl",
+                        help="Su 100 giocate che sarebbero state perse, quante tagli prima della fine.")
+    show(roi_heatmap(an.breakeven_matrix(be, tp_freq, sl_freq), be["roi_hold_pct"]))
+    st.caption("Ogni cella è il ROI atteso con le frequenze scelte sopra: in orizzontale quanto del profitto incassi con il take "
+               "profit, in verticale quanto del rischio recuperi con lo stop loss. Verde = utile, rosso = perdita, grigio = pari. "
+               "Il bordo bianco è la **frontiera di pareggio**: per ogni livello di rischio recuperato, il minimo profitto da incassare "
+               "per non andare in perdita. È un valore atteso calcolato sullo storico, senza sorte.")
     st.caption(":material/warning: Questa è la soglia teorica: presume che tu chiuda solo giocate che avrebbero perso. Nella realtà, per "
-               "tagliare le perdenti chiudi per errore anche alcune vincenti: usa il campo *vincenti incassate prima* (o le regole "
+               "tagliare le perdenti chiudi per errore anche alcune vincenti: alza la *Frequenza Take Profit* nella mappa (o usa le regole "
                "manuali nel pannello laterale, che includono anche le vincenti chiuse in perdita) per vedere quanto margine ti resta. "
                "Se il pareggio richiede di riconoscere in anticipo gran parte delle perdenti, la strategia non ha un vantaggio suo.")
 
@@ -1159,7 +1215,7 @@ def tab_cashout(cfg: dict, res: bt.BacktestResult, sel_args: tuple, bank: float)
                    "regge in entrambe le metà del periodo: diffida delle combinazioni buone in una sola.")
         grid = co.threshold_grid(hold, cfg)
         st.dataframe(grid.sort_values("roi_pct", ascending=False), hide_index=True, width="stretch", height=420, column_config={
-            "incassa_da": "incassa da", "taglia_da": "taglia da",
+            "incassa_da": "take profit da", "taglia_da": "stop loss da",
             "chiuse_pct": st.column_config.NumberColumn("giocate chiuse %", format="%.0f"),
             "roi_pct": st.column_config.NumberColumn("ROI %", format="%+.2f"), "profit": st.column_config.NumberColumn("profitto (u)", format="%+.1f"),
             "max_dd": st.column_config.NumberColumn("max drawdown (u)", format="%.1f"),
@@ -1591,10 +1647,10 @@ def page_live() -> None:
         omin = c[3].number_input("Quota min", 1.01, 1000.0, 1.01, 0.05)
         omax = c[4].number_input("Quota max", 1.01, 1000.0, 50.0, 0.05)
         c = st.columns([1.2, 1, 1.2, 1, 1.4, 1, 1])
-        use_tp = c[0].checkbox("Incassa in profitto", value=True)
-        tp = c[1].number_input("da +%", 1.0, 500.0, 30.0, 5.0, disabled=not use_tp)
-        use_sl = c[2].checkbox("Taglia in perdita", value=False)
-        sl = c[3].number_input("da -%", 1.0, 99.0, 50.0, 5.0, disabled=not use_sl)
+        use_tp = c[0].checkbox("Take Profit", value=True, help="Chiude in utile alla prima rilevazione in cui il cash out vale almeno la soglia.")
+        tp = c[1].number_input("soglia +%", 1.0, 500.0, 30.0, 5.0, disabled=not use_tp)
+        use_sl = c[2].checkbox("Stop Loss", value=False, help="Chiude in perdita alla prima rilevazione in cui il cash out scende sotto la soglia.")
+        sl = c[3].number_input("soglia -%", 1.0, 99.0, 50.0, 5.0, disabled=not use_sl)
         minutes = c[4].number_input("Esci dopo minuti (0 = mai)", 0, 300, 0, 5)
         spread = c[5].number_input("Spread %", 0.0, 5.0, 0.5, 0.1)
         comm = c[6].number_input("Commissione %", 0.0, 20.0, 2.0, 0.5)
@@ -1614,7 +1670,7 @@ def page_live() -> None:
           ("Mercati importati", num_it(runners["market_id"].nunique()), f"{runners['n_prices'].mean():.0f} prezzi in media per selezione", None)],
          hero_spark=t["equity"].to_numpy())
     show(equity_chart(t, by_trade=True).update_layout(title_text="Profitto cumulato con cash out (unità), per operazione"))
-    labels = {"": "Tenuta fino alla fine", "tp": "Incassata in profitto", "sl": "Tagliata in perdita", "time": "Chiusa a tempo"}
+    labels = {"": "Tenuta fino alla fine", "tp": "Take profit", "sl": "Stop loss", "time": "Chiusa a tempo"}
     by = t.groupby("cashout").agg(operazioni=("pnl", "size"), profitto=("pnl", "sum"), tenendole=("pnl_hold", "sum"),
                                   minuto_medio=("exit_minute", "mean")).reset_index()
     by["cashout"] = by["cashout"].map(labels)
@@ -1626,7 +1682,7 @@ def page_live() -> None:
     if st.toggle("Prova tutte le combinazioni di incasso e taglio", help="Qualche secondo di calcolo."):
         grid = bf.threshold_grid(runners, prices, side, spread, comm / 100, filters)
         st.dataframe(grid.sort_values("roi_pct", ascending=False), hide_index=True, width="stretch", height=420, column_config={
-            "incassa_da": "incassa da", "taglia_da": "taglia da", "chiuse_pct": st.column_config.NumberColumn("chiuse %", format="%.0f"),
+            "incassa_da": "take profit da", "taglia_da": "stop loss da", "chiuse_pct": st.column_config.NumberColumn("chiuse %", format="%.0f"),
             "roi_pct": st.column_config.NumberColumn("ROI %", format="%+.2f"), "profit": st.column_config.NumberColumn("profitto (u)", format="%+.1f"),
             "max_dd": st.column_config.NumberColumn("max drawdown (u)", format="%.1f")})
     st.caption("Ingresso all'ultimo prezzo scambiato prima dell'inizio; il cash out scatta alla prima rilevazione in cui il suo "
