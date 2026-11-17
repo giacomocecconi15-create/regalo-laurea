@@ -179,6 +179,7 @@ def apply_pending() -> None:
     ss["bt_omin"] = float(cfg.get("odds_min") or 1.01)
     ss["bt_omax"] = float(cfg.get("odds_max") or 50.0)
     ss["bt_excl"] = bool(cfg.get("exclude_retirements"))
+    ss["bt_live_margin"] = float(cfg.get("live_margin", bt.LIVE_MARGIN))
     saved = cfg.get("cashout") or {}
     ss["bt_co_mode"] = saved.get("mode") if saved.get("mode") in ("off", "manual", "smart") else "off"
     for k, v in saved.items():
@@ -230,6 +231,7 @@ def ensure_schema() -> None:
                 with closing(duckdb.connect(str(C.DB_PATH))) as con:
                     ud.init_db(con)
                     ud.refresh_features(con)
+                    sc.ensure_events(con)     # collega i match punto per punto al database (solo dalla cache locale)
             st.cache_resource.clear()
             st.cache_data.clear()
     except duckdb.Error as exc:
@@ -579,6 +581,9 @@ Più filtri provi, più è facile trovare per caso una combinazione che ha reso 
 strategia solo se supera i controlli e ha una logica che sai spiegare.
 
 ### 5 · Dal test alla pratica
+- **In partita**: filtri come "ha vinto il primo set", "ha fatto il primo break", "in vantaggio all'intervallo". Le quote
+  scelte restano pre-partita, ma l'operazione entra dopo l'evento alla quota live stimata; la vista *In partita*
+  mostra quante partite vince la selezione in ogni situazione, con intervallo di confidenza e quota live di entrata.
 - **Cash out**: nel pannello laterale puoi simulare le chiusure anticipate, a mano (quante giocate chiudi prima
   e a quanto) o in automatico dal risultato all'intervallo / primo set. La vista *Cash out* mostra l'effetto.
 - **Oggi**: le partite in programma con classifica, form e precedenti a quote simili, e le strategie che attivano.
@@ -846,11 +851,19 @@ def sidebar_config() -> dict:
     for spec in bt.FILTERS[sport]:
         groups.setdefault(spec[2], []).append(spec)
     for group, specs in groups.items():
-        with sb.expander(group):
+        with sb.expander(group + (" (ingresso live)" if group == "In partita" else "")):
+            if group == "In partita":
+                st.caption("Condizioni note solo a partita iniziata. Le quote scelte sopra restano pre-partita; con questi "
+                           "filtri l'operazione entra dopo l'evento alla quota live stimata (vista *In partita*).")
             for spec in specs:
                 rule = _filter_widget(sport, spec, sel)
                 if rule:
                     filters[spec[0]] = rule
+            if group == "In partita":
+                ss.setdefault("bt_live_margin", bt.LIVE_MARGIN)
+                st.number_input("Margine sulle quote in partita (%)", 0.0, 15.0, step=0.5, key="bt_live_margin",
+                                help="Quanto la quota live disponibile è peggiore di quella equa stimata. Su Betfair 1-3%, "
+                                     "su un bookmaker in live spesso 4-8%.")
     excl = False
     if sport == "tennis":
         ss.setdefault("bt_excl", False)
@@ -868,6 +881,7 @@ def sidebar_config() -> dict:
         "price_timing": timing, "commission": commission / 100, "lay_mode": lay_mode,
         "odds_min": odds_min, "odds_max": odds_max, "date_from": str(d_from), "date_to": str(d_to),
         "exclude_retirements": bool(excl), "filters": filters, "cashout": cash,
+        "live_margin": float(ss.get("bt_live_margin", bt.LIVE_MARGIN)),
     }
 
 
@@ -907,7 +921,7 @@ STAT_COLS = {
 
 
 def trades_table(trades: pd.DataFrame, sport: str) -> pd.DataFrame:
-    cols = TRADE_COLS[sport] + ["side", "odds", "close_odds", "clv_pct", "won", "risk", "cashout", "pnl_hold", "pnl", "equity"]
+    cols = TRADE_COLS[sport] + ["side", "pre_odds", "odds", "live_prob", "close_odds", "clv_pct", "won", "risk", "cashout", "pnl_hold", "pnl", "equity"]
     out = trades[[c for c in cols if c in trades.columns]].copy()
     out["date"] = out["date"].dt.date
     if "cashout" in out.columns:
@@ -936,9 +950,23 @@ def tab_summary(cfg: dict, res: bt.BacktestResult, bank: float) -> None:
           ("Profitto", f"{m['profit']:+.2f} u", "stake 1 u per operazione", sign_tone(m["profit"])),
           ("CLV medio", fmt(m["clv_pct"], "{:+.2f}%"), "contro la quota di chiusura", sign_tone(m["clv_pct"])),
           ("Max Drawdown", f"-{m['max_dd_units']:.1f} u", f"-{m['max_dd_pct']:.0f}% di una banca da {bank:.0f} u", None),
-          ("Win Rate", f"{m['win_rate_pct']:.1f}%", f"quota media {m['avg_odds']:.2f}", None),
+          ("Win Rate", f"{m['win_rate_pct']:.1f}%",
+           f"quota live mediana {trades['odds'].median():.2f}" if res.live else f"quota media {m['avg_odds']:.2f}", None),
           ("Operazioni", num_it(m["trades"]), f"serie negativa max {m['longest_losing_streak']}", None)],
          hero_spark=trades["equity"].to_numpy())
+    if res.live:
+        L = res.live
+        kpis([("Quota media pre-partita", f"{L['avg_pre_odds']:.2f}", f"probabilità implicita {L['pre_implied_pct']:.1f}%", None),
+              ("Quota live di entrata (stimata)", f"{L['avg_live_odds']:.2f}", f"mediana, {L['label'].split(' (')[0]}, margine {L['margin_pct']:g}%", None),
+              ("Vittorie reali", f"{L['real_win_pct']:.1f}%", "frequenza esatta nello storico", None),
+              ("Probabilità stimata al momento", f"{L['est_prob_pct']:.1f}%", "quella che la quota live sconta",
+               sign_tone(L["real_win_pct"] - L["est_prob_pct"]))])
+        st.caption(f":material/schedule: Ingresso **{L['label']}**: i filtri di quota valgono sulle quote pre-partita, ma l'operazione "
+                   "si apre al prezzo live stimato in quel momento, quindi ROI e profitto non usano informazioni future. Le vittorie "
+                   "sono conteggi esatti; la quota live è una stima tarata sui risultati reali (vedi vista *In partita*).")
+        if L.get("smart_cashout_skipped"):
+            st.warning("Il cash out intelligente non viene applicato: il suo punto di controllo (intervallo / primo set) coincide "
+                       "con l'ingresso live. Usa il cash out manuale per simulare chiusure successive.")
     if "cashout" in trades.columns:
         closed = int((trades["cashout"] != "").sum())
         delta = float(trades["pnl"].sum() - trades["pnl_hold"].sum())
@@ -951,7 +979,7 @@ def tab_summary(cfg: dict, res: bt.BacktestResult, bank: float) -> None:
                    "e considera il risultato come limite superiore.")
     if cfg["sport"] == "tennis" and cfg["price"] == "ps":
         st.caption("Tennis: l'unica quota Pinnacle disponibile è quella di chiusura, quindi con ingresso Pinnacle il CLV è 0 per costruzione.")
-    elif m["clv_coverage_pct"] < 99:
+    elif m["clv_coverage_pct"] < 99 and not res.live:
         st.caption(f"CLV calcolato sul {m['clv_coverage_pct']:.0f}% delle operazioni (quota di chiusura non disponibile per le altre).")
     show(equity_chart(trades))
     show(drawdown_chart(trades))
@@ -966,7 +994,8 @@ def tab_summary(cfg: dict, res: bt.BacktestResult, bank: float) -> None:
 def tab_analysis(cfg: dict, trades: pd.DataFrame) -> None:
     sport = cfg["sport"]
     dims = {"year": "Anno", "odds_bucket": "Fascia di quota"}
-    dims.update({f[0]: f[1] for f in bt.FILTERS[sport] if f[3] == "cat" and f[0] in trades.columns and f[0] != "year"})
+    dims.update({f[0]: f[1] for f in bt.FILTERS[sport] if f[3] == "cat" and f[0] in trades.columns and f[0] != "year"
+                 and f[0] not in bt.INPLAY.get(sport, set())})
     by = st.selectbox("Scomponi il risultato per", list(dims), format_func=dims.get)
     bd = bt.breakdown(trades, by)
     if not bd.empty:
@@ -1156,6 +1185,8 @@ def tab_trades(cfg: dict, trades: pd.DataFrame) -> None:
         "odds": st.column_config.NumberColumn("quota", format="%.2f"), "close_odds": st.column_config.NumberColumn("chiusura", format="%.2f"),
         "clv_pct": st.column_config.NumberColumn("clv %", format="%.2f"), "pnl": st.column_config.NumberColumn(format="%.3f"),
         "risk": st.column_config.NumberColumn(format="%.2f"), "equity": st.column_config.NumberColumn(format="%.2f"),
+        "pre_odds": st.column_config.NumberColumn("quota pre-partita", format="%.2f"),
+        "live_prob": st.column_config.NumberColumn("prob. live stimata", format="%.3f"),
         "pnl_hold": st.column_config.NumberColumn("pnl tenendo", format="%.3f"),
         "form10": st.column_config.NumberColumn(format="%.0f"), "form_surf": st.column_config.NumberColumn(format="%.0f"),
         "home_ppg5": st.column_config.NumberColumn(format="%.1f"), "away_ppg5": st.column_config.NumberColumn(format="%.1f"),
@@ -1164,7 +1195,46 @@ def tab_trades(cfg: dict, trades: pd.DataFrame) -> None:
                        file_name=f"operazioni_{cfg['sport']}_{date.today():%Y%m%d}.csv", mime="text/csv", icon=":material/download:")
 
 
-VIEWS = ["Riepilogo", "Analisi", "Robustezza", "Cash out", "Operazioni", "Salva"]
+VIEWS = ["Riepilogo", "In partita", "Analisi", "Robustezza", "Cash out", "Operazioni", "Salva"]
+
+
+def tab_inplay(cfg: dict, sel: pd.DataFrame) -> None:
+    """Statistiche condizionate: quante partite vince la selezione in ogni situazione di gioco."""
+    sport = cfg["sport"]
+    base_cfg = {**cfg, "filters": {c: r for c, r in (cfg.get("filters") or {}).items() if c not in bt.INPLAY.get(sport, set())}}
+    base = bt.apply_filters(sel, base_cfg)
+    st.caption("Le operazioni della strategia **senza** i filtri in partita, divise per quello che succede durante il match. "
+               "*Vince %* e l'intervallo al 95% sono conteggi esatti dallo storico. *Prob. live stimata* è quella che sconta la "
+               "quota nel momento dell'evento (stima tarata sui risultati reali); se *vince %* sta stabilmente sopra, l'ingresso "
+               "in quella situazione ha avuto valore. Per bancare: la selezione perde nel 100% meno *vince %*.")
+    if base.empty:
+        st.info("Nessuna operazione con i filtri attuali.")
+        return
+    key = json.dumps([base_cfg, db_version()], sort_keys=True, default=str)
+    if ss.get("_ip_key") != key:
+        with st.spinner("Calcolo le statistiche per situazione di gioco..."):
+            ss["_ip"] = bt.conditional_stats(base, sport, cfg.get("side", "back"), float(cfg.get("live_margin", bt.LIVE_MARGIN)))
+        ss["_ip_key"] = key
+    stats = ss["_ip"]
+    cols = {"partite": st.column_config.NumberColumn(format="%d"), "vinte": st.column_config.NumberColumn(format="%d"),
+            "vince_pct": st.column_config.NumberColumn("vince %", format="%.1f"),
+            "ic_basso": st.column_config.NumberColumn("IC 95% da", format="%.1f"), "ic_alto": st.column_config.NumberColumn("IC 95% a", format="%.1f"),
+            "implicita_pre_pct": st.column_config.NumberColumn("prob. pre-partita %", format="%.1f"),
+            "stimata_live_pct": st.column_config.NumberColumn("prob. live stimata %", format="%.1f"),
+            "quota_pre_media": st.column_config.NumberColumn("quota pre-partita media", format="%.2f"),
+            "quota_live_mediana": st.column_config.NumberColumn("quota live di entrata (mediana)", format="%.2f")}
+    for title, table in stats.items():
+        st.subheader(title)
+        st.dataframe(table, hide_index=True, width="stretch", column_config=cols)
+    if sport == "tennis":
+        cov = int(base["ip_break1"].notna().sum()) if "ip_break1" in base.columns else 0
+        st.caption(f"*Primo break*: disponibile per {num_it(cov)} operazioni su {num_it(len(base))}, quelle dei match registrati punto per "
+                   "punto dal Match Charting Project (soprattutto tornei maggiori). Il primo set è disponibile per tutti i match "
+                   "completati; un ritiro a metà primo set lascia il dato vuoto.")
+    else:
+        st.caption("La squadra che segna per prima non è disponibile: la fonte non riporta i minuti dei gol e ricavarla solo "
+                   "dalle partite in cui è deducibile falserebbe il campione. Il risultato all'intervallo è invece esatto.")
+    st.caption("Per usare una situazione come strategia, selezionala nel pannello laterale, gruppo *In partita*.")
 
 
 def page_backtester() -> None:
@@ -1195,6 +1265,8 @@ def page_backtester() -> None:
         tab_analysis(cfg, res.trades)
     elif view == "Robustezza":
         tab_robustness(cfg, res, args, bank)
+    elif view == "In partita":
+        tab_inplay(cfg, selections(*args, db_version()))
     elif view == "Cash out":
         tab_cashout(cfg, res, args, bank)
     elif view == "Operazioni":
@@ -1379,6 +1451,32 @@ def page_scalping() -> None:
         st.info("I dati punto per punto non sono ancora stati scaricati. Vai nella pagina **Dati** e premi *Aggiorna ora*: "
                 "la prima volta scarica circa 90 MB dal Match Charting Project (qualche minuto).")
         return
+    tennis_vault = {n: e for n, e in sv.load_vault().items() if e.get("config", {}).get("sport") == "tennis"}
+    with st.container(border=True):
+        c = st.columns([2.2, 1.8, 2])
+        strat = c[0].selectbox("Partite di una strategia salvata", list(tennis_vault), index=None, placeholder="nessuna: tutti i match",
+                               help="Limita la simulazione ai match in cui la strategia avrebbe operato.")
+        who = c[1].radio("Chi serve", ["player", "opponent", "both"], horizontal=True, disabled=strat is None,
+                         format_func={"player": "Il giocatore scelto", "opponent": "L'avversario", "both": "Entrambi"}.get)
+        after = c[2].checkbox("Solo game dopo l'ingresso della strategia", value=False, disabled=strat is None,
+                              help="Per strategie con filtri in partita: solo i game giocati dopo il primo break o dopo il primo set.")
+        if strat is not None:
+            scfg = tennis_vault[strat]["config"]
+            res = bt.backtest_selections(selections("tennis", "h2h", scfg.get("price", "avg"), "open", db_version()), scfg)
+            games, info = sc.strategy_games(games, res.trades, who)
+            point = bt.entry_point(scfg)
+            if after and point and len(games):
+                fbg = res.trades.drop_duplicates("match_id").set_index("match_id")["_fb_game"] if "_fb_game" in res.trades else pd.Series(dtype=float)
+                cut = games["db_match_id"].map(fbg) if point == "break1" else pd.Series(np.nan, index=games.index)
+                games = games[(games["set_no"] >= 2) | (cut.notna() & (games["game_no"] > cut))]
+            st.caption(f"Strategia **{strat}**: {num_it(info['strategy_matches'])} match nel backtest, {num_it(info['with_points'])} con dati "
+                       f"punto per punto ({info['with_points'] / max(info['strategy_matches'], 1) * 100:.0f}%)"
+                       + (f", {info['unmatched_names']} esclusi per nomi non abbinati" if info["unmatched_names"] else "")
+                       + f". Game selezionati: {num_it(len(games))}. " + describe(scfg))
+            if games.empty:
+                st.warning("Nessun game disponibile per questa strategia: il Match Charting Project copre circa un match ATP su cinque, "
+                           "soprattutto nei tornei maggiori.")
+                return
     with st.container(border=True):
         c = st.columns([1.1, 1.5, 1, 1.4, 1, 1])
         entry = c[0].selectbox("Ingresso al punteggio", sc.ENTRY_SCORES, help="Punteggio del game dal punto di vista di chi serve (battitore-risposta).")
@@ -1395,7 +1493,7 @@ def page_scalping() -> None:
     filters = {"surface": surf, "set_no": sets, "pre_prob": (lo / 100 if lo > 0 else None, hi / 100 if hi < 100 else None),
                "price_source": ["quote"] if real else None}
     exit_points = int(n_pts) if mode == "points" else None
-    key = json.dumps([entry, exit_points, stop, spread, comm, filters, db_version()], default=str)
+    key = json.dumps([entry, exit_points, stop, spread, comm, filters, db_version(), strat, who, after], default=str)
     if ss.get("_sc_key") != key:
         ss["_sc"] = sc.simulate(games, entry, exit_points, stop, spread, comm / 100, filters)
         ss["_sc_key"] = key
@@ -1792,7 +1890,9 @@ def page_vault() -> None:
         st.dataframe(signals, hide_index=True, width="stretch", column_config={
             "quota": st.column_config.NumberColumn(format="%.2f"),
             "importo_rischio": st.column_config.NumberColumn("importo a rischio", format="%.2f"),
-            "puntata_exchange": st.column_config.NumberColumn("puntata da inserire", format="%.2f")})
+            "puntata_exchange": st.column_config.NumberColumn("puntata da inserire", format="%.2f"),
+            "condizione_in_partita": "condizione da verificare in partita",
+            "quota_live_stimata": st.column_config.NumberColumn("quota live attesa", format="%.2f")})
         st.caption("Back: importo a rischio = puntata. Lay: importo a rischio = responsabilità; la puntata da inserire sull'exchange è responsabilità / (quota - 1).")
         st.download_button("Esporta segnali (CSV)", signals.to_csv(index=False).encode("utf-8"),
                            f"segnali_{date.today():%Y%m%d}.csv", "text/csv", icon=":material/download:")

@@ -378,7 +378,7 @@ def scan(upload: pd.DataFrame, vault: dict, bankroll: float, con=None, method: s
     """Ritorna (segnali, avvisi). Un segnale = match del CSV che soddisfa una strategia salvata."""
     sport = detect_sport(upload)
     cols = ["strategia", "data", "evento", "competizione", "selezione", "lato", "quota",
-            "stake_%", "importo_rischio", "puntata_exchange", "roi_storico_%"]
+            "stake_%", "importo_rischio", "puntata_exchange", "roi_storico_%", "condizione_in_partita", "quota_live_stimata"]
     if sport is None:
         return pd.DataFrame(columns=cols), [
             "Formato non riconosciuto. Tennis: " + ", ".join(TENNIS_REQUIRED) + " - Calcio: " + ", ".join(FOOTBALL_REQUIRED)]
@@ -397,8 +397,13 @@ def scan(upload: pd.DataFrame, vault: dict, bankroll: float, con=None, method: s
             continue
         live = {k: v for k, v in cfg.items() if k not in ("date_from", "date_to", "exclude_retirements")}
         live["filters"] = {}
+        conds = []
         for col, rule in (cfg.get("filters") or {}).items():
             if col in ("season", "year"):
+                continue
+            if col in bt.INPLAY.get(sport, set()):      # condizione nota solo a partita iniziata: si verifica dal vivo
+                if rule and rule.get("in"):
+                    conds.append((col, rule["in"]))
                 continue
             if col not in sel.columns or sel[col].isna().all():
                 notes.append(f"'{name}': filtro '{col}' non verificabile (dato assente nel CSV e nel database) - ignorato.")
@@ -411,6 +416,18 @@ def scan(upload: pd.DataFrame, vault: dict, bankroll: float, con=None, method: s
         if method == "kelly" and not float(metrics.get("roi_pct") or 0) > 0:
             notes.append(f"'{name}': ROI storico non positivo, Kelly assegna stake 0.")
         lay = cfg.get("side") == "lay"
+        cond_text = ""
+        live_q = np.full(len(hit), np.nan)
+        if conds:
+            point = bt.entry_point({"sport": sport, "filters": {c: {"in": v} for c, v in conds}})
+            cond_text = f"Entra {bt.ENTRY_LABEL[point].split(' (')[0]} solo se: " + "; ".join(
+                f"{bt.FILTER_LABELS[sport].get(c, c)} = {' o '.join(map(str, v))}" for c, v in conds)
+            set_states = dict(conds).get("ip_set1")
+            if point == "set1" and set_states and len(set_states) == 1 and not (set(dict(conds)) - {"ip_set1"}):
+                from src import cashout
+                p = cashout.tennis_checkpoint_prob(hit.assign(set1_won=1.0 if set_states[0] == "Vinto" else 0.0,
+                                                              best_of=hit["best_of"].fillna(3)))
+                live_q = bt.live_odds(p, "lay" if lay else "back", float(cfg.get("live_margin", bt.LIVE_MARGIN)))
         rows.append(pd.DataFrame({
             "strategia": name, "data": hit["date"].dt.strftime("%Y-%m-%d").to_numpy(), "evento": hit["event"].to_numpy(),
             "competizione": hit["competition"].to_numpy(), "selezione": hit["pick"].to_numpy(),
@@ -418,6 +435,7 @@ def scan(upload: pd.DataFrame, vault: dict, bankroll: float, con=None, method: s
             "stake_%": st["stake_pct"].round(2).to_numpy(), "importo_rischio": st["risk"].round(2).to_numpy(),
             "puntata_exchange": st["backer_stake"].round(2).to_numpy(),
             "roi_storico_%": round(float(metrics.get("roi_pct") or 0), 2),
+            "condizione_in_partita": cond_text, "quota_live_stimata": np.round(live_q, 2),
         }))
     if not any(e.get("config", {}).get("sport") == sport for e in vault.values()):
         notes.append(f"Nessuna strategia salvata per lo sport rilevato ({sport}).")

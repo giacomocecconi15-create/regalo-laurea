@@ -35,7 +35,7 @@ FILES = {"matches": "charting-m-matches.csv", "p2020": "charting-m-points-2020s.
 ENTRY_SCORES = ["0-0", "15-0", "0-15", "15-15", "30-0", "0-30", "30-15", "15-30", "30-30", "40-15", "15-40", "40-30", "30-40", "40-40"]
 PTS = {"0": 0, "15": 1, "30": 2, "40": 3}
 MAXLEN = 30
-GAME_COLUMNS = ["match_id", "match_date", "tournament", "round", "surface", "best_of", "server", "returner", "set_no", "game_no",
+GAME_COLUMNS = ["match_id", "db_match_id", "match_date", "tournament", "round", "surface", "best_of", "server", "returner", "set_no", "game_no",
                 "srv_games", "ret_games", "srv_sets", "ret_sets", "seq", "held", "p_srv", "v_hold", "v_break", "pre_prob", "price_source"]
 
 
@@ -186,12 +186,13 @@ def build_games(matches: pd.DataFrame, points: pd.DataFrame, db_matches: pd.Data
     ])
     cand["gap"] = (cand["match_date"] - cand["match_date_db"]).dt.days.abs()
     cand = cand[cand["gap"] <= 3].sort_values("gap").drop_duplicates("match_id")
-    m = m.merge(cand[["match_id", "p1_pre", "src"]], on="match_id")
+    cand = cand.rename(columns={"match_id_db": "db_match_id"}) if "match_id_db" in cand.columns else cand.assign(db_match_id=None)
+    m = m.merge(cand[["match_id", "p1_pre", "src", "db_match_id"]], on="match_id")
     if m.empty:
         return pd.DataFrame(columns=GAME_COLUMNS)
 
     g = _sequences(points[points["match_id"].isin(m["match_id"])])
-    g = g.merge(m[["match_id", "match_date", "Tournament", "Round", "surface", "best_of", "p1", "p2", "p1_pre", "src"]], on="match_id")
+    g = g.merge(m[["match_id", "db_match_id", "match_date", "Tournament", "Round", "surface", "best_of", "p1", "p2", "p1_pre", "src"]], on="match_id")
     if g.empty:
         return pd.DataFrame(columns=GAME_COLUMNS)
     # livello medio del servizio per superficie, misurato sugli stessi punti
@@ -230,7 +231,7 @@ def build_games(matches: pd.DataFrame, points: pd.DataFrame, db_matches: pd.Data
     v_hold_1 = value(g1 + srv1, g2 + ~srv1, nxt)
     v_break_1 = value(g1 + ~srv1, g2 + srv1, nxt)
     out = pd.DataFrame({
-        "match_id": g["match_id"], "match_date": g["match_date"], "tournament": g["Tournament"], "round": g["Round"],
+        "match_id": g["match_id"], "db_match_id": g["db_match_id"], "match_date": g["match_date"], "tournament": g["Tournament"], "round": g["Round"],
         "surface": g["surface"], "best_of": g["best_of"], "server": np.where(srv1, g["p1"], g["p2"]),
         "returner": np.where(srv1, g["p2"], g["p1"]), "set_no": s1 + s2 + 1, "game_no": g1 + g2 + 1,
         "srv_games": np.where(srv1, g1, g2), "ret_games": np.where(srv1, g2, g1),
@@ -251,6 +252,9 @@ def update_points(con, refresh: bool = False) -> dict:
             return {"games": 0, "matches": 0, "note": "dati punto per punto non raggiungibili"}
         raw[key], changed = data, changed or new
     have = "tennis_service_games" in {r[0] for r in con.execute("SHOW TABLES").fetchall()}
+    if have:   # tabella di una versione precedente (senza collegamento ai match del database): va ricostruita
+        cols = {r[0] for r in con.execute("DESCRIBE tennis_service_games").fetchall()}
+        have = "db_match_id" in cols and "tennis_match_events" in {r[0] for r in con.execute("SHOW TABLES").fetchall()}
     if have and not changed and not refresh:
         n = con.execute("SELECT count(*), count(DISTINCT match_id) FROM tennis_service_games").fetchone()
         return {"games": n[0], "matches": n[1], "note": "gia' aggiornati"}
@@ -260,13 +264,76 @@ def update_points(con, refresh: bool = False) -> dict:
     points = pd.concat([pd.read_csv(io.BytesIO(raw[k]), usecols=cols, dtype=str, encoding="utf-8", encoding_errors="replace",
                                     on_bad_lines="skip") for k in ("p2020", "p2010")], ignore_index=True)
     points = points[points["match_id"].str.slice(0, 4) >= str(C.FIRST_YEAR)]
-    db = con.execute("""SELECT match_date, winner_name, loser_name, ps_w, ps_l, avg_w, avg_l, winner_elo, loser_elo
+    db = con.execute("""SELECT match_id, match_date, winner_name, loser_name, ps_w, ps_l, avg_w, avg_l, winner_elo, loser_elo
                         FROM tennis_matches""").df()
     games = build_games(matches, points, db)
+    events = build_events(games)
     con.register("_games", games)
     con.execute("CREATE OR REPLACE TABLE tennis_service_games AS SELECT * FROM _games")
     con.unregister("_games")
+    con.register("_events", events)
+    con.execute("CREATE OR REPLACE TABLE tennis_match_events AS SELECT * FROM _events")
+    con.unregister("_events")
     return {"games": len(games), "matches": int(games["match_id"].nunique()), "note": "ricostruiti"}
+
+
+def build_events(games: pd.DataFrame) -> pd.DataFrame:
+    """Per ogni match del database con dati punto per punto: chi ha fatto il primo break nel primo set e la
+    probabilita' di vittoria del match (modello) del giocatore che ha breakkato subito dopo il break.
+    Se nel primo set non ci sono break, `fb_breaker` e' vuoto (il set si e' deciso al tie-break)."""
+    cols = ["db_match_id", "fb_breaker", "fb_prob", "fb_game"]
+    if games.empty:
+        return pd.DataFrame(columns=cols)
+    g = games[games["db_match_id"].notna() & (games["set_no"] == 1)].sort_values(["db_match_id", "game_no"], kind="stable")
+    rows = []
+    for mid, x in g.groupby("db_match_id", sort=False):
+        nums = x["game_no"].to_numpy()
+        if len(x) < 6 or nums[0] != 1:            # primo set registrato in modo incompleto: niente dato
+            continue
+        broken = x[~x["held"].astype(bool)]
+        if broken.empty:
+            rows.append({"db_match_id": mid, "fb_breaker": None, "fb_prob": np.nan, "fb_game": np.nan})
+        else:
+            b = broken.iloc[0]
+            rows.append({"db_match_id": mid, "fb_breaker": b["returner"], "fb_prob": 1 - float(b["v_break"]), "fb_game": int(b["game_no"])})
+    return pd.DataFrame(rows, columns=cols)
+
+
+def ensure_events(con) -> bool:
+    """Ricostruisce dalla cache locale (senza scaricare nulla) le tabelle dei punti se sono di una versione
+    precedente. Ritorna True se ha ricostruito."""
+    if not all((C.RAW_DIR / "points" / f).exists() for f in FILES.values()):
+        return False
+    tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
+    ok = "tennis_service_games" in tables and "tennis_match_events" in tables and \
+        "db_match_id" in {r[0] for r in con.execute("DESCRIBE tennis_service_games").fetchall()}
+    if ok:
+        return False
+    update_points(con, refresh=False)
+    return True
+
+
+def strategy_games(games: pd.DataFrame, trades: pd.DataFrame, who: str = "player") -> tuple[pd.DataFrame, dict]:
+    """Game di servizio dei match di una strategia. `who`: 'player' = serve il giocatore scelto dalla strategia,
+    'opponent' = serve l'avversario, 'both' = tutti i game di quei match. Ritorna (game, copertura)."""
+    info = {"strategy_matches": int(trades["match_id"].nunique()) if len(trades) else 0, "with_points": 0, "unmatched_names": 0}
+    if games.empty or trades.empty or "db_match_id" not in games.columns:
+        return games.iloc[0:0], info
+    pick = trades.drop_duplicates("match_id").set_index("match_id")["player"].map(ud.norm_key)
+    g = games[games["db_match_id"].isin(pick.index)].copy()
+    info["with_points"] = int(g["db_match_id"].nunique())
+    if g.empty:
+        return g, info
+    key = g["db_match_id"].map(pick)
+    srv, ret = g["server"].map(ud.norm_key), g["returner"].map(ud.norm_key)
+    known = (srv == key) | (ret == key)
+    info["unmatched_names"] = int(g.loc[~known, "db_match_id"].nunique())
+    g = g[known]
+    if who == "player":
+        g = g[srv[known] == key[known]]
+    elif who == "opponent":
+        g = g[ret[known] == key[known]]
+    return g, info
 
 
 def load_games(con) -> pd.DataFrame:

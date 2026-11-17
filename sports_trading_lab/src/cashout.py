@@ -115,8 +115,31 @@ def total_from_over(p_over: np.ndarray) -> np.ndarray:
     return np.where(np.isfinite(p), np.interp(np.clip(p, over[0], over[-1]), over, lam), np.nan)
 
 
-def football_checkpoint_prob(t: pd.DataFrame) -> np.ndarray:
-    """Probabilita' della selezione all'intervallo, dato il risultato del primo tempo."""
+# correzione delle probabilita' all'intervallo misurata sui risultati reali (taratura 2019-2022, verificata sul 2023+):
+# il modello di Poisson sopravvaluta chi e' in vantaggio e il numero di gol del secondo tempo
+HT_TEAM = (-0.02, 1.00, -0.22)        # logit' = a + b*logit + c*segno del vantaggio della squadra scelta
+HT_DRAW = (0.06, 0.94)
+HT_OVER = (-0.04, 1.07, 0.10)         # termine c se all'intervallo c'e' esattamente un gol
+
+
+def _calibrate_ht(t: pd.DataFrame, p: np.ndarray) -> np.ndarray:
+    sel = t["selection"].to_numpy()
+    h, a = t["ht_home"].to_numpy(dtype=float), t["ht_away"].to_numpy(dtype=float)
+    inner = np.isfinite(p) & (p > 1e-6) & (p < 1 - 1e-6)
+    x = np.log(np.clip(p, 1e-6, 1 - 1e-6) / (1 - np.clip(p, 1e-6, 1 - 1e-6)))
+    lead = np.sign(np.where(sel == "home", h - a, np.where(sel == "away", a - h, 0.0)))
+    team = HT_TEAM[0] + HT_TEAM[1] * x + HT_TEAM[2] * lead
+    draw = HT_DRAW[0] + HT_DRAW[1] * x
+    one_goal = (h + a) == 1
+    x_over = np.where(sel == "under", -x, x)                      # logit dell'over
+    over = HT_OVER[0] + HT_OVER[1] * x_over + HT_OVER[2] * one_goal
+    logit = np.where(sel == "draw", draw, np.where(sel == "over", over, np.where(sel == "under", -over, team)))
+    return np.where(inner, 1 / (1 + np.exp(-logit)), p)
+
+
+def football_checkpoint_prob(t: pd.DataFrame, calibrated: bool = True) -> np.ndarray:
+    """Probabilita' della selezione all'intervallo, dato il risultato del primo tempo.
+    `calibrated=False` restituisce il modello di Poisson puro (le probabilita' 1-X-2 sommano a 1)."""
     need = ("odds_home", "odds_draw", "odds_away", "ht_home", "ht_away", "selection")
     if t.empty or any(c not in t.columns for c in need):
         return np.full(len(t), np.nan)
@@ -149,7 +172,7 @@ def football_checkpoint_prob(t: pd.DataFrame) -> np.ndarray:
     for name, p in table.items():
         res = np.where(sel == name, p, res)
     out[ok] = res
-    return out
+    return _calibrate_ht(t, out) if calibrated else out
 
 
 # --------------------------------------------------------------------------- modello tennis

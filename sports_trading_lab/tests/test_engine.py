@@ -795,7 +795,7 @@ def test_football_halftime_model():
         for sel in ("home", "draw", "away", "over", "under"):
             rows.append({**base, "ht_home": ht[0], "ht_away": ht[1], "selection": sel})
     t = pd.DataFrame(rows)
-    p = co.football_checkpoint_prob(t)
+    p = co.football_checkpoint_prob(t, calibrated=False)
     g = t.assign(p=p).set_index(["ht_home", "ht_away", "selection"])["p"]
     for ht in ((0, 0), (3, 0), (0, 3), (2, 2)):
         assert g[ht[0], ht[1], "home"] + g[ht[0], ht[1], "draw"] + g[ht[0], ht[1], "away"] == pytest.approx(1.0, abs=1e-6)
@@ -1275,3 +1275,124 @@ def test_betfair_import_and_real_cashout(tmp_path):
     none = grid[(grid["incassa_da"] == "mai") & (grid["taglia_da"] == "mai")].iloc[0]
     assert none["profit"] == pytest.approx(-0.55) and none["chiuse_pct"] == 0 and len(grid) == 30
     assert bt.compute_metrics(tp.reset_index())["profit"] == pytest.approx(tp["pnl"].sum())
+
+
+# ------------------------------------------------------------------ filtri in partita e ingresso live
+def test_first_set_parsing_only_counts_completed_sets():
+    m = tennis_frame()
+    m = pd.concat([m, m.iloc[[0]].assign(match_id="d"), m.iloc[[0]].assign(match_id="e")], ignore_index=True)
+    m["score"] = ["6-4 6-2", "W/O", "6-7(4) 7-6(4) 6-1", "3-2 RET", "7-5 6-1"]
+    m["status"] = ["Completed", "Walkover", "Completed", "Retired", "Completed"]
+    s = bt.tennis_selections(m, "avg").set_index(["match_id", "won"])
+    assert s.loc[("a", True), "ip_set1"] == "Vinto" and s.loc[("a", False), "ip_set1"] == "Perso"
+    assert s.loc[("c", True), "ip_set1"] == "Perso" and s.loc[("c", True), "ip_set1_tb"] == "Sì"   # perso al tie-break, vinto il match
+    assert pd.isna(s.loc[("d", True), "ip_set1"]) and pd.isna(s.loc[("d", True), "ip_set1_tb"])    # ritiro a meta' primo set
+    assert s.loc[("e", True), "ip_set1_tb"] == "No" and pd.isna(s.loc[("a", True), "ip_break1"])     # senza dati punto per punto
+
+
+def test_live_entry_uses_prematch_odds_filter_and_live_price():
+    m = tennis_frame().assign(score=["6-4 6-2", "6-1 6-1", "6-4 3-6 6-2"], status="Completed")
+    s = bt.tennis_selections(m, "avg")
+    cfg = {"sport": "tennis", "selection": ["underdog"], "odds_min": 2.6, "odds_max": 4.0, "filters": {"ip_set1": {"in": ["Vinto"]}},
+           "live_margin": 3.0}
+    r = bt.backtest_selections(s, cfg)
+    t = r.trades
+    assert len(t) == 1 and t["pre_odds"].iloc[0] == 3.0 and t["event"].iloc[0] == "E vs F"   # filtro sulla quota PRE-partita
+    from src import cashout as co
+    row = s[(s["match_id"] == "c") & s["won"]]
+    p = co.tennis_checkpoint_prob(row)[0]
+    assert t["live_prob"].iloc[0] == pytest.approx(p) and t["odds"].iloc[0] == pytest.approx(max(1 / p * 0.97, 1.01))
+    assert t["pnl"].iloc[0] == pytest.approx(t["odds"].iloc[0] - 1)                            # la selezione ha vinto il match
+    assert r.live["entry"] == "set1" and r.live["real_win_pct"] == 100 and np.isnan(t["clv_pct"].iloc[0])
+    lay = bt.backtest_selections(s, {**cfg, "side": "lay"}).trades
+    assert lay["odds"].iloc[0] == pytest.approx(1 / p * 1.03) and lay["pnl"].iloc[0] == pytest.approx(-1.0)
+    assert bt.backtest_selections(s, {**cfg, "filters": {}}).live is None                       # senza filtri live: quote pre-partita
+    assert bt.entry_point({"sport": "tennis", "filters": {"ip_break1": {"in": ["Fatto"]}}}) == "break1"
+    assert bt.entry_point({"sport": "tennis", "filters": {"ip_break1": {"in": ["Fatto"]}, "ip_set1_tb": {"in": ["No"]}}}) == "set1"
+    assert bt.entry_point({"sport": "football", "filters": {"ip_ht": {"in": ["Pari"]}}}) == "ht"
+    smart = bt.backtest_selections(s, {**cfg, "cashout": {"mode": "smart"}})
+    assert smart.live["smart_cashout_skipped"] and "cashout" not in smart.trades.columns
+
+
+def test_break_price_and_conditional_stats():
+    m = tennis_frame().assign(score=["6-4 6-2", "6-1 6-1", "4-6 6-3 6-2"], status="Completed")
+    m["_ev_match"] = ["a", None, "c"]
+    m["fb_breaker"] = ["A", None, None]          # in 'c' nessun break nel primo set
+    m["fb_prob"] = [0.7, np.nan, np.nan]
+    m["fb_game"] = [3, np.nan, np.nan]
+    s = bt.tennis_selections(m, "avg").set_index(["match_id", "player"])
+    assert s.loc[("a", "A"), "ip_break1"] == "Fatto" and s.loc[("a", "B"), "ip_break1"] == "Subito"
+    assert s.loc[("c", "E"), "ip_break1"] == "Nessun break" and pd.isna(s.loc[("b", "C"), "ip_break1"])
+    s = s.reset_index()
+    p = bt.live_prob(s[s["match_id"] == "a"], "break1")
+    up = 1 / (1 + np.exp(-(np.log(0.7 / 0.3) + bt.BREAK_MOMENTUM)))
+    assert p.tolist() == pytest.approx([up, 1 - up])                                       # correzione simmetrica
+    stats = bt.conditional_stats(s[s["match_id"] != "b"], "tennis")
+    first = stats["Primo set"].set_index("situazione")
+    assert first.loc["Vinto", "partite"] == 2 and first.loc["Vinto", "vinte"] == 1 and first.loc["Perso", "vinte"] == 1
+    lo, hi = bt.wilson(1, 2)
+    assert first.loc["Vinto", "ic_basso"] == pytest.approx(lo) and lo < 50 < hi
+    assert bt.wilson(0, 0)[0] != bt.wilson(0, 0)[0]
+    assert stats["Primo break del primo set"].set_index("situazione").loc["Fatto", "partite"] == 1
+
+
+def test_football_halftime_columns_and_scan_conditions():
+    f = football_frame().assign(hthg=[1.0, 0.0], htag=[0.0, 0.0])
+    s = bt.football_selections(f, "1x2", "avg")
+    x = s.set_index(["match_id", "selection"])
+    assert x.loc[("x", "home"), "ip_ht_sel"] == "In vantaggio" and x.loc[("x", "away"), "ip_ht_sel"] == "In svantaggio"
+    assert pd.isna(x.loc[("x", "draw"), "ip_ht_sel"]) and x.loc[("y", "home"), "ip_ht"] == "Pari"
+    assert x.loc[("x", "home"), "ip_ht_goals"] == "1" and x.loc[("y", "draw"), "ip_ht_goals"] == "0"
+    r = bt.backtest_selections(s, {"sport": "football", "selection": ["home"], "filters": {"ip_ht_sel": {"in": ["In vantaggio"]}}})
+    assert len(r.trades) == 1 and r.trades["pre_odds"].iloc[0] == 1.40 and r.trades["odds"].iloc[0] < 1.40
+    assert bt.segment_scan(bt.settle(s), "football", 1)["col"].isin(bt.INPLAY["football"]).sum() == 0
+    vault = {"live": {"config": {"sport": "tennis", "selection": ["underdog"], "filters": {"ip_set1": {"in": ["Vinto"]}}}, "metrics": {}},
+             "pre": {"config": {"sport": "tennis", "selection": ["underdog"]}, "metrics": {}}}
+    up = pd.DataFrame({"date": ["2026-11-20"], "player1": ["Uno"], "player2": ["Due"], "odds1": [1.5], "odds2": [2.7], "best_of": [3]})
+    sig, notes = sv.scan(up, vault, 1000)
+    sig = sig.set_index("strategia")
+    assert sig.loc["pre", "condizione_in_partita"] == "" and np.isnan(sig.loc["pre", "quota_live_stimata"])
+    assert "Primo set = Vinto" in sig.loc["live", "condizione_in_partita"] and 1.01 < sig.loc["live", "quota_live_stimata"] < 2.7
+    from src import notify
+    assert "Primo set = Vinto" in notify.format_signals(sig.reset_index())
+
+
+def test_first_break_events_and_strategy_games():
+    rows = []
+    for mid, seqs in (("m1", ["1111", "0000", "1111", "1111", "1111", "1111"]), ("m2", ["1111"] * 7), ("m3", ["1111"] * 3)):
+        for k, seq in enumerate(seqs, start=1):
+            rows.append({"match_id": "mcp" + mid, "db_match_id": mid, "set_no": 1, "game_no": k, "held": seq == "1111",
+                         "server": "A B" if k % 2 else "C D", "returner": "C D" if k % 2 else "A B", "v_break": 0.35, "seq": seq})
+    g = pd.DataFrame(rows)
+    ev = sc.build_events(g).set_index("db_match_id")
+    assert ev.loc["m1", "fb_breaker"] == "A B" and ev.loc["m1", "fb_prob"] == pytest.approx(0.65) and ev.loc["m1", "fb_game"] == 2
+    assert pd.isna(ev.loc["m2", "fb_breaker"]) and "m3" not in ev.index          # primo set registrato in modo incompleto
+    trades = pd.DataFrame({"match_id": ["m1", "m2", "zz"], "player": ["A B", "c d", "X"]})
+    mine, info = sc.strategy_games(g, trades, "player")
+    assert info == {"strategy_matches": 3, "with_points": 2, "unmatched_names": 0}
+    assert set(mine["server"]) == {"A B", "C D"} and (mine.groupby("db_match_id")["server"].nunique() == 1).all()
+    assert (mine[mine["db_match_id"] == "m2"]["server"] == "C D").all()          # nomi confrontati senza maiuscole e accenti
+    opp, _ = sc.strategy_games(g, trades, "opponent")
+    both, _ = sc.strategy_games(g, trades, "both")
+    assert len(mine) + len(opp) == len(both) == 13
+
+
+@needs_db
+def test_live_estimates_match_real_frequencies(con):
+    """Per ogni situazione di gioco la probabilita' live stimata deve coincidere con la frequenza reale."""
+    t = bt.load_selections("tennis", "h2h", "avg", "open", con)
+    for sel_ in (["favourite"], ["underdog"]):
+        stats = bt.conditional_stats(bt.apply_filters(t, {"selection": sel_}), "tennis")
+        for _, r in stats["Primo set"].iterrows():
+            assert abs(r["vince_pct"] - r["stimata_live_pct"]) < 2.0, (sel_, r["situazione"])
+        for _, r in stats.get("Primo break del primo set", pd.DataFrame()).iterrows():
+            if r["situazione"] != "Nessun break" and r["partite"] > 300:
+                assert abs(r["vince_pct"] - r["stimata_live_pct"]) < 4.0, (sel_, r["situazione"])
+    f = bt.load_selections("football", "1x2", "avg", "open", con)
+    stats = bt.conditional_stats(bt.apply_filters(f, {"selection": ["home", "away"]}), "football")
+    for _, r in stats["Squadra scelta all'intervallo"].iterrows():
+        assert abs(r["vince_pct"] - r["stimata_live_pct"]) < 1.5, r["situazione"]
+        assert r["ic_basso"] < r["vince_pct"] < r["ic_alto"]
+    o = bt.load_selections("football", "ou25", "avg", "open", con)
+    for _, r in bt.conditional_stats(bt.apply_filters(o, {"selection": ["over"]}), "football")["Gol nel primo tempo"].iterrows():
+        assert abs(r["vince_pct"] - r["stimata_live_pct"]) < 1.5, r["situazione"]

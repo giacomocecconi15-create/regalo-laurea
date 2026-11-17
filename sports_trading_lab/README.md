@@ -26,7 +26,7 @@ Uso manuale:
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python src/update_data.py        # scarica / aggiorna il database
-.venv/bin/python -m pytest tests -q        # 71 test
+.venv/bin/python -m pytest tests -q        # 77 test
 .venv/bin/python -m streamlit run app.py   # dashboard
 ```
 
@@ -171,6 +171,33 @@ spread e commissione configurabili.
   mercato vero né la liquidità.
 - La tabella *Punti reali contro modello* confronta, da ogni punteggio, quante volte chi serve tiene davvero il
   servizio con quanto previsto; *Dove rende* prova la stessa regola di uscita da tutti i punteggi di ingresso.
+
+### Filtri in partita e ingresso live
+
+Gruppo *In partita* nel pannello del Backtester:
+
+- **Tennis**: primo set vinto o perso, primo set al tie-break, primo break del primo set (fatto, subito o nessuno).
+  Il primo set vale per tutti i match completati (un ritiro a metà primo set lascia il dato vuoto); il primo break
+  esiste solo per i match registrati punto per punto (circa uno su cinque, soprattutto nei tornei maggiori).
+- **Calcio**: squadra scelta all'intervallo (in vantaggio, pari, in svantaggio), risultato all'intervallo, gol nel primo
+  tempo. La squadra che segna per prima non è disponibile: la fonte non riporta i minuti dei gol.
+
+I range di quota restano sulle quote **pre-partita**, ma con un filtro in partita l'operazione entra **dopo l'evento**
+(dopo il break, a fine primo set, all'intervallo) alla quota live stimata, meno un margine configurabile: così ROI e
+profitto non usano informazioni future. Il Riepilogo mostra quota media pre-partita, quota live di entrata (mediana),
+vittorie reali e probabilità stimata al momento. La vista *In partita* divide le operazioni per situazione di gioco
+con il numero di partite, la percentuale di vittorie (conteggio esatto) e il suo intervallo di confidenza al 95%.
+
+**Taratura delle quote live.** Non esistono quote in partita gratuite, e online non si trovano misure affidabili del
+calo medio delle quote (solo regole dei trader, per esempio "la quota dello sfavorito che vince il primo set si divide
+per 4-4,5"). La stima viene quindi dai modelli dell'app, tarati sui risultati reali: primo set su tutti i match,
+primo break sui match punto per punto (chi breakka per primo vince circa 8 punti più di quanto preveda un modello a punti
+indipendenti), intervallo sulle partite di calcio 2019-2022 con verifica sul 2023 in poi. Un test controlla che, per ogni
+situazione, la probabilità stimata coincida con la frequenza reale (entro 1,5 punti nel calcio e 2 nel tennis).
+
+Lo **Scalping** può partire da una strategia salvata: simula solo i game dei match in cui la strategia avrebbe operato,
+scegliendo se serve il giocatore scelto, l'avversario o entrambi, ed eventualmente solo dopo il momento di ingresso.
+Lo scanner segnala le strategie con condizioni in partita come "da verificare dal vivo", con la quota live attesa.
 
 ### Quote reali (Betfair Exchange)
 

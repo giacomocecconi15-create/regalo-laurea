@@ -63,6 +63,9 @@ def format_signals(signals: pd.DataFrame) -> str:
     lines = [f"Sports Trading Lab: {len(signals)} nuovi segnali"]
     for r in signals.itertuples():
         lines.append(f"\n{r.data}  {r.evento}\n{r.lato} {r.selezione} @ {r.quota:.2f}  ({r.strategia})\nstake {r.importo_rischio:.2f}")
+        cond = getattr(r, "condizione_in_partita", "") or ""
+        if cond:
+            lines.append(cond)
     return "\n".join(lines)
 
 

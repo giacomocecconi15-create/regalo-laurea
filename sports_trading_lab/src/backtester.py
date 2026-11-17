@@ -80,6 +80,9 @@ FILTERS = {
         ("opp_hand", "Mano", "Avversario", "cat"),
         ("model_prob", "Probabilità di vittoria secondo il modello Elo (%)", "Modello", "slider", 0, 100, 5),
         ("model_edge", "Vantaggio del modello sulla quota (punti %)", "Modello", "slider", -30, 30, 1),
+        ("ip_set1", "Primo set", "In partita", "cat"),
+        ("ip_set1_tb", "Primo set deciso al tie-break", "In partita", "cat"),
+        ("ip_break1", "Primo break del primo set", "In partita", "cat"),
         ("rank_adv", "Vantaggio di ranking (avversario - giocatore)", "Confronto diretto", "num"),
         ("form_adv", "Vantaggio di form (punti %)", "Confronto diretto", "slider", -100, 100, 5),
         ("h2h_wins", "Precedenti vinti (dal 2019)", "Confronto diretto", "slider", 0, 15, 1),
@@ -115,14 +118,25 @@ FILTERS = {
         ("away_rest_days", "Giorni di riposo", "Squadra ospite", "slider", 2, 30, 1),
         ("model_prob", "Probabilità dell'esito secondo il modello Elo (%, solo 1X2)", "Modello", "slider", 0, 100, 5),
         ("model_edge", "Vantaggio del modello sulla quota (punti %, solo 1X2)", "Modello", "slider", -30, 30, 1),
+        ("ip_ht_sel", "Squadra scelta all'intervallo (solo 1 e 2)", "In partita", "cat"),
+        ("ip_ht", "Risultato all'intervallo", "In partita", "cat"),
+        ("ip_ht_goals", "Gol nel primo tempo", "In partita", "cat"),
         ("pos_diff", "Posizioni di vantaggio della casa", "Confronto", "slider", -23, 23, 1),
         ("ppg_diff", "Differenza punti a partita ult. 5 (casa - ospite)", "Confronto", "slider", -3.0, 3.0, 0.2),
         ("goals5", "Gol totali medi nelle partite recenti", "Confronto", "slider", 0.0, 6.0, 0.2),
     ],
 }
 FILTER_COLUMNS = {sp: {f[0]: (f[1], f[3]) for f in specs} for sp, specs in FILTERS.items()}
-FILTER_LABELS = {sp: {f[0]: (f[1] if f[2] in ("Torneo", "Competizione", "Calendario", "Quote del match", "Confronto", "Confronto diretto", "Modello")
+FILTER_LABELS = {sp: {f[0]: (f[1] if f[2] in ("Torneo", "Competizione", "Calendario", "Quote del match", "Confronto", "Confronto diretto", "Modello", "In partita")
                             else f"{f[2]}: {f[1]}") for f in specs} for sp, specs in FILTERS.items()}
+
+
+# condizioni note solo a partita iniziata: con questi filtri l'ingresso avviene dopo l'evento, a quota live stimata
+INPLAY = {"tennis": {"ip_set1", "ip_set1_tb", "ip_break1"}, "football": {"ip_ht_sel", "ip_ht", "ip_ht_goals"}}
+LIVE_MARGIN = 3.0          # margine di default sulle quote in partita (%)
+BREAK_MOMENTUM = 0.4       # correzione (logit) per chi fa il primo break, misurata sui match punto per punto
+ENTRY_LABEL = {"set1": "dopo il primo set", "break1": "dopo il primo break (o a fine primo set se non c'e' break)",
+               "ht": "all'intervallo"}
 
 
 DRAW_PEAK, DRAW_WIDTH, ELO_HOME, ELO_SCALE = 0.29, 250.0, 55.0, 0.75   # tarati sullo storico (minima log-loss)
@@ -141,6 +155,13 @@ def football_model_probs(home_elo, away_elo, home_adv: float = ELO_HOME, scale: 
     d = DRAW_PEAK * np.exp(-dr ** 2 / (2 * DRAW_WIDTH ** 2))
     p = np.stack([np.clip(e - d / 2, 0.02, 0.96), d, np.clip(1 - e - d / 2, 0.02, 0.96)], axis=1)
     return p / p.sum(axis=1, keepdims=True)
+
+
+def _norm_name(name) -> str:
+    import re
+    import unicodedata
+    s = unicodedata.normalize("NFKD", str(name)).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z]", "", s.lower())
 
 
 def _get(m: pd.DataFrame, name: str) -> pd.Series:
@@ -172,12 +193,17 @@ def tennis_selections(matches: pd.DataFrame, price: str = "avg") -> pd.DataFrame
         "court": np.where(indoor.isna(), None, np.where(indoor.eq(True), "Indoor", "Outdoor")),
         "status": m["status"],
     }
-    # esito del primo set (dato successivo al match: serve solo alla simulazione del cash out, non ai filtri)
+    # primo set dal punteggio finale, solo se il set e' stato completato (6-0..6-4, 7-5, 7-6): un ritiro a meta'
+    # primo set lascia il dato vuoto
     first = m["score"].astype(str).str.extract(r"^\s*(\d+)-(\d+)") if "score" in m.columns else pd.DataFrame({0: [], 1: []})
     g_w = pd.to_numeric(first[0], errors="coerce").reindex(m.index)
     g_l = pd.to_numeric(first[1], errors="coerce").reindex(m.index)
-    set1 = {True: (g_w > g_l).astype(float).where(g_w.notna() & g_l.notna() & (g_w != g_l)),
-            False: (g_l > g_w).astype(float).where(g_w.notna() & g_l.notna() & (g_w != g_l))}
+    hi, lo = np.maximum(g_w, g_l), np.minimum(g_w, g_l)
+    complete = ((hi == 6) & (lo <= 4)) | ((hi == 7) & ((lo == 5) | (lo == 6)))
+    set1 = {True: (g_w > g_l).astype(float).where(complete), False: (g_l > g_w).astype(float).where(complete)}
+    tb = pd.Series(np.where(complete, np.where(lo == 6, "Sì", "No"), None), index=m.index)
+    breaker = _get(m, "fb_breaker").map(lambda n: _norm_name(n) if isinstance(n, str) else n)
+    has_events = _get(m, "_ev_match").notna().to_numpy()
     sides = []
     for a, b, won in (("winner", "loser", True), ("loser", "winner", False)):
         x, y = a[0], b[0]
@@ -200,6 +226,13 @@ def tennis_selections(matches: pd.DataFrame, price: str = "avg") -> pd.DataFrame
             "odds": m[f"{price}_{x}"], "opp_odds": m[f"{price}_{y}"],
             "close_odds": m[f"ps_{x}"], "_close_opp": m[f"ps_{y}"],
             "won": won, "set1_won": set1[won],
+            "ip_set1": set1[won].map({1.0: "Vinto", 0.0: "Perso"}), "ip_set1_tb": tb,
+            "ip_break1": np.where(~has_events, None, np.where(breaker.isna(), "Nessun break",
+                                  np.where(breaker == m[f"{a}_name"].map(_norm_name), "Fatto",
+                                           np.where(breaker == m[f"{b}_name"].map(_norm_name), "Subito", None)))),
+            "_fb_game": _get(m, "fb_game"),
+            "_fb_prob": np.where(breaker == m[f"{a}_name"].map(_norm_name), _get(m, "fb_prob"),
+                                 np.where(breaker == m[f"{b}_name"].map(_norm_name), 1 - _get(m, "fb_prob"), np.nan)),
         }))
     s = pd.concat(sides, ignore_index=True)
     s["rank_adv"] = s["opp_rank"] - s["rank"]
@@ -262,9 +295,17 @@ def football_selections(matches: pd.DataFrame, market: str = "1x2", price: str =
     model = football_model_probs(feats["home_elo"], feats["away_elo"]) * 100
     imp = 1 / np.stack([oh.to_numpy(dtype=float), od.to_numpy(dtype=float), oa.to_numpy(dtype=float)], axis=1)
     imp = imp / imp.sum(axis=1, keepdims=True) * 100
+    hh, ha = _get(m, "hthg"), _get(m, "htag")
+    ht_ok = hh.notna() & ha.notna()
+    common["ht_home"], common["ht_away"] = hh, ha
+    common["ip_ht"] = np.where(~ht_ok, None, np.where(hh > ha, "Casa avanti", np.where(hh < ha, "Ospite avanti", "Pari")))
+    tot = hh + ha
+    common["ip_ht_goals"] = np.where(~ht_ok, None, np.where(tot >= 3, "3+", tot.fillna(0).astype(int).astype(str)))
     for k, (name, suf, won) in enumerate(outcomes):
         d = pd.DataFrame({**common, "selection": name, "odds": m[f"{price}_{pre}{suf}"],
                           "close_odds": close[suf], "p_close": (1 / close[suf]) / inv, "won": won.to_numpy()})
+        lead = (hh - ha) if name == "home" else (ha - hh) if name == "away" else None
+        d["ip_ht_sel"] = None if lead is None else np.where(~ht_ok, None, np.where(lead > 0, "In vantaggio", np.where(lead < 0, "In svantaggio", "Pari")))
         d["model_prob"] = model[:, k] if market == "1x2" else np.nan
         d["model_edge"] = model[:, k] - imp[:, k] if market == "1x2" else np.nan
         if market == "1x2" and name != "draw":
@@ -282,7 +323,13 @@ def load_selections(sport: str, market: str | None = None, price: str = "avg", t
     con = con or connect()
     try:
         if sport == "tennis":
-            return tennis_selections(con.execute("SELECT * FROM tennis_matches WHERE has_odds").df(), price)
+            tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
+            if "tennis_match_events" in tables:
+                q = """SELECT t.*, e.fb_breaker, e.fb_prob, e.fb_game, e.db_match_id AS _ev_match FROM tennis_matches t
+                       LEFT JOIN tennis_match_events e ON e.db_match_id = t.match_id WHERE t.has_odds"""
+            else:
+                q = "SELECT * FROM tennis_matches WHERE has_odds"
+            return tennis_selections(con.execute(q).df(), price)
         if sport == "football":
             return football_selections(con.execute("SELECT * FROM football_matches").df(), market or "1x2", price, timing)
         raise ValueError(f"sport non supportato: {sport}")
@@ -433,6 +480,7 @@ class BacktestResult:
     trades: pd.DataFrame
     metrics: dict
     monthly: pd.DataFrame
+    live: dict | None = None     # ingresso in partita: quote medie pre/live, frequenza reale, probabilita' stimata
 
     @property
     def equity_curve(self) -> pd.DataFrame:
@@ -440,14 +488,78 @@ class BacktestResult:
         return pd.DataFrame({"trade": np.arange(1, len(t) + 1), "date": t["date"], "pnl": t["pnl"], "equity": t["equity"]})
 
 
+def inplay_active(cfg: dict) -> set:
+    """Filtri in partita attivi nella configurazione."""
+    sport = cfg.get("sport", "tennis")
+    return {c for c, r in (cfg.get("filters") or {}).items() if c in INPLAY.get(sport, set()) and r and r.get("in")}
+
+
+def entry_point(cfg: dict) -> str | None:
+    """Momento di ingresso imposto dai filtri in partita (il piu' tardivo tra quelli attivi)."""
+    active = inplay_active(cfg)
+    if not active:
+        return None
+    if cfg.get("sport") == "football":
+        return "ht"
+    return "set1" if active & {"ip_set1", "ip_set1_tb"} else "break1"
+
+
+def live_prob(sel: pd.DataFrame, point: str) -> np.ndarray:
+    """Probabilita' stimata della selezione nel momento di ingresso (senza margine).
+    set1: modello a set tarato sui risultati;  break1: modello punto per punto con correzione per il primo
+    break (se nel primo set non c'e' break, si usa la fine del primo set);  ht: modello Poisson sui gol."""
+    if sel.empty:
+        return np.zeros(0)
+    if point == "ht":
+        return cashout.football_checkpoint_prob(sel)
+    after_set = cashout.tennis_checkpoint_prob(sel)
+    if point == "set1":
+        return after_set
+    p = np.clip(sel["_fb_prob"].to_numpy(dtype=float), 1e-4, 1 - 1e-4) if "_fb_prob" in sel.columns else np.full(len(sel), np.nan)
+    breaker = sel["ip_break1"].to_numpy() == "Fatto" if "ip_break1" in sel.columns else np.zeros(len(sel), bool)
+    broken = sel["ip_break1"].to_numpy() == "Subito" if "ip_break1" in sel.columns else np.zeros(len(sel), bool)
+    logit = np.log(p / (1 - p)) + np.where(breaker, BREAK_MOMENTUM, np.where(broken, -BREAK_MOMENTUM, 0.0))
+    corrected = 1 / (1 + np.exp(-logit))
+    return np.where(breaker | broken, corrected, after_set)
+
+
+def live_odds(p: np.ndarray, side: str, margin_pct: float) -> np.ndarray:
+    """Quota disponibile in partita: quota equa 1/p peggiorata del margine (piu' bassa per chi punta,
+    piu' alta per chi banca)."""
+    m = margin_pct / 100
+    fair = 1 / np.clip(p, 1e-4, 1)
+    return np.maximum(fair * (1 - m), 1.01) if side == "back" else np.maximum(fair * (1 + m), 1.01)
+
+
 def backtest_selections(sel: pd.DataFrame, cfg: dict, bankroll: float = 100.0) -> BacktestResult:
-    """Backtest su un dataframe di selezioni gia' caricato (utile per riusare la cache)."""
+    """Backtest su un dataframe di selezioni gia' caricato (utile per riusare la cache).
+    Con filtri in partita attivi i range di quota restano sulle quote pre-partita, ma l'operazione entra dopo
+    l'evento alla quota live stimata (vedi `live_prob`), cosi' il risultato non usa informazioni future."""
     picked = apply_filters(sel, cfg)
-    trades = settle(picked, cfg.get("side", "back"), float(cfg.get("commission") or 0.0),
+    point = entry_point(cfg)
+    live = None
+    side = cfg.get("side", "back")
+    if point is not None and len(picked):
+        p = live_prob(picked, point)
+        picked = picked.assign(pre_odds=picked["odds"], live_prob=p)[np.isfinite(p)]
+        p = picked["live_prob"].to_numpy()
+        picked = picked.assign(odds=live_odds(p, side, float(cfg.get("live_margin", LIVE_MARGIN))),
+                               close_odds=np.nan, p_close=np.nan)
+    trades = settle(picked, side, float(cfg.get("commission") or 0.0),
                     cfg.get("lay_mode", "liability"), float(cfg.get("stake") or 1.0))
+    smart_skipped = False
     if cashout.is_active(cfg):
-        trades = cashout.apply(trades, cfg)
-    return BacktestResult(cfg, trades, compute_metrics(trades, bankroll), monthly_returns(trades))
+        if point is not None and cashout.settings(cfg)["mode"] == "smart":
+            smart_skipped = True       # il punto di controllo del cash out coincide con l'ingresso: non ha senso
+        else:
+            trades = cashout.apply(trades, cfg)
+    if point is not None and len(trades):
+        pre_p = 1 / trades["pre_odds"]
+        live = {"entry": point, "label": ENTRY_LABEL[point], "avg_pre_odds": float(trades["pre_odds"].mean()),
+                "avg_live_odds": float(trades["odds"].median()), "real_win_pct": float(trades["won"].mean() * 100),
+                "est_prob_pct": float(trades["live_prob"].mean() * 100), "pre_implied_pct": float(pre_p.mean() * 100),
+                "margin_pct": float(cfg.get("live_margin", LIVE_MARGIN)), "smart_cashout_skipped": smart_skipped}
+    return BacktestResult(cfg, trades, compute_metrics(trades, bankroll), monthly_returns(trades), live)
 
 
 def run_backtest(cfg: dict, con: duckdb.DuckDBPyConnection | None = None, bankroll: float = 100.0) -> BacktestResult:
@@ -498,6 +610,8 @@ def segment_scan(trades: pd.DataFrame, sport: str, min_trades: int = 100, bucket
     half = np.where(np.arange(len(t)) < len(t) / 2, 1, 2)
     for spec in FILTERS[sport]:
         col, kind = spec[0], spec[3]
+        if col in INPLAY.get(sport, set()):      # condizioni in partita: il ROI a quote pre-partita non sarebbe reale
+            continue
         if col not in t.columns or t[col].notna().sum() < min_trades:
             continue
         if kind == "cat":
@@ -571,6 +685,49 @@ def walk_forward(trades: pd.DataFrame, n_bands: int = 5, min_trades: int = 40) -
                "naive_roi_pct": float(naive["pnl"].sum() / naive["risk"].sum() * 100) if len(naive) else float("nan"),
                "naive_profit": float(naive["pnl"].sum()), "positive_years": int((table["profitto"] > 0).sum()) if len(table) else 0}
     return table, summary
+
+
+def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Intervallo di confidenza al 95% di una frequenza (metodo di Wilson)."""
+    if n == 0:
+        return float("nan"), float("nan")
+    p = k / n
+    den = 1 + z ** 2 / n
+    mid = (p + z ** 2 / (2 * n)) / den
+    half = z * np.sqrt(p * (1 - p) / n + z ** 2 / (4 * n ** 2)) / den
+    return float(mid - half) * 100, float(mid + half) * 100
+
+
+def conditional_stats(base: pd.DataFrame, sport: str, side: str = "back", margin_pct: float = LIVE_MARGIN) -> dict:
+    """Quante volte vince la selezione in ogni situazione di partita. `base` = selezioni gia' filtrate SENZA
+    i filtri in partita. Frequenze e intervalli sono conteggi esatti; prob./quota live sono stime."""
+    out = {}
+    if base.empty:
+        return out
+    groups = {"tennis": [("ip_set1", "set1", "Primo set"), ("ip_break1", "break1", "Primo break del primo set"),
+                         ("ip_set1_tb", "set1", "Primo set al tie-break")],
+              "football": [("ip_ht_sel", "ht", "Squadra scelta all'intervallo"), ("ip_ht", "ht", "Risultato all'intervallo"),
+                           ("ip_ht_goals", "ht", "Gol nel primo tempo")]}[sport]
+    for col, point, title in groups:
+        if col not in base.columns:
+            continue
+        b = base[base[col].notna()]
+        if b.empty:
+            continue
+        p = live_prob(b, point)
+        b = b.assign(_p=p)
+        rows = []
+        for state, x in b.groupby(col, sort=True):
+            n, k = len(x), int(x["won"].sum())
+            lo, hi = wilson(k, n)
+            pl = x["_p"].to_numpy(dtype=float)
+            rows.append({"situazione": state, "partite": n, "vinte": k, "vince_pct": k / n * 100, "ic_basso": lo, "ic_alto": hi,
+                         "implicita_pre_pct": float((1 / x["odds"]).mean() * 100),
+                         "stimata_live_pct": float(np.nanmean(pl) * 100) if np.isfinite(pl).any() else np.nan,
+                         "quota_pre_media": float(x["odds"].mean()),
+                         "quota_live_mediana": float(np.nanmedian(live_odds(pl, side, margin_pct))) if np.isfinite(pl).any() else np.nan})
+        out[title] = pd.DataFrame(rows)
+    return out
 
 
 def roi_confidence(trades: pd.DataFrame, n_boot: int = 1000, seed: int = 7) -> dict:
