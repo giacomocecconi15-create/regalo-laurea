@@ -10,7 +10,7 @@ RAW_DIR = DATA_DIR / "raw"
 DB_PATH = DATA_DIR / "trading_db.duckdb"
 STRATEGIES_PATH = ROOT / "strategies.json"
 
-SCHEMA_VERSION = "5"  # da incrementare quando cambiano le feature calcolate
+SCHEMA_VERSION = "6"  # da incrementare quando cambiano le feature calcolate
 FIRST_YEAR = 2019  # primo anno / stagione scaricata (>= 5 anni di storico)
 
 # --------------------------------------------------------------------------- calcio
@@ -101,9 +101,11 @@ TENNIS_ODDS_MIRRORS = [
 TENNIS_TOUR_SOURCES = [
     "https://raw.githubusercontent.com/Tennismylife/TML-Database/master/{year}.csv",
     "https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_{year}.csv",
+    "https://raw.githubusercontent.com/Aneeshers/tennis-sackmann-archive/main/atp/atp_matches_{year}.csv",
 ]
 TENNIS_CHALL_SOURCES = [
     "https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_qual_chall_{year}.csv",
+    "https://raw.githubusercontent.com/Aneeshers/tennis-sackmann-archive/main/atp/atp_matches_qual_chall_{year}.csv",
     "https://media.githubusercontent.com/media/ivanposinovec/ATP/main/tennis_atp-master/atp_matches_qual_chall_{year}.csv",
 ]
 

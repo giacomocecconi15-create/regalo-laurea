@@ -494,3 +494,93 @@ def state_stats(games: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(rows)
     out["scarto"] = out["tenuti_pct"] - out["modello_pct"]
     return out
+
+
+# --------------------------------------------------------------------------- scalping con Take Profit / Stop Loss
+def scalp_paths(games: pd.DataFrame, side: str = "back", spread_pct: float = 0.5, commission: float = 0.0,
+                skip_games: int = 2, decided_pct: float = 5.0, stop_at_bp: bool = False) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
+    """Un'operazione per game di servizio: ingresso sul battitore a 0-0, valore dopo ogni punto.
+    Esclusi i primi `skip_games` game del match e i game con match ormai deciso (probabilita' del battitore
+    sotto `decided_pct`% o sopra 100-`decided_pct`%, quando sul mercato non ci sarebbero quote utili).
+    Ritorna (dati dei game, matrice dei valori per unita' di rischio n x MAXLEN con NaN dopo la fine, valore a fine game)."""
+    g = games[~((games["set_no"] == 1) & (games["game_no"] <= skip_games))].reset_index(drop=True)
+    if g.empty:
+        return g.assign(p_in=np.nan), np.zeros((0, MAXLEN)), np.zeros(0)
+    pts, lens = _matrix(g["seq"])
+    n = len(g)
+    a = np.concatenate([np.zeros((n, 1), int), np.cumsum(pts == 1, axis=1)], axis=1)
+    b = np.concatenate([np.zeros((n, 1), int), np.cumsum(pts == 0, axis=1)], axis=1)
+    na, nb = _norm(a, b)
+    table = game_table(g["p_srv"].to_numpy())
+    rows = np.arange(n)[:, None]
+    pg = table[rows, na, nb]                                                     # prob. di tenere dopo k punti
+    held = g["held"].to_numpy().astype(float)
+    k = np.arange(MAXLEN + 1)[None, :]
+    pg = np.where(k >= lens[:, None], held[:, None], pg)
+    vh, vb = g["v_hold"].to_numpy()[:, None], g["v_break"].to_numpy()[:, None]
+    price = pg * vh + (1 - pg) * vb                                              # prob. match del battitore
+    p_in = price[:, 0]
+    s = spread_pct / 100
+    with np.errstate(divide="ignore", invalid="ignore"):
+        if side == "back":
+            val = (price[:, 1:] / p_in[:, None]) * (1 - s) / (1 + s) - 1
+        else:                                                                    # banca il battitore, chiude puntando
+            o_in, o_out = (1 / p_in[:, None]) * (1 + s), (1 / price[:, 1:]) * (1 - s)
+            val = (1 - o_in / o_out) / (o_in - 1)
+    val = np.where(val > 0, val * (1 - commission), val)
+    val = np.maximum(val, -1.0)
+    alive = k[:, 1:] <= lens[:, None]
+    end = lens.copy()
+    if stop_at_bp:                                                               # chiude alla prima palla break
+        bp = (nb >= 3) & (nb > na) & (k < lens[:, None])
+        k_bp = np.where(bp[:, 1:].any(axis=1), bp[:, 1:].argmax(axis=1) + 1, MAXLEN + 1)
+        end = np.minimum(end, k_bp)
+        alive &= k[:, 1:] <= end[:, None]
+    val = np.where(alive, val, np.nan)
+    final = val[np.arange(n), end - 1]
+    ok = (p_in >= decided_pct / 100) & (p_in <= 1 - decided_pct / 100) & np.isfinite(final)
+    g = g.assign(p_in=p_in, end_pts=end)
+    return g[ok].reset_index(drop=True), val[ok], final[ok]
+
+
+def scalp_trades(games: pd.DataFrame, tp: float, sl: float, **kw) -> pd.DataFrame:
+    """Operazioni di scalping nel formato del backtester, con Take Profit / Stop Loss punto per punto."""
+    from src import cashout
+    g, vals, final = scalp_paths(games, **kw)
+    cols = ["date", "match_id", "event", "surface", "set_no", "game_no", "role", "selection", "odds", "risk", "pnl", "pnl_hold",
+            "cashout", "exit_point", "held", "won", "clv_pct", "ev_close_pct", "trade_won", "equity"]
+    if g.empty:
+        return pd.DataFrame(columns=cols)
+    pnl, reason, k = cashout.apply_tpsl(vals, final, tp, sl)
+    t = pd.DataFrame({
+        "date": g["match_date"], "match_id": g["db_match_id"].astype(str) + "|" + g["set_no"].astype(str) + "|" + g["game_no"].astype(str),
+        "event": g["server"] + " (serve) vs " + g["returner"], "surface": g["surface"], "set_no": g["set_no"], "game_no": g["game_no"],
+        "role": np.where(g["pre_prob"] >= 0.5, "Favorito al servizio", "Sfavorito al servizio"), "selection": "server",
+        "odds": 1 / g["p_in"], "risk": 1.0, "pnl": pnl, "pnl_hold": final, "cashout": reason,
+        "exit_point": [f"dopo {i + 1} punti" if i >= 0 else "fine game" for i in k],
+        "held": np.where(g["held"].astype(bool), "Tenuto", "Break"), "won": g["held"].astype(bool),
+        "clv_pct": np.nan, "ev_close_pct": np.nan,
+    })
+    t = t.sort_values(["date", "match_id"], kind="stable").reset_index(drop=True)
+    t["trade_won"] = t["pnl"] > 0
+    t["equity"] = t["pnl"].cumsum()
+    return t
+
+
+def typical_moves(games: pd.DataFrame, side: str = "back", **kw) -> pd.DataFrame:
+    """Rendimento tipico di un game tenuto fino alla fine, per superficie e ruolo del battitore:
+    quanto si guadagna in media se il servizio e' tenuto e quanto si perde se arriva il break.
+    Sono le percentuali di riferimento per scegliere Take Profit e Stop Loss nello scalping."""
+    g, _, final = scalp_paths(games, side=side, **kw)
+    if g.empty:
+        return pd.DataFrame()
+    d = pd.DataFrame({"superficie": g["surface"], "battitore": np.where(g["pre_prob"] >= 0.5, "Favorito", "Sfavorito"),
+                      "tenuto": g["held"].astype(bool), "r": final * 100})
+    rows = []
+    for (surf, role), x in d.groupby(["superficie", "battitore"]):
+        h, b = x[x["tenuto"]], x[~x["tenuto"]]
+        rows.append({"superficie": surf, "battitore": role, "game": len(x), "tenuti_pct": x["tenuto"].mean() * 100,
+                     "guadagno_tenuto_pct": h["r"].median() if len(h) else np.nan,
+                     "perdita_break_pct": b["r"].median() if len(b) else np.nan,
+                     "rendimento_medio_pct": x["r"].mean()})
+    return pd.DataFrame(rows)

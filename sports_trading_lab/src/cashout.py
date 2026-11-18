@@ -1,68 +1,86 @@
-"""Simulazione delle chiusure anticipate (cash out) nel backtest.
+"""Cash out con Take Profit e Stop Loss.
 
-Il database non contiene quote in corso di partita, quindi il cash out si simula in due modi:
+Due sole soglie, in percentuale dell'importo a rischio:
+    Take Profit  -> chiudi in utile quando il cash out vale almeno +TP%
+    Stop Loss    -> chiudi in perdita quando il cash out vale -SL% o meno
+e un "quando": i momenti della partita in cui il cash out viene controllato.
 
-MANUALE  - riproduci il tuo comportamento reale con quattro regole, ciascuna con una quota di giocate
-           interessate e un importo:
-             1. vincente incassata prima      -> incassi solo una parte del profitto pieno
-             2. vincente chiusa in perdita    -> uscita sbagliata: perdi una parte della puntata
-             3. perdente chiusa in profitto   -> uscita giusta: incassi una parte del profitto potenziale
-             4. perdente tagliata             -> recuperi una parte della puntata
-           Le giocate interessate sono scelte in modo casuale ma ripetibile (dipende solo dall'id del
-           match e dal seme), quindi lo stesso backtest da' sempre lo stesso risultato.
+  tennis:  al primo break del primo set, a fine primo set, a fine secondo set, oppure in ognuno di questi momenti
+  calcio:  all'intervallo
+  scalping sul servizio (tennis): ogni game di servizio e' un'operazione a se', controllata punto per punto
+                                   (vedi src/scalping.py)
 
-INTELLIGENTE - usa lo stato reale della partita a un punto di controllo presente nei dati:
-             calcio -> risultato all'intervallo;   tennis -> esito del primo set.
-           La probabilita' della selezione a quel punto e' stimata con un modello (Poisson per i gol
-           del secondo tempo, set indipendenti per il tennis) calibrato sulle quote pre-partita; da
-           li' si ricava il valore del cash out e si chiude se supera la soglia di profitto
-           ("incassa") o di perdita ("taglia"). E' una stima: le quote reali in corso di partita
-           possono differire, e il margine del cash out e' un parametro.
+Il database non contiene quote in corso di partita: nei momenti di controllo la quota viene stimata con
+modelli tarati sui risultati reali (primo set, secondo set, primo break, intervallo). Se nessuna soglia
+viene raggiunta l'operazione resta aperta fino alla fine.
 
-Valore del cash out per unita' (p = probabilita' stimata della selezione al punto di controllo,
+Valore del cash out per unita' di rischio (p = probabilita' stimata della selezione nel momento di controllo,
 m = margine del cash out):
-    back: profitto = puntata * (quota * p * (1 - m) - 1)
-    lay : profitto = puntata_banco * (1 - quota * p * (1 + m))
+    back: profitto = quota_ingresso * p * (1 - m) - 1
+    lay : profitto = puntata_banco * (1 - quota_ingresso * p * (1 + m))
 Sui profitti si applica la commissione exchange della strategia.
 """
 from __future__ import annotations
-
-import hashlib
 
 import numpy as np
 import pandas as pd
 
 SECOND_HALF_SHARE = 0.554   # quota dei gol segnati nel secondo tempo (misurata sul database)
 SET_MOMENTUM = 0.2          # spostamento (logit) dopo il primo set: chi lo vince rende piu' di quanto dica il modello a set indipendenti
+SET2_MOMENTUM = 0.08        # idem dopo il secondo set: sull'1-1 chi ha vinto il secondo set vince di piu' (tarato 2019-2022, verificato 2023+)
 MAX_GOALS = 12
-DEFAULTS = {
-    "mode": "off",
-    # manuale: quote e importi in percentuale
-    "win_early_share": 0.0, "win_early_keep": 70.0,      # vincenti incassate prima: % giocate, % del profitto incassata
-    "win_panic_share": 0.0, "win_panic_loss": 30.0,      # vincenti chiuse in perdita: % giocate, % della puntata persa
-    "lose_saved_share": 0.0, "lose_saved_gain": 30.0,    # perdenti chiuse in profitto: % giocate, % del profitto potenziale
-    "lose_cut_share": 0.0, "lose_cut_recover": 40.0,     # perdenti tagliate: % giocate, % della puntata recuperata
-    "seed": 1,
-    # intelligente
-    "take_profit": True, "tp_pct": 30.0,                 # incassa se il cash out vale almeno +tp% del rischio
-    "stop_loss": False, "sl_pct": 50.0,                  # taglia se il cash out vale al massimo -sl% del rischio
-    "margin_pct": 5.0,                                   # margine trattenuto sul cash out
+WHEN = {
+    "tennis": {"off": "Nessun cash out", "break1": "Al primo break", "set1": "A fine primo set", "set2": "A fine secondo set",
+               "all": "In ogni momento disponibile", "scalping": "Scalping sul servizio"},
+    "football": {"off": "Nessun cash out", "ht": "All'intervallo"},
 }
-REASONS = {"": "Tenuta fino alla fine", "tp": "Take profit (soglia)", "sl": "Stop loss (soglia)", "time": "Chiusa a tempo",
-           "win_early": "Take profit", "win_panic": "Uscita errata in perdita",
-           "lose_saved": "Uscita anticipata in utile", "lose_cut": "Stop loss"}
+CHECKPOINT_LABEL = {"break1": "primo break", "set1": "fine primo set", "set2": "fine secondo set", "ht": "intervallo"}
+ORDER = ["break1", "set1", "set2"]
+DEFAULTS = {"mode": "off", "when": "set1", "tp": 30.0, "sl": 50.0, "margin_pct": 5.0,
+            # solo scalping
+            "who": "both", "skip_games": 2, "decided_pct": 5.0, "stop_at_bp": False, "spread_pct": 0.5}
+REASONS = {"": "Tenuta fino alla fine", "tp": "Take Profit", "sl": "Stop Loss"}
 
 
 def settings(cfg: dict | None) -> dict:
-    """Impostazioni complete del cash out di una strategia (i valori mancanti prendono il default)."""
-    return {**DEFAULTS, **((cfg or {}).get("cashout") or {})}
+    """Impostazioni complete del cash out di una strategia. Le strategie salvate con le versioni precedenti
+    (regole 'manuali' a frequenza o modalita' 'intelligente') vengono convertite: l'intelligente diventa
+    Take Profit / Stop Loss a fine primo set (intervallo nel calcio), il manuale viene disattivato."""
+    raw = dict((cfg or {}).get("cashout") or {})
+    sport = (cfg or {}).get("sport", "tennis")
+    if raw.get("mode") == "smart":
+        raw = {"mode": "tpsl", "when": "ht" if sport == "football" else "set1",
+               "tp": raw.get("tp_pct", 30.0) if raw.get("take_profit", True) else 0.0,
+               "sl": raw.get("sl_pct", 50.0) if raw.get("stop_loss", False) else 0.0,
+               "margin_pct": raw.get("margin_pct", 5.0)}
+    elif raw.get("mode") == "manual":
+        raw = {"mode": "off", "legacy_manual": True}
+    out = {**DEFAULTS, **raw}
+    if out["when"] not in WHEN.get(sport, {}) or out["when"] == "off":
+        out["mode"] = "off"
+    return out
 
 
 def is_active(cfg: dict | None) -> bool:
-    return settings(cfg)["mode"] in ("manual", "smart")
+    c = settings(cfg)
+    return c["mode"] == "tpsl" and (c["tp"] > 0 or c["sl"] > 0 or c["when"] == "scalping")
 
 
-# --------------------------------------------------------------------------- modello calcio
+def checkpoints(cfg: dict) -> list[str]:
+    """Momenti di controllo validi, in ordine cronologico, tenendo conto del momento di ingresso:
+    un controllo precedente o coincidente con l'ingresso viene escluso."""
+    c = settings(cfg)
+    if c["mode"] != "tpsl" or c["when"] == "scalping":
+        return []
+    from src import backtester as bt
+    entry = bt.entry_point(cfg)
+    if cfg.get("sport") == "football":
+        return [] if entry == "ht" else ["ht"]
+    wanted = ORDER if c["when"] == "all" else [c["when"]]
+    start = {None: -1, "break1": 0, "set1": 1}[entry]
+    return [w for w in wanted if ORDER.index(w) > start]
+
+
 def _poisson_pmf(lam: np.ndarray, kmax: int = MAX_GOALS) -> np.ndarray:
     """Matrice (n, kmax+1) delle probabilita' di Poisson; l'ultima colonna assorbe la coda."""
     lam = np.asarray(lam, dtype=float)[:, None]
@@ -212,23 +230,57 @@ def tennis_checkpoint_prob(t: pd.DataFrame) -> np.ndarray:
     return out
 
 
-def checkpoint_prob(trades: pd.DataFrame) -> np.ndarray:
-    """Probabilita' della selezione al punto di controllo (intervallo / fine primo set)."""
-    if "set1_won" in trades.columns:
-        return tennis_checkpoint_prob(trades)
-    return football_checkpoint_prob(trades)
+def tennis_set2_prob(t: pd.DataFrame) -> np.ndarray:
+    """Probabilita' di vincere il match dopo due set, dai set vinti nei primi due (colonna `set2_sets`)."""
+    need = ("odds", "opp_odds", "set2_sets", "best_of")
+    if t.empty or any(c not in t.columns for c in need):
+        return np.full(len(t), np.nan)
+    o, oo = 1 / t["odds"].to_numpy(dtype=float), 1 / t["opp_odds"].to_numpy(dtype=float)
+    p0 = o / (o + oo)
+    k = t["set2_sets"].to_numpy(dtype=float)
+    bo = t["best_of"].to_numpy(dtype=float)
+    ok = np.isfinite(p0) & np.isfinite(k)
+    out = np.full(len(t), np.nan)
+    if not ok.any():
+        return out
+    s = set_prob_from_match(p0[ok], bo[ok])
+    q = 1 - s
+    five = bo[ok] == 5
+    kk = k[ok]
+    p = np.where(five, np.select([kk == 2, kk == 1], [1 - q ** 3, s ** 2 * (3 - 2 * s)], s ** 3),
+                 np.select([kk == 2, kk == 1], [1.0, s], 0.0))
+    inner = (p > 1e-6) & (p < 1 - 1e-6)
+    pc = np.clip(p, 1e-6, 1 - 1e-6)
+    won2 = (t["set1_won"].to_numpy(dtype=float)[ok] == 0) if "set1_won" in t.columns else np.zeros(len(kk), bool)
+    sign = np.where(kk == 1, np.where(won2, 1.0, -1.0), np.sign(kk - 1))     # sull'1-1 conta chi ha vinto il secondo set
+    adj = 1 / (1 + np.exp(-(np.log(pc / (1 - pc)) + SET2_MOMENTUM * sign)))
+    out[ok] = np.where(inner, adj, p)
+    return out
 
 
-# --------------------------------------------------------------------------- applicazione
-def _uniform(match_ids: pd.Series, selections: pd.Series, seed: int) -> np.ndarray:
-    """Numero in [0, 1) stabile per ogni giocata: non cambia aggiungendo o togliendo filtri."""
-    def one(key: str) -> float:
-        return int(hashlib.md5(key.encode()).hexdigest()[:8], 16) / 0x100000000
-    return np.array([one(f"{seed}|{m}|{s}") for m, s in zip(match_ids, selections)])
+def checkpoint_prob(trades: pd.DataFrame, point: str | None = None) -> np.ndarray:
+    """Probabilita' stimata della selezione nel momento di controllo indicato (calcolata sulle quote
+    pre-partita, colonna `book_odds` se presente)."""
+    t = trades.assign(odds=trades["book_odds"]) if "book_odds" in trades.columns else trades
+    if point is None:
+        point = "set1" if "set1_won" in t.columns else "ht"
+    if point == "ht":
+        return football_checkpoint_prob(t)
+    if point == "set1":
+        return tennis_checkpoint_prob(t)
+    if point == "set2":
+        p = tennis_set2_prob(t)
+        return np.where((p <= 0) | (p >= 1), np.nan, p)       # partita gia' finita in due set: niente cash out
+    if point == "break1":
+        from src import backtester as bt
+        p = bt.live_prob(t, "break1")
+        has = t["ip_break1"].isin(["Fatto", "Subito"]).to_numpy() if "ip_break1" in t.columns else np.zeros(len(t), bool)
+        return np.where(has, p, np.nan)
+    raise ValueError(point)
 
 
 def cashout_value(trades: pd.DataFrame, p_now: np.ndarray, margin: float, commission: float) -> np.ndarray:
-    """Profitto del cash out al punto di controllo, nelle stesse unita' di `pnl` (NaN se non stimabile)."""
+    """Profitto del cash out nel momento di controllo, per unita' di rischio (NaN se non stimabile)."""
     o = trades["odds"].to_numpy(dtype=float)
     risk = trades["risk"].to_numpy(dtype=float)
     lay = (trades["side"].to_numpy() == "lay") if "side" in trades.columns else np.zeros(len(trades), dtype=bool)
@@ -240,82 +292,80 @@ def cashout_value(trades: pd.DataFrame, p_now: np.ndarray, margin: float, commis
     return np.maximum(pnl, -risk)
 
 
+def first_hit(values: np.ndarray, tp: float, sl: float) -> np.ndarray:
+    """Indice del primo momento in cui il valore raggiunge il Take Profit o lo Stop Loss (-1 = mai).
+    `values` = matrice (operazioni x momenti) di rendimenti per unita' di rischio, NaN = momento non disponibile."""
+    hit = np.zeros(values.shape, dtype=bool)
+    with np.errstate(invalid="ignore"):
+        if tp > 0:
+            hit |= values >= tp / 100
+        if sl > 0:
+            hit |= values <= -sl / 100
+    return np.where(hit.any(axis=1), hit.argmax(axis=1), -1)
+
+
+def apply_tpsl(values: np.ndarray, hold: np.ndarray, tp: float, sl: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Applica le soglie. Ritorna (rendimento, motivo '', 'tp', 'sl', indice del momento di uscita)."""
+    k = first_hit(values, tp, sl)
+    rows = np.arange(len(hold))
+    v = np.where(k >= 0, values[rows, np.maximum(k, 0)], hold)
+    reason = np.where(k < 0, "", np.where(v >= 0, "tp", "sl"))
+    return v, reason, k
+
+
+def checkpoint_values(trades: pd.DataFrame, points: list[str], margin_pct: float, commission: float) -> np.ndarray:
+    """Matrice (operazioni x momenti di controllo) del valore del cash out per unita' di rischio."""
+    if trades.empty or not points:
+        return np.zeros((len(trades), 0))
+    risk = trades["risk"].to_numpy(dtype=float)
+    cols = [cashout_value(trades, checkpoint_prob(trades, p), margin_pct / 100, commission) / risk for p in points]
+    return np.stack(cols, axis=1)
+
+
 def apply(trades: pd.DataFrame, cfg: dict) -> pd.DataFrame:
-    """Applica il cash out alle operazioni gia' regolate. Aggiunge `pnl_hold` (risultato tenendo fino
-    alla fine), `cashout` (motivo della chiusura, '' se tenuta) e ricalcola `pnl`, `trade_won`, `equity`."""
-    co = settings(cfg)
+    """Cash out sulle operazioni a livello di match. Aggiunge `pnl_hold` (tenendo fino alla fine), `cashout`
+    ('', 'tp', 'sl'), `exit_point` (momento di uscita) e ricalcola `pnl`, `trade_won`, `equity`."""
+    c = settings(cfg)
+    points = checkpoints(cfg)
     t = trades.copy()
     hold = t["pnl"].to_numpy(dtype=float)
     t["pnl_hold"] = hold
-    reason = np.full(len(t), "", dtype=object)
-    pnl = hold.copy()
-    if co["mode"] == "manual" and len(t):
-        risk = t["risk"].to_numpy(dtype=float)
-        full_win = t["win_return"].to_numpy(dtype=float) * risk
-        u = _uniform(t["match_id"], t["selection"], int(co["seed"]))
-        won = hold > 0
-        a, b = co["win_early_share"] / 100, co["win_panic_share"] / 100
-        c, d = co["lose_saved_share"] / 100, co["lose_cut_share"] / 100
-        early, panic = won & (u < a), won & (u >= a) & (u < a + b)
-        saved, cut = ~won & (u < c), ~won & (u >= c) & (u < c + d)
-        pnl = np.where(early, hold * co["win_early_keep"] / 100, pnl)
-        pnl = np.where(panic, -risk * co["win_panic_loss"] / 100, pnl)
-        pnl = np.where(saved, full_win * co["lose_saved_gain"] / 100, pnl)
-        pnl = np.where(cut, -risk * (1 - co["lose_cut_recover"] / 100), pnl)
-        for mask, name in ((early, "win_early"), (panic, "win_panic"), (saved, "lose_saved"), (cut, "lose_cut")):
-            reason[mask] = name
-    elif co["mode"] == "smart" and len(t):
-        p_now = checkpoint_prob(t)
-        value = cashout_value(t, p_now, co["margin_pct"] / 100, float((cfg or {}).get("commission") or 0.0))
-        ratio = value / t["risk"].to_numpy(dtype=float)
-        tp = bool(co["take_profit"]) & np.isfinite(ratio) & (ratio >= co["tp_pct"] / 100)
-        sl = bool(co["stop_loss"]) & np.isfinite(ratio) & (ratio <= -co["sl_pct"] / 100)
-        pnl = np.where(tp | sl, value, pnl)
-        reason[tp], reason[sl] = "tp", "sl"
-        t["cashout_value"] = value
-    t["pnl"] = pnl
+    if not points or t.empty:
+        t["cashout"], t["exit_point"] = "", ""
+        return t
+    vals = checkpoint_values(t, points, c["margin_pct"], float(cfg.get("commission") or 0.0))
+    risk = t["risk"].to_numpy(dtype=float)
+    v, reason, k = apply_tpsl(vals, hold / risk, c["tp"], c["sl"])
+    t["pnl"] = v * risk
     t["cashout"] = reason
-    t["trade_won"] = pnl > 0
-    t["equity"] = np.cumsum(pnl)
+    t["exit_point"] = [CHECKPOINT_LABEL[points[i]] if i >= 0 else "fine partita" for i in k]
+    t["trade_won"] = t["pnl"] > 0
+    t["equity"] = np.cumsum(t["pnl"].to_numpy())
     return t
 
 
+def tpsl_grid(values: np.ndarray, hold: np.ndarray, risk: np.ndarray, tps, sls) -> pd.DataFrame:
+    """ROI (%) per ogni coppia di soglie. Righe = Stop Loss, colonne = Take Profit (0 = disattivo)."""
+    out = np.full((len(sls), len(tps)), np.nan)
+    for i, sl in enumerate(sls):
+        for j, tp in enumerate(tps):
+            v, _, _ = apply_tpsl(values, hold, tp, sl)
+            out[i, j] = (v * risk).sum() / risk.sum() * 100 if risk.sum() else np.nan
+    return pd.DataFrame(out, index=list(sls), columns=list(tps))
+
+
 def summary(trades: pd.DataFrame) -> pd.DataFrame:
-    """Effetto del cash out per motivo: giocate, profitto ottenuto e profitto che avrebbero dato tenendole."""
+    """Effetto del cash out per motivo e momento: operazioni, profitto ottenuto e profitto tenendo fino alla fine."""
     if "cashout" not in trades.columns or trades.empty:
-        return pd.DataFrame(columns=["esito", "giocate", "profitto", "profitto_tenendo", "differenza"])
-    g = trades.groupby("cashout")
-    out = pd.DataFrame({"giocate": g.size(), "profitto": g["pnl"].sum(), "profitto_tenendo": g["pnl_hold"].sum()})
+        return pd.DataFrame(columns=["esito", "momento", "operazioni", "profitto", "profitto_tenendo", "differenza"])
+    point = trades["exit_point"].astype(object) if "exit_point" in trades.columns else pd.Series("", index=trades.index, dtype=object)
+    n = pd.to_numeric(point.astype(str).str.extract(r"^dopo (\d+) punt", expand=False), errors="coerce")
+    point = point.where(n.isna(), np.select([n <= 3, n <= 6], ["durante il game: punti 1-3", "durante il game: punti 4-6"],
+                                            "durante il game: punti 7+"))
+    key = [trades["cashout"].map(REASONS).rename("esito"), point.rename("momento")]
+    g = trades.groupby(key, sort=False)
+    out = pd.DataFrame({"operazioni": g.size(), "profitto": g["pnl"].sum(), "profitto_tenendo": g["pnl_hold"].sum()})
     out["differenza"] = out["profitto"] - out["profitto_tenendo"]
-    out.insert(0, "esito", [REASONS.get(k, k) for k in out.index])
-    return out.reset_index(drop=True)
-
-
-def threshold_grid(trades_hold: pd.DataFrame, cfg: dict, tps=(None, 10, 20, 30, 50, 75), sls=(None, 30, 50, 70)) -> pd.DataFrame:
-    """ROI per ogni combinazione di soglie 'incassa' / 'taglia' (modalita' intelligente), con la tenuta
-    nelle due meta' del periodo. `trades_hold` sono le operazioni senza cash out."""
-    co = settings(cfg)
-    if trades_hold.empty:
-        return pd.DataFrame()
-    p_now = checkpoint_prob(trades_hold)
-    value = cashout_value(trades_hold, p_now, co["margin_pct"] / 100, float((cfg or {}).get("commission") or 0.0))
-    hold = trades_hold["pnl"].to_numpy(dtype=float)
-    risk = trades_hold["risk"].to_numpy(dtype=float)
-    ratio = value / risk
-    ok = np.isfinite(ratio)
-    half = np.arange(len(hold)) < len(hold) / 2
-    rows = []
-    for tp in tps:
-        for sl in sls:
-            close = (ok & (ratio >= tp / 100) if tp is not None else False) | (ok & (ratio <= -sl / 100) if sl is not None else False)
-            pnl = np.where(close, value, hold)
-            eq = np.cumsum(pnl)
-            rows.append({
-                "incassa_da": "mai" if tp is None else f"+{tp}%", "taglia_da": "mai" if sl is None else f"-{sl}%",
-                "chiuse_pct": float(np.mean(close) * 100) if np.ndim(close) else 0.0,
-                "roi_pct": pnl.sum() / risk.sum() * 100, "profit": pnl.sum(),
-                "max_dd": float((np.maximum.accumulate(np.maximum(eq, 0)) - eq).max()),
-                "roi_1": pnl[half].sum() / risk[half].sum() * 100 if half.any() else np.nan,
-                "roi_2": pnl[~half].sum() / risk[~half].sum() * 100 if (~half).any() else np.nan,
-            })
-    return pd.DataFrame(rows)
+    out = out.rename_axis(["esito", "momento"]).reset_index()
+    order = {v: i for i, v in enumerate(REASONS.values())}
+    return out.sort_values(["esito", "momento"], key=lambda c: c.map(order) if c.name == "esito" else c).reset_index(drop=True)

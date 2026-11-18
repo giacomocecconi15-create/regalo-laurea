@@ -26,7 +26,7 @@ Uso manuale:
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python src/update_data.py        # scarica / aggiorna il database
-.venv/bin/python -m pytest tests -q        # 79 test
+.venv/bin/python -m pytest tests -q        # 86 test
 .venv/bin/python -m streamlit run app.py   # dashboard
 ```
 
@@ -47,7 +47,7 @@ attiva_avvisi_mac.sh   attiva il controllo automatico dei segnali su Mac
 src/analysis.py        partite del giorno, punto di pareggio, monitor delle strategie, calcolatore di copertura
 src/scalping.py        scalping sul servizio: dati punto per punto, modello delle quote, simulatore
 src/betfair.py         importazione dei dati storici Betfair e cash out su prezzi reali
-src/cashout.py         simulazione del cash out (regole manuali e modello intelligente)
+src/cashout.py         cash out Take Profit / Stop Loss ai punti di controllo (break, set, intervallo)
 src/fixtures.py        partite in programma con quote (calcio gratis, tennis con chiave gratuita) e impostazioni
 assets/                icona dell'app
 crea_app_mac.sh        crea l'app da doppio clic per Mac
@@ -60,7 +60,7 @@ data/trading_db.duckdb database (generato, non versionato)   data/raw/  cache de
 | Tabella | Contenuto | Fonte |
 |---|---|---|
 | `football_matches` | dal 2019/20: risultati, tiri, angoli, falli, cartellini, xG (dove presente), quote 1X2 e O/U 2.5 pre-match e di chiusura (Pinnacle, Bet365, massimo e media mercato, Betfair Exchange), linea asiatica | football-data.co.uk |
-| `tennis_matches` | dal 2019: ATP, qualificazioni e Challenger con ranking, punti, statistiche di servizio, punteggio; quote Pinnacle, Bet365, massimo e media mercato per l'ATP | TML-Database / formato Sackmann + tennis-data.co.uk |
+| `tennis_matches` | dal 2019: ATP, qualificazioni e Challenger con ranking, punti, statistiche di servizio, punteggio; quote Pinnacle, Bet365, massimo e media mercato per l'ATP | TML-Database / archivio Sackmann + tennis-data.co.uk |
 
 Variabili pre-partita calcolate senza look-ahead (usano solo i match precedenti):
 
@@ -88,6 +88,14 @@ una strategia salvata si applicano alle partite future esattamente come nel test
 gratuita senza registrazione: è integrata The Odds API (piano gratuito da 500 crediti al mese, chiave personale;
 un credito per torneo), oppure si carica un CSV.
 
+**The Odds API in pratica.** È facoltativa e serve solo per le quote tennis del giorno (pagine *Oggi* e *Strategie*):
+1. vai su the-odds-api.com, premi *Get API Key* e scegli il piano gratuito *Starter* (nessuna carta di credito);
+2. arriva per email una chiave (una stringa di lettere e numeri);
+3. incollala nel campo *Chiave di The Odds API* della pagina e scarica le quote: la chiave resta salvata sul Mac in
+   `data/settings.json` e non va inserita di nuovo.
+Senza chiave tutto il resto funziona; per il tennis si può sempre caricare un CSV. La stessa guida è nell'app, nel
+riquadro *Non hai ancora la chiave? Ecco cosa fare*.
+
 **Nomi dei giocatori.** Le fonti scrivono alcuni nomi in modo diverso ("Auger-Aliassime" / "Auger Aliassime"):
 vengono unificati al caricamento, altrimenti form e precedenti dello stesso giocatore risulterebbero spezzati.
 
@@ -104,9 +112,11 @@ non liquidi come 1.01) vengono annullate. A fine caricamento gira una validazion
 - **Calcio "apertura".** Le quote pre-match di football-data sono rilevate qualche giorno prima del match, non
   all'apertura vera del mercato. Pinnacle manca in parte del 2025/26 e nel 2026/27: il CLV ripiega su Betfair
   Exchange e poi sulla media di chiusura (colonna `close_source`).
-- **Sorgenti tennis.** Il repository originale `JeffSackmann/tennis_atp` non è più pubblico: le statistiche ATP
-  arrivano da TML-Database (stesso formato) e i Challenger 2019-2024 da un mirror; i Challenger dal 2025 non sono
-  disponibili. tennis-data.co.uk è il primo tentativo per le quote, con mirror GitHub di riserva (coprono fino a
+- **Sorgenti tennis.** Il repository originale `JeffSackmann/tennis_atp` resta il primo tentativo ma oggi non è
+  raggiungibile: ATP e Challenger arrivano da TML-Database e dall'archivio completo dei file Sackmann
+  (`Aneeshers/tennis-sackmann-archive`, aggiornato a giugno 2026, Challenger 2025-26 compresi). Per ogni anno si
+  scaricano tutte le fonti e si tiene la più completa (più match e data più recente). Turni e livelli sono uniformati
+  (es. *Quarterfinals* → QF, *Grand Slam*, *Masters 1000*, *ATP 500*, *ATP 250*). tennis-data.co.uk è il primo tentativo per le quote, con mirror GitHub di riserva (coprono fino a
   luglio 2025). Lo script riprova le fonti ufficiali a ogni esecuzione. I dati sono per uso personale e non commerciale.
 
 ## Backtester
@@ -127,7 +137,9 @@ curve, rendimenti mensili. Ogni operazione rischia 1 unità.
 
 - **Back**: vinta `+(quota-1)·(1-commissione)`, persa `-1`.
 - **Lay**: responsabilità fissa 1u (puntata del banco `1/(quota-1)`) oppure puntata fissa 1u. Il prezzo di banca è la
-  quota back scelta: il risultato reale sull'exchange è un po' peggiore (spread).
+  quota **equa** (senza il margine del bookmaker) più lo *spread lay sull'exchange* (2% di default). Prima si bancava
+  alla quota back del bookmaker, che contiene il margine: per questo back e lay risultavano entrambi in perdita o con
+  segni incoerenti. Ora, a parità di condizioni, back + lay ≈ -(margine + spread + commissione).
 - **CLV %**: back `quota/chiusura - 1`, lay `1 - quota/chiusura`.
 
 ### Modello di probabilità e incroci
@@ -172,15 +184,16 @@ spread e commissione configurabili.
 - La tabella *Punti reali contro modello* confronta, da ogni punteggio, quante volte chi serve tiene davvero il
   servizio con quanto previsto; *Dove rende* prova la stessa regola di uscita da tutti i punteggi di ingresso.
 
-### Filtri in partita e ingresso live
+### Ingresso e cash out (pannello principale del Backtester)
 
-Gruppo *In partita* nel pannello del Backtester:
+In cima al Backtester, sopra i risultati, il riquadro **Ingresso e cash out** riunisce le due scelte che contano di più;
+a sinistra restano i filtri di quota, torneo, calendario, giocatori.
 
-- **Tennis**: primo set vinto o perso, primo set al tie-break, primo break del primo set (fatto, subito o nessuno).
-  Il primo set vale per tutti i match completati (un ritiro a metà primo set lascia il dato vuoto); il primo break
-  esiste solo per i match registrati punto per punto (circa uno su cinque, soprattutto nei tornei maggiori).
-- **Calcio**: squadra scelta all'intervallo (in vantaggio, pari, in svantaggio), risultato all'intervallo, gol nel primo
-  tempo. La squadra che segna per prima non è disponibile: la fonte non riporta i minuti dei gol.
+**Quando entri.** Tennis: pre-partita, dopo il primo break fatto o subito, dopo il primo set vinto o perso. Calcio 1X2:
+pre-partita, all'intervallo in vantaggio, sul pari o in svantaggio. Over/Under: pre-partita o all'intervallo con 0, 1,
+2 gol. Il primo set vale per tutti i match completati (un ritiro a metà primo set lascia il dato vuoto); il primo break
+esiste solo per i match registrati punto per punto (circa uno su cinque, soprattutto nei tornei maggiori). La squadra
+che segna per prima non è disponibile: la fonte non riporta i minuti dei gol.
 
 I range di quota restano sulle quote **pre-partita**, ma con un filtro in partita l'operazione entra **dopo l'evento**
 (dopo il break, a fine primo set, all'intervallo) alla quota live stimata, meno un margine configurabile: così ROI e
@@ -213,40 +226,55 @@ Pagina *Quote reali*: il cash out simulato su prezzi veri in corso di partita, i
 - **Limite**: il piano BASIC registra circa un prezzo al minuto, quindi va bene per il cash out ma non per lo scalping
   punto per punto. I dati restano in `data/betfair.duckdb`.
 
-### Cash out
+### Cash out: Take Profit e Stop Loss
 
-Il database non contiene quote in corso di partita, quindi le chiusure anticipate si simulano in due modi
-(pannello laterale, sezione *4 · Cash out*; risultati nella vista *Cash out*):
+Il cash out ha solo due numeri: il **Take Profit** (profitto in % della somma rischiata a cui chiudi) e lo **Stop Loss**
+(perdita in % a cui tagli); 0 = non usato. Poi scegli **quando** li controlli:
 
-- **Manuale** – riproduci le tue abitudini con quattro regole, ognuna con la quota di giocate interessate e
-  l'importo: vincenti incassate prima (parte del profitto), vincenti chiuse in perdita, perdenti chiuse in
-  profitto, perdenti tagliate (parte della puntata recuperata). Le giocate interessate sono scelte a caso ma in
-  modo ripetibile (seme): lo stesso backtest dà sempre lo stesso risultato.
-- **Intelligente** – decide da solo usando lo stato reale della partita a un punto di controllo presente nei
-  dati: il risultato all'intervallo nel calcio, l'esito del primo set nel tennis. Un modello calibrato sulle
-  quote pre-partita (Poisson sui gol del secondo tempo; set indipendenti con una correzione misurata sul
-  database) stima la probabilità della selezione a quel punto e quindi il valore del cash out, a cui si toglie
-  il margine impostato. Chiude se il valore supera la soglia *incassa* o scende sotto la soglia *taglia*. La
-  vista mostra anche il confronto tra soglie diverse.
+- **Tennis**: al primo break, a fine primo set, a fine secondo set, in ogni momento disponibile (tutti i punti di
+  controllo dopo l'ingresso, in ordine: chiude al primo che tocca una soglia), oppure *scalping sul servizio*.
+- **Calcio**: all'intervallo.
 
-Sul database le probabilità stimate sono in linea con le frequenze reali (scarti entro pochi punti, verificati
-da un test), ma resta una stima: le quote reali in corso di partita possono differire e il cash out vero può
-scattare in altri momenti. Chiudere prima costa il margine, quindi in media riduce il rendimento.
+A ogni punto di controllo un modello tarato sui risultati reali (set e break nel tennis, Poisson sul secondo tempo nel
+calcio) stima la probabilità della selezione e quindi il valore del cash out, meno il margine impostato. Se il valore
+supera il Take Profit o scende sotto lo Stop Loss la posizione si chiude, altrimenti si tiene fino alla fine. Un punto di
+controllo che arriva prima dell'ingresso (es. ingresso dopo il primo set e controllo al primo break) viene ignorato e
+l'app lo segnala.
 
-**Punto di pareggio.** La vista *Cash out* calcola quanto bisogna spingersi con le chiusure perché la strategia vada
-in utile: quale quota di giocate perdenti va tagliata, per ogni livello di puntata recuperata, e una griglia del ROI
-atteso. È la soglia teorica (presume di chiudere solo giocate che avrebbero perso); un campo permette di aggiungere il
-costo delle vincenti chiuse per errore.
+**Scalping sul servizio.** Un'operazione per ogni game di servizio dei match della strategia (servizio del giocatore
+scelto, dell'avversario o di entrambi), entrando a 0-0. Esclusi i primi due game della partita e i game a match ormai
+deciso (probabilità sotto/sopra la soglia *Salta se il match è deciso*, 5% di default: lì non ci sono quote). Il prezzo
+segue il punteggio punto per punto: si chiude al Take Profit o allo Stop Loss, altrimenti a fine game (servizio tenuto
+o break), con uscita opzionale alla prima palla break. Spread per lato regolabile.
 
-**Terminologia e mappa.** Le regole manuali usano i termini del trading: *Frequenza Take Profit* e *% Profitto Incassato*,
-*Frequenza Stop Loss* e *% Rischio Recuperato*, più le uscite errate e le uscite anticipate in utile; ogni campo ha una
-spiegazione (?). Nella vista *Cash out* la mappa di calore incrocia % Profitto Incassato (orizzontale) e % Rischio
-Recuperato (verticale), con le due frequenze regolabili da cursori: verde = utile, rosso = perdita, e un bordo bianco
-segna la frontiera di pareggio.
+Valori tipici per game (puntando chi serve a 0-0, spread 0,5%, giochi reali 2019-2026, stessi filtri dello scalping):
 
-**Quota di ingresso.** Senza filtri live ogni operazione entra alla propria quota pre-partita (il Riepilogo lo indica,
-con la quota mediana del campione). Con filtri live la quota stimata si può sostituire con una quota fissa scelta a mano
-(*Modifica manualmente quota live stimata*); se si discosta di oltre il 10% dalla stima compare un avviso.
+| Superficie | Chi serve | Tiene il servizio | Guadagno se tiene | Perdita se subisce il break |
+|---|---|---|---|---|
+| Terra | Favorito | 80% | +3,6% | -20,8% |
+| Terra | Sfavorito | 72% | +11,4% | -36,7% |
+| Erba | Favorito | 88% | +1,8% | -23,7% |
+| Erba | Sfavorito | 81% | +8,1% | -42,1% |
+| Cemento | Favorito | 85% | +2,9% | -25,0% |
+| Cemento | Sfavorito | 78% | +9,6% | -40,9% |
+
+Tenere il servizio vale molto meno che subire il break, e la differenza cambia con superficie e ruolo: sulla terra il
+break pesa meno (si recupera più spesso), sull'erba di più; lo sfavorito al servizio muove la quota molto di più. Online
+non esistono misure numeriche affidabili di questi movimenti (solo regole dei trader), quindi i valori vengono dal
+modello applicato ai punti reali; la vista *Cash out* li ricalcola sul campione della strategia.
+
+**Vista Cash out.** ROI con e senza cash out, effetto sul profitto, quota di operazioni chiuse, tabella per esito e
+momento di uscita e mappa di calore del ROI per ogni coppia Take Profit × Stop Loss (bordo bianco = combinazione
+migliore, bordo blu tratteggiato = quella scelta). Chiudere prima costa margine e spread, quindi in media riduce il
+rendimento: la mappa mostra se e dove una combinazione compensa.
+
+Le strategie salvate con il vecchio cash out (regole manuali o modello "intelligente") si riaprono convertite in Take
+Profit / Stop Loss a fine primo set (tennis) o all'intervallo (calcio); le vecchie regole manuali vengono ignorate e
+l'app lo segnala.
+
+**Quota di ingresso.** Con ingresso pre-partita ogni operazione entra alla propria quota pre-partita (il Riepilogo lo
+indica, con la quota mediana del campione). Con ingresso in partita la quota stimata si può sostituire con una quota fissa
+scelta a mano (riquadro *Quota live di ingresso*); se si discosta di oltre il 10% dalla stima compare un avviso.
 
 Nel **Registro** una giocata reale si può chiudere come *Cash out* indicando a mano il profitto o la perdita
 effettivamente incassati.
@@ -257,13 +285,16 @@ Navigazione in alto tra le pagine; il pannello laterale compare solo nel Backtes
 a ogni pagina c'è lo stato dei dati. Tema scuro, senza animazioni: i mini-grafici nelle schede sono SVG statici.
 
 1. **Backtester** – pannello laterale con esempi pronti e filtri a gruppi (torneo/lega, calendario,
-   giocatore/squadra, avversario, confronto). Cinque schede:
+   giocatore/squadra, avversario, confronto); in alto il riquadro *Ingresso e cash out* (quando entri, Take Profit,
+   Stop Loss e quando controllarli). Viste:
    - *Riepilogo*: KPI, equity curve, drawdown, rendimenti mensili.
+   - *In partita*: operazioni divise per situazione di gioco (set, break, intervallo) con vittorie reali e intervallo di confidenza.
    - *Analisi*: risultato scomposto per anno, fascia di quota, torneo, superficie...; elenco automatico dei
      segmenti migliori e peggiori, applicabili come filtro con un clic.
    - *Robustezza*: sei controlli (campione, significatività, intervallo di confidenza del ROI, CLV, tenuta
      fuori campione, costanza negli anni), confronto studio/verifica, anno per anno, confronto tra bookmaker.
-   - *Cash out*: effetto delle chiusure anticipate rispetto a tenere fino alla fine, per tipo di chiusura e per soglia.
+   - *Cash out*: effetto di Take Profit e Stop Loss rispetto a tenere fino alla fine, mappa di calore TP × SL e, nello
+     scalping, valori tipici di game tenuto e break per superficie e ruolo.
    - *Operazioni*: tabella esportabile in CSV.  *Salva*: archivia la strategia.
 
    Ogni vista viene calcolata solo quando la apri, e il backtest si ricalcola solo se cambia la strategia.

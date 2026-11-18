@@ -189,7 +189,7 @@ def breakeven_matrix(be: dict, tp_freq: float, sl_freq: float, keeps=range(0, 10
 
 
 # --------------------------------------------------------------------------- monitor delle strategie
-def strategy_monitor(vault: dict, load_selections, bankroll: float = 100.0) -> tuple[pd.DataFrame, pd.DataFrame]:
+def strategy_monitor(vault: dict, load_selections, bankroll: float = 100.0, games: pd.DataFrame | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Riesegue ogni strategia salvata sui dati correnti e confronta il periodo recente con lo storico.
     `load_selections(sport, market, price, timing)` fornisce le selezioni (cosi' l'app puo' usare la cache).
     Ritorna (tabella per strategia, operazioni di tutte le strategie per il portafoglio)."""
@@ -202,7 +202,7 @@ def strategy_monitor(vault: dict, load_selections, bankroll: float = 100.0) -> t
         market = cfg.get("market") or bt.MARKETS[sport][0]
         cfg.pop("date_from", None)
         cfg.pop("date_to", None)                       # il monitor guarda sempre fino all'ultimo dato
-        res = bt.backtest_selections(load_selections(sport, market, cfg.get("price", "avg"), cfg.get("price_timing", "open")), cfg, bankroll)
+        res = bt.backtest_selections(load_selections(sport, market, cfg.get("price", "avg"), cfg.get("price_timing", "open")), cfg, bankroll, games)
         t, m = res.trades, res.metrics
         if t.empty:
             rows.append({"strategia": name, "operazioni": 0, "stato": "nessuna operazione"})

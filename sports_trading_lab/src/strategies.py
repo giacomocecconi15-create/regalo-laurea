@@ -328,6 +328,7 @@ def football_upload_selections(df: pd.DataFrame, market: str, con=None) -> pd.Da
         "country": country, "league": league, "competition": league, "season": np.nan,
         "home_team": home, "away_team": away, "event": home + " - " + away,
         "odds_home": oh, "odds_draw": od, "odds_away": oa, "odds_over": _col(df, "odds_over25", True),
+        "odds_under": _col(df, "odds_under25", True),
         "ah_line": _col(df, "ah_line", True), **feat,
         "ppg_diff": feat["home_ppg5"] - feat["away_ppg5"], "pos_diff": feat["away_pos"] - feat["home_pos"],
         "goals5": (feat["home_gf5"] + feat["home_ga5"] + feat["away_gf5"] + feat["away_ga5"]) / 2,
@@ -412,6 +413,8 @@ def scan(upload: pd.DataFrame, vault: dict, bankroll: float, con=None, method: s
         hit = bt.apply_filters(sel, live)
         if hit.empty:
             continue
+        if cfg.get("side") == "lay":      # si banca alla quota equa piu' lo spread dell'exchange, non alla quota back
+            hit = hit.assign(odds=bt.lay_price(hit, float(cfg.get("lay_spread", bt.LAY_SPREAD))))
         st = stake_for(cfg, metrics, hit["odds"].to_numpy(), bankroll, method, flat_pct, kelly_fraction, cap_pct)
         if method == "kelly" and not float(metrics.get("roi_pct") or 0) > 0:
             notes.append(f"'{name}': ROI storico non positivo, Kelly assegna stake 0.")

@@ -77,6 +77,27 @@ def fetch(cache: Path, urls: list[str], refresh: bool, validate) -> tuple[bytes 
     return None, "non disponibile", False
 
 
+def fetch_best(cache: Path, urls: list[str], refresh: bool, validate) -> tuple[bytes | None, str, bool]:
+    """Come `fetch`, ma prova tutte le fonti e tiene il file con piu' righe: le copie dei dati di Sackmann non
+    sono aggiornate tutte allo stesso modo."""
+    old = cache.read_bytes() if cache.exists() else None
+    if old is not None and not refresh:
+        return old, "cache", False
+    best, src = None, ""
+    for url in urls:
+        raw = http_get(url)
+        if raw is not None and validate(raw) and (best is None or raw.count(b"\n") > best.count(b"\n")):
+            best, src = raw, url
+    if best is None:
+        return (old, "cache (download fallito)", False) if old is not None else (None, "non disponibile", False)
+    if old is not None and old.count(b"\n") > best.count(b"\n"):
+        return old, "cache", False
+    if best != old:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_bytes(best)
+    return best, src, best != old
+
+
 def parallel(jobs: dict, workers: int = 8) -> dict:
     """Esegue in parallelo {chiave: funzione senza argomenti} e ritorna {chiave: risultato}."""
     if not jobs:
@@ -514,7 +535,7 @@ def build_tennis_year(year: int, tour: pd.DataFrame, chall: pd.DataFrame, odds: 
     d["loser_rank"] = d["loser_rank"].fillna(d["td_lrank"])
     d["winner_rank_points"] = d["winner_rank_points"].fillna(d["td_wpts"])
     d["loser_rank_points"] = d["loser_rank_points"].fillna(d["td_lpts"])
-    d["score"] = d["score"].fillna(d["td_score"])
+    d["score"] = d["score"].astype(object).where(d["score"].notna(), d["td_score"])
     d["status"] = d["td_status"].where(d["td_status"].isin(["Completed", "Retired", "Walkover"]), d["status"]).fillna("Completed")
     d["has_odds"] = d[[f"{b}_{s}" for b in C.TENNIS_BOOKS for s in "wl"]].notna().any(axis=1)
     d = d.drop_duplicates("match_id")
@@ -629,6 +650,29 @@ def canonicalize_tennis_names(con) -> int:
     return len(fix)
 
 
+def normalize_tennis_labels(con) -> int:
+    """Turni con codici unici (Q1..Q3, R128..R16, QF, SF, F, RR, BR). tennis-data scrive '1st Round', '2nd Round'...
+    il cui significato dipende dal tabellone: il turno n di un torneo che arriva fino all'n-esimo turno numerato k
+    e' R(16 * 2^(k-n)) (per esempio negli Slam il 1st Round e' R128, in un ATP 250 a 32 giocatori e' R32)."""
+    fixed = 0
+    for old, new in (("The Final", "F"), ("Final", "F"), ("Semifinals", "SF"), ("Quarterfinals", "QF"), ("Round Robin", "RR")):
+        fixed += con.execute("UPDATE tennis_matches SET round = ? WHERE round = ?", [new, old]).fetchone()[0]
+    rows = con.execute("""SELECT match_id, season, tourney_name, round FROM tennis_matches
+                          WHERE regexp_matches(round, '^[0-9](st|nd|rd|th) Round$')""").df()
+    if len(rows):
+        rows["n"] = rows["round"].str[0].astype(int)
+        top = rows.groupby(["season", "tourney_name"])["n"].transform("max")
+        rows["new"] = "R" + (16 * 2 ** (top - rows["n"])).astype(str)
+        con.register("_rounds", rows[["match_id", "new"]])
+        con.execute("UPDATE tennis_matches t SET round = r.new FROM _rounds r WHERE t.match_id = r.match_id")
+        con.unregister("_rounds")
+        fixed += len(rows)
+    con.execute("UPDATE tennis_matches SET round_order = CASE round WHEN 'Q1' THEN 0 WHEN 'Q2' THEN 1 WHEN 'Q3' THEN 2 "
+                "WHEN 'RR' THEN 3 WHEN 'R128' THEN 4 WHEN 'R64' THEN 5 WHEN 'R32' THEN 6 WHEN 'R16' THEN 7 WHEN 'QF' THEN 8 "
+                "WHEN 'SF' THEN 9 WHEN 'BR' THEN 9.5 WHEN 'F' THEN 10 ELSE round_order END")
+    return fixed
+
+
 def refresh_features(con, sport: str = "all") -> None:
     """Ricalcola da zero tutte le feature pre-partita (non richiede download)."""
     if sport in ("all", "football"):
@@ -638,6 +682,7 @@ def refresh_features(con, sport: str = "all") -> None:
             write_features(con, "football_matches", football_features(df))
     if sport in ("all", "tennis"):
         canonicalize_tennis_names(con)
+        normalize_tennis_labels(con)
         df = con.execute("""SELECT match_id, match_date, round_order, surface, winner_name, loser_name,
                                    w_svpt, w_1stWon, w_2ndWon, w_ace, w_df, l_svpt, l_1stWon, l_2ndWon, l_ace, l_df
                             FROM tennis_matches""").df()
@@ -766,11 +811,12 @@ def update_tennis(con, full: bool, progress) -> dict:
     is_csv = lambda b: b"winner_name" in b[:1500]
     raw_dir = C.RAW_DIR / "tennis"
     todo = [(y, full or y in current) for y in years
-            if full or y in current or y not in have or not (raw_dir / f"tour_{y}.csv").exists()]
+            if full or y in current or y not in have or not (raw_dir / f"tour_{y}.csv").exists()
+            or not (raw_dir / f"chall_{y}.csv").exists()]
 
     def download(year: int, refresh: bool):
-        return (fetch(raw_dir / f"tour_{year}.csv", [u.format(year=year) for u in C.TENNIS_TOUR_SOURCES], refresh, is_csv),
-                fetch(raw_dir / f"chall_{year}.csv", [u.format(year=year) for u in C.TENNIS_CHALL_SOURCES], refresh, is_csv),
+        return (fetch_best(raw_dir / f"tour_{year}.csv", [u.format(year=year) for u in C.TENNIS_TOUR_SOURCES], refresh, is_csv),
+                fetch_best(raw_dir / f"chall_{year}.csv", [u.format(year=year) for u in C.TENNIS_CHALL_SOURCES], refresh, is_csv),
                 _best_odds_file(year, refresh))
 
     fetched = parallel({y: (lambda y=y, r=r: download(y, r)) for y, r in todo}, workers=4)

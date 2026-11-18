@@ -21,7 +21,8 @@ Configurazione di una strategia (dict serializzabile in JSON):
       "date_from": "2021-01-01", "date_to": null,
       "exclude_retirements": false,        # solo tennis
       "filters": {"surface": {"in": ["Clay"]}, "rank": {"min": 1, "max": 50}},
-      "cashout": {"mode": "off" | "manual" | "smart", ...}   # vedi src/cashout.py
+      "cashout": {"mode": "off" | "tpsl", "when": ..., "tp": 30, "sl": 50}   # vedi src/cashout.py
+      "lay_spread": 2.0                    # lay: quota equa (senza margine) peggiorata di questo spread
     }
 """
 from __future__ import annotations
@@ -157,6 +158,51 @@ def football_model_probs(home_elo, away_elo, home_adv: float = ELO_HOME, scale: 
     return p / p.sum(axis=1, keepdims=True)
 
 
+LAY_SPREAD = 2.0           # spread di default di una quota lay sull'exchange rispetto alla quota equa (%)
+ROUND_ORDER_CODES = ["Q1", "Q2", "Q3", "R128", "R64", "R32", "R16", "QF", "SF", "BR", "F", "RR"]
+ROUND_LABELS = {"Q1": "Q1 - Qualificazioni 1° turno", "Q2": "Q2 - Qualificazioni 2° turno", "Q3": "Q3 - Qualificazioni 3° turno",
+                "R128": "R128 - Sessantaquattresimi (128 giocatori)", "R64": "R64 - Trentaduesimi (64 giocatori)",
+                "R32": "R32 - Sedicesimi (32 giocatori)",
+                "R16": "R16 - Ottavi di finale", "QF": "QF - Quarti di finale", "SF": "SF - Semifinali", "BR": "BR - Finale 3° posto",
+                "F": "F - Finale", "RR": "RR - Round robin"}
+ROUND_ALIASES = {"The Final": "F", "Final": "F", "Semifinals": "SF", "Quarterfinals": "QF", "Round Robin": "RR",
+                 "4th Round": "R16", "Bronze": "BR"}
+LEVEL_ALIASES = {"G": "Grand Slam", "M": "Masters 1000", "500": "ATP 500", "250": "ATP 250", "A": "ATP 250/500",
+                 "F": "ATP Finals", "D": "Coppa Davis", "O": "Altri eventi", "C": "Challenger",
+                 "Grand Slam": "Grand Slam", "Masters 1000": "Masters 1000", "ATP500": "ATP 500", "ATP250": "ATP 250",
+                 "Masters Cup": "ATP Finals", "International": "ATP 250", "International Gold": "ATP 500"}
+
+
+def level_label(code, series=None) -> str | None:
+    """Livello del torneo con un'etichetta unica: le fonti usano codici diversi ('A', '250', 'ATP250'...).
+    La serie di tennis-data distingue 250 e 500 quando il codice dice solo 'A'."""
+    code = None if code is None or (isinstance(code, float) and code != code) else str(code)
+    series = None if series is None or (isinstance(series, float) and series != series) else str(series)
+    if code in ("250", "500", "M", "G", "F", "D", "C", "O"):
+        return LEVEL_ALIASES[code]
+    if series in LEVEL_ALIASES:
+        return LEVEL_ALIASES[series]
+    return LEVEL_ALIASES.get(code, code)
+
+
+def fair_prob(sel: pd.DataFrame) -> np.ndarray:
+    """Probabilita' senza margine della selezione, dalle quote del bookmaker scelto."""
+    o = 1 / sel["odds"].to_numpy(dtype=float)
+    if "opp_odds" in sel.columns:                                   # tennis: due esiti
+        return o / (o + 1 / sel["opp_odds"].to_numpy(dtype=float))
+    names = sel["selection"].to_numpy()
+    three = sum(1 / sel[c].to_numpy(dtype=float) for c in ("odds_home", "odds_draw", "odds_away"))
+    two = 1 / sel["odds_over"].to_numpy(dtype=float) + 1 / sel["odds_under"].to_numpy(dtype=float) \
+        if {"odds_over", "odds_under"} <= set(sel.columns) else np.nan
+    return np.where(np.isin(names, ["over", "under"]), o / two, o / three)
+
+
+def lay_price(sel: pd.DataFrame, spread_pct: float = LAY_SPREAD) -> np.ndarray:
+    """Quota a cui si puo' realisticamente bancare: la quota equa (senza il margine del bookmaker) piu' lo spread
+    dell'exchange. Bancare alla quota back del bookmaker regalerebbe il suo margine e darebbe risultati falsi."""
+    return np.maximum((1 / fair_prob(sel)) * (1 + spread_pct / 100), 1.01)
+
+
 def _norm_name(name) -> str:
     import re
     import unicodedata
@@ -188,8 +234,9 @@ def tennis_selections(matches: pd.DataFrame, price: str = "avg") -> pd.DataFrame
     indoor = _get(m, "indoor")
     common = {
         "match_id": m["match_id"], "date": dates, "season": m["season"], **_calendar(dates),
-        "circuit": m["circuit"], "competition": m["tourney_name"], "level": m["tourney_level"],
-        "series": m["series"], "surface": m["surface"], "round": m["round"], "best_of": m["best_of"],
+        "circuit": m["circuit"], "competition": m["tourney_name"],
+        "level": [level_label(c, s) for c, s in zip(m["tourney_level"], _get(m, "series"))],
+        "series": m["series"], "surface": m["surface"], "round": m["round"].replace(ROUND_ALIASES), "best_of": m["best_of"],
         "court": np.where(indoor.isna(), None, np.where(indoor.eq(True), "Indoor", "Outdoor")),
         "status": m["status"],
     }
@@ -202,6 +249,13 @@ def tennis_selections(matches: pd.DataFrame, price: str = "avg") -> pd.DataFrame
     complete = ((hi == 6) & (lo <= 4)) | ((hi == 7) & ((lo == 5) | (lo == 6)))
     set1 = {True: (g_w > g_l).astype(float).where(complete), False: (g_l > g_w).astype(float).where(complete)}
     tb = pd.Series(np.where(complete, np.where(lo == 6, "Sì", "No"), None), index=m.index)
+    sec = m["score"].astype(str).str.extract(r"^\s*\d+-\d+(?:\(\d+\))?\s+(\d+)-(\d+)") if "score" in m.columns else pd.DataFrame({0: [], 1: []})
+    s_w = pd.to_numeric(sec[0], errors="coerce").reindex(m.index)
+    s_l = pd.to_numeric(sec[1], errors="coerce").reindex(m.index)
+    hi2, lo2 = np.maximum(s_w, s_l), np.minimum(s_w, s_l)
+    complete2 = complete & (((hi2 == 6) & (lo2 <= 4)) | ((hi2 == 7) & ((lo2 == 5) | (lo2 == 6))))
+    w_sets = (g_w > g_l).astype(float) + (s_w > s_l).astype(float)
+    set2 = {True: w_sets.where(complete2), False: (2 - w_sets).where(complete2)}
     breaker = _get(m, "fb_breaker").map(lambda n: _norm_name(n) if isinstance(n, str) else n)
     has_events = _get(m, "_ev_match").notna().to_numpy()
     sides = []
@@ -225,7 +279,7 @@ def tennis_selections(matches: pd.DataFrame, price: str = "avg") -> pd.DataFrame
             "elo": _get(m, f"{a}_elo"), "opp_elo": _get(m, f"{b}_elo"),
             "odds": m[f"{price}_{x}"], "opp_odds": m[f"{price}_{y}"],
             "close_odds": m[f"ps_{x}"], "_close_opp": m[f"ps_{y}"],
-            "won": won, "set1_won": set1[won],
+            "won": won, "set1_won": set1[won], "set2_sets": set2[won],
             "ip_set1": set1[won].map({1.0: "Vinto", 0.0: "Perso"}), "ip_set1_tb": tb,
             "ip_break1": np.where(~has_events, None, np.where(breaker.isna(), "Nessun break",
                                   np.where(breaker == m[f"{a}_name"].map(_norm_name), "Fatto",
@@ -363,7 +417,12 @@ def apply_filters(sel: pd.DataFrame, cfg: dict) -> pd.DataFrame:
         if col not in sel.columns or not rule:
             continue
         if rule.get("in"):
-            mask &= sel[col].isin(rule["in"]).to_numpy()
+            vals = list(rule["in"])
+            if col == "level":
+                vals = [LEVEL_ALIASES.get(str(v), v) for v in vals]
+            elif col == "round":
+                vals = [ROUND_ALIASES.get(str(v), v) for v in vals]
+            mask &= sel[col].isin(vals).to_numpy()
         if rule.get("min") is not None:
             mask &= (sel[col] >= rule["min"]).to_numpy()  # NaN -> escluso
         if rule.get("max") is not None:
@@ -531,14 +590,23 @@ def live_odds(p: np.ndarray, side: str, margin_pct: float) -> np.ndarray:
     return np.maximum(fair * (1 - m), 1.01) if side == "back" else np.maximum(fair * (1 + m), 1.01)
 
 
-def backtest_selections(sel: pd.DataFrame, cfg: dict, bankroll: float = 100.0) -> BacktestResult:
+def backtest_selections(sel: pd.DataFrame, cfg: dict, bankroll: float = 100.0, games: pd.DataFrame | None = None) -> BacktestResult:
     """Backtest su un dataframe di selezioni gia' caricato (utile per riusare la cache).
-    Con filtri in partita attivi i range di quota restano sulle quote pre-partita, ma l'operazione entra dopo
-    l'evento alla quota live stimata (vedi `live_prob`), cosi' il risultato non usa informazioni future."""
+    - Con filtri in partita i range di quota restano sulle quote pre-partita, ma l'operazione entra dopo
+      l'evento alla quota live stimata (vedi `live_prob`), cosi' il risultato non usa informazioni future.
+    - Lay: si banca alla quota equa piu' lo spread dell'exchange, non alla quota back del bookmaker.
+    - Cash out 'scalping sul servizio': le operazioni diventano i game di servizio dei match selezionati
+      (serve `games`, la tabella dei game punto per punto)."""
     picked = apply_filters(sel, cfg)
+    co_cfg = cashout.settings(cfg)
+    if co_cfg["mode"] == "tpsl" and co_cfg["when"] == "break1" and "ip_break1" in picked.columns:
+        picked = picked[picked["ip_break1"].notna()]           # il controllo al primo break esiste solo con i dati punto per punto
+    picked = picked.assign(book_odds=picked["odds"])
     point = entry_point(cfg)
     live = None
     side = cfg.get("side", "back")
+    if side == "lay" and point is None and len(picked):
+        picked = picked.assign(odds=lay_price(picked, float(cfg.get("lay_spread", LAY_SPREAD))))
     override = cfg.get("live_odds_override")
     override = float(override) if override not in (None, "", 0) and float(override) > 1 else None
     if point is not None and len(picked):
@@ -551,17 +619,24 @@ def backtest_selections(sel: pd.DataFrame, cfg: dict, bankroll: float = 100.0) -
     trades = settle(picked, side, float(cfg.get("commission") or 0.0),
                     cfg.get("lay_mode", "liability"), float(cfg.get("stake") or 1.0))
     smart_skipped = False
-    if cashout.is_active(cfg):
-        if point is not None and cashout.settings(cfg)["mode"] == "smart":
-            smart_skipped = True       # il punto di controllo del cash out coincide con l'ingresso: non ha senso
+    if co_cfg["mode"] == "tpsl" and co_cfg["when"] == "scalping":
+        from src import scalping
+        if games is None or games.empty or cfg.get("sport") != "tennis":
+            trades = trades.iloc[0:0]
         else:
-            trades = cashout.apply(trades, cfg)
+            g, _ = scalping.strategy_games(games, trades, co_cfg["who"])
+            trades = scalping.scalp_trades(g, co_cfg["tp"], co_cfg["sl"], side=side, spread_pct=co_cfg["spread_pct"],
+                                           commission=float(cfg.get("commission") or 0.0), skip_games=int(co_cfg["skip_games"]),
+                                           decided_pct=co_cfg["decided_pct"], stop_at_bp=bool(co_cfg["stop_at_bp"]))
+        return BacktestResult(cfg, trades, compute_metrics(trades, bankroll), monthly_returns(trades), None)
+    if cashout.is_active(cfg):
+        trades = cashout.apply(trades, cfg)
     if point is not None and len(trades):
         pre_p = 1 / trades["pre_odds"]
         live = {"entry": point, "label": ENTRY_LABEL[point], "avg_pre_odds": float(trades["pre_odds"].mean()),
                 "avg_live_odds": float(trades["odds"].median()), "real_win_pct": float(trades["won"].mean() * 100),
                 "est_prob_pct": float(trades["live_prob"].mean() * 100), "pre_implied_pct": float(pre_p.mean() * 100),
-                "margin_pct": float(cfg.get("live_margin", LIVE_MARGIN)), "smart_cashout_skipped": smart_skipped,
+                "margin_pct": float(cfg.get("live_margin", LIVE_MARGIN)),
                 "override": override,
                 "est_live_odds": float(np.median(live_odds(trades["live_prob"].to_numpy(), side, float(cfg.get("live_margin", LIVE_MARGIN)))))}
     return BacktestResult(cfg, trades, compute_metrics(trades, bankroll), monthly_returns(trades), live)
@@ -571,7 +646,17 @@ def run_backtest(cfg: dict, con: duckdb.DuckDBPyConnection | None = None, bankro
     sport = cfg["sport"]
     market = cfg.get("market") or MARKETS[sport][0]
     sel = load_selections(sport, market, cfg.get("price", "avg"), cfg.get("price_timing", "open"), con)
-    return backtest_selections(sel, cfg, bankroll)
+    games = None
+    if cashout.settings(cfg)["when"] == "scalping" and sport == "tennis":
+        from src import scalping
+        own = con is None
+        c = con or connect()
+        try:
+            games = scalping.load_games(c)
+        finally:
+            if own:
+                c.close()
+    return backtest_selections(sel, cfg, bankroll, games)
 
 
 # --------------------------------------------------------------------------- analisi

@@ -243,9 +243,11 @@ def test_football_over_under_and_closing_price():
     s = bt.football_selections(football_frame(), "ou25", "avg")
     over = bt.backtest_selections(s, {"selection": ["over"]})
     assert over.metrics["trades"] == 2 and over.metrics["profit"] == pytest.approx(0.6 - 1.0)
-    under = bt.backtest_selections(s, {"selection": ["under"], "side": "lay", "commission": 0.05})
-    # lay under resp. 1u: x -> under perde: +1/(2.40-1)*0.95 ; y -> under vince: -1
-    assert under.metrics["profit"] == pytest.approx(0.95 / 1.4 - 1.0)
+    under = bt.backtest_selections(s, {"selection": ["under"], "side": "lay", "commission": 0.05, "lay_spread": 2.0})
+    # si banca alla quota equa (senza margine) + 2%: x -> under perde: +1/(q-1)*0.95 ; y -> under vince: -1
+    q = (1 / ((1 / 2.40) / (1 / 1.60 + 1 / 2.40))) * 1.02
+    assert under.trades["odds"].iloc[0] == pytest.approx(q)
+    assert under.metrics["profit"] == pytest.approx(0.95 / (q - 1) - 1.0)
     close = bt.football_selections(football_frame(), "1x2", "ps", timing="close")
     assert bt.backtest_selections(close, {"selection": ["home"]}).metrics["clv_pct"] == pytest.approx(0.0)
 
@@ -500,10 +502,15 @@ def test_real_backtest_is_consistent(con):
     assert r.monthly["trades"].sum() == m["trades"]
     assert -15 < m["roi_pct"] < 5          # puntare alla cieca la media mercato non puo' rendere molto
     assert t["match_id"].is_unique and t["date"].is_monotonic_increasing
-    # back e lay della stessa selezione senza commissioni e a puntata fissa sono speculari
+    # il lay si apre alla quota equa + spread, non alla quota back del bookmaker: bancare alla cieca non puo'
+    # rendere quanto il back perde (il margine del bookmaker non e' incassabile)
     lay = bt.run_backtest({"sport": "football", "market": "1x2", "selection": ["home"], "price": "avg",
                            "side": "lay", "lay_mode": "stake", "filters": {"league": {"in": ["Serie A"]}}}, con)
-    assert lay.metrics["profit"] == pytest.approx(-m["profit"])
+    assert (lay.trades["odds"] > lay.trades["book_odds"]).mean() > 0.9
+    assert lay.metrics["profit"] != pytest.approx(-m["profit"])          # niente piu' simmetria fittizia con il back
+    everywhere = bt.run_backtest({"sport": "football", "market": "1x2", "selection": ["home"], "price": "avg", "side": "lay",
+                                  "lay_mode": "stake"}, con)
+    assert -3.0 < everywhere.metrics["roi_pct"] < 1.0                   # su tutti i campionati: circa meno lo spread
 
 
 @needs_db
@@ -810,56 +817,74 @@ def test_football_halftime_model():
     assert np.isnan(co.football_checkpoint_prob(t.assign(ht_home=np.nan))).all()
 
 
-def test_smart_cashout_triggers_and_keeps_hold_result(monkeypatch):
+def test_tpsl_cashout_at_checkpoints(monkeypatch):
     monkeypatch.setattr(co, "SET_MOMENTUM", 0.0)
     sel = make_sel([2.0, 2.0, 2.0, 2.0], [True, False, True, False])
     sel["opp_odds"], sel["best_of"], sel["set1_won"] = 2.0, 3.0, [1.0, 1.0, 0.0, np.nan]
-    cfg = {"cashout": {"mode": "smart", "take_profit": True, "tp_pct": 30, "stop_loss": True, "sl_pct": 40, "margin_pct": 0}}
+    sel["sport"] = "tennis"
+    cfg = {"sport": "tennis", "cashout": {"mode": "tpsl", "when": "set1", "tp": 30, "sl": 40, "margin_pct": 0}}
     r = bt.backtest_selections(sel, cfg)
     t = r.trades
     # quota 2.0 alla pari: dopo il primo set vinto p = 0.75 -> cash out +0.5; perso p = 0.25 -> -0.5
     assert t["cashout"].tolist() == ["tp", "tp", "sl", ""]
+    assert t["exit_point"].tolist() == ["fine primo set"] * 3 + ["fine partita"]
     assert t["pnl"].tolist() == pytest.approx([0.5, 0.5, -0.5, -1.0])
     assert t["pnl_hold"].tolist() == pytest.approx([1.0, -1.0, 1.0, -1.0])
-    assert r.metrics["profit"] == pytest.approx(-0.5) and r.metrics["wins"] == 2
-    assert t["equity"].tolist() == pytest.approx([0.5, 1.0, 0.5, -0.5])
-    only_tp = bt.backtest_selections(sel, {"cashout": {"mode": "smart", "tp_pct": 60, "margin_pct": 0}}).trades
-    assert (only_tp["cashout"] == "").all()                              # soglia non raggiunta: nessuna chiusura
-    off = bt.backtest_selections(sel, {"cashout": {"mode": "off"}}).trades
-    assert "cashout" not in off.columns and off["pnl"].tolist() == [1.0, -1.0, 1.0, -1.0]
-    grid = co.threshold_grid(off, cfg)
-    row = grid[(grid["incassa_da"] == "+30%") & (grid["taglia_da"] == "-30%")].iloc[0]
-    assert row["profit"] == pytest.approx(-0.5) and row["chiuse_pct"] == pytest.approx(75.0)
-    assert grid[(grid["incassa_da"] == "mai") & (grid["taglia_da"] == "mai")].iloc[0]["profit"] == pytest.approx(0.0)
+    assert r.metrics["profit"] == pytest.approx(-0.5) and t["equity"].tolist() == pytest.approx([0.5, 1.0, 0.5, -0.5])
+    none = bt.backtest_selections(sel, {**cfg, "cashout": {**cfg["cashout"], "tp": 60, "sl": 0}}).trades
+    assert (none["cashout"] == "").all() and none["pnl"].tolist() == [1.0, -1.0, 1.0, -1.0]
+    off = bt.backtest_selections(sel, {"sport": "tennis", "cashout": {"mode": "off", "when": "set1"}}).trades
+    assert "cashout" not in off.columns
+    vals = co.checkpoint_values(off, ["set1"], 0, 0.0)
+    grid = co.tpsl_grid(vals, off["pnl"].to_numpy(), off["risk"].to_numpy(), (0, 30), (0, 40))
+    assert grid.loc[40, 30] == pytest.approx(-0.5 / 4 * 100) and grid.loc[0, 0] == pytest.approx(0.0)
+    s = co.summary(t).set_index(["esito", "momento"])
+    assert s.loc[("Take Profit", "fine primo set"), "operazioni"] == 2 and s["profitto"].sum() == pytest.approx(-0.5)
 
 
-def test_manual_cashout_rules_are_reproducible():
-    rng = np.random.default_rng(5)
-    n = 4000
-    odds = np.round(rng.uniform(1.5, 3.0, n), 2)
-    sel = make_sel(odds.tolist(), (rng.random(n) < 0.45).tolist(),
-                   dates=pd.date_range("2015-01-01", periods=n, freq="D").strftime("%Y-%m-%d").tolist())
-    rules = {"mode": "manual", "win_early_share": 30, "win_early_keep": 60, "win_panic_share": 10, "win_panic_loss": 25,
-             "lose_saved_share": 20, "lose_saved_gain": 40, "lose_cut_share": 25, "lose_cut_recover": 50, "seed": 3}
-    t = bt.backtest_selections(sel, {"cashout": rules}).trades
-    won = t["pnl_hold"] > 0
-    share = lambda k, mask: (t.loc[mask, "cashout"] == k).mean() * 100
-    assert share("win_early", won) == pytest.approx(30, abs=3) and share("win_panic", won) == pytest.approx(10, abs=2.5)
-    assert share("lose_saved", ~won) == pytest.approx(20, abs=3) and share("lose_cut", ~won) == pytest.approx(25, abs=3)
-    e, pn, sv_, cu = (t[t["cashout"] == k] for k in ("win_early", "win_panic", "lose_saved", "lose_cut"))
-    assert np.allclose(e["pnl"], e["pnl_hold"] * 0.60) and np.allclose(pn["pnl"], -0.25)
-    assert np.allclose(sv_["pnl"], (sv_["odds"] - 1) * 0.40) and np.allclose(cu["pnl"], -0.50)
-    untouched = t[t["cashout"] == ""]
-    assert np.allclose(untouched["pnl"], untouched["pnl_hold"])
-    again = bt.backtest_selections(sel, {"cashout": rules}).trades
-    assert again["pnl"].equals(t["pnl"])                                  # stesso seme -> stesso risultato
-    other = bt.backtest_selections(sel, {"cashout": {**rules, "seed": 4}}).trades
-    assert not other["cashout"].equals(t["cashout"])
-    # aggiungere un filtro non cambia la sorte delle giocate rimaste
-    sub = bt.backtest_selections(sel, {"cashout": rules, "odds_max": 2.2}).trades
-    assert sub.set_index("match_id")["cashout"].equals(t.set_index("match_id")["cashout"].reindex(sub["match_id"]))
-    s = co.summary(t)
-    assert s["giocate"].sum() == n and s["profitto"].sum() == pytest.approx(t["pnl"].sum())
+def test_cashout_settings_and_checkpoints():
+    legacy = co.settings({"sport": "tennis", "cashout": {"mode": "smart", "take_profit": True, "tp_pct": 25, "stop_loss": False}})
+    assert legacy["mode"] == "tpsl" and legacy["when"] == "set1" and legacy["tp"] == 25 and legacy["sl"] == 0
+    assert co.settings({"sport": "football", "cashout": {"mode": "smart"}})["when"] == "ht"
+    manual = co.settings({"cashout": {"mode": "manual", "win_early_share": 30}})
+    assert manual["mode"] == "off" and manual["legacy_manual"]
+    base = {"sport": "tennis", "cashout": {"mode": "tpsl", "when": "all", "tp": 10, "sl": 10}}
+    assert co.checkpoints(base) == ["break1", "set1", "set2"]
+    assert co.checkpoints({**base, "filters": {"ip_break1": {"in": ["Fatto"]}}}) == ["set1", "set2"]   # solo dopo l'ingresso
+    assert co.checkpoints({**base, "filters": {"ip_set1": {"in": ["Vinto"]}}}) == ["set2"]
+    assert co.checkpoints({**base, "cashout": {**base["cashout"], "when": "set1"}, "filters": {"ip_set1": {"in": ["Vinto"]}}}) == []
+    assert co.checkpoints({"sport": "football", "cashout": {"mode": "tpsl", "when": "ht", "tp": 10}}) == ["ht"]
+    assert co.checkpoints({"sport": "football", "cashout": {"mode": "tpsl", "when": "ht", "tp": 10}, "filters": {"ip_ht": {"in": ["Pari"]}}}) == []
+    assert not co.is_active({"sport": "tennis", "cashout": {"mode": "tpsl", "when": "set1", "tp": 0, "sl": 0}})
+    v = np.array([[0.1, np.nan, -0.6], [np.nan, 0.35, 0.0], [0.0, 0.0, 0.0]])
+    assert co.first_hit(v, 30, 50).tolist() == [2, 1, -1]
+    pnl, reason, k = co.apply_tpsl(v, np.array([1.0, -1.0, 0.4]), 30, 50)
+    assert pnl.tolist() == pytest.approx([-0.6, 0.35, 0.4]) and reason.tolist() == ["sl", "tp", ""]
+
+
+def test_second_set_model():
+    t = pd.DataFrame({"odds": [2.0] * 5, "opp_odds": [2.0] * 5, "best_of": [3, 3, 3, 5, 5], "set2_sets": [2, 1, 0, 2, 1],
+                      "set1_won": [1.0, 0.0, 0.0, 1.0, 1.0]})
+    p = co.tennis_set2_prob(t)
+    assert p[0] == 1.0 and p[2] == 0.0                                      # al meglio dei 3 il 2-0 chiude la partita
+    assert 0.5 < p[1] < 0.6 and 0.85 < p[3] < 1 and 0.4 < p[4] < 0.5      # sull'1-1 conta chi ha vinto il secondo set
+    assert np.isnan(co.checkpoint_prob(t, "set2")[0])                       # partita finita: niente cash out
+
+
+def test_lay_price_removes_bookmaker_margin():
+    sel = make_sel([1.80, 2.10], [True, False])
+    sel["opp_odds"] = [2.00, 1.75]
+    fair = 1 / ((1 / 1.80) / (1 / 1.80 + 1 / 2.00))
+    assert bt.lay_price(sel, 2.0)[0] == pytest.approx(fair * 1.02) and bt.lay_price(sel, 0)[0] > 1.80
+    back = bt.backtest_selections(sel, {"side": "back"})
+    lay = bt.backtest_selections(sel, {"side": "lay", "lay_spread": 0.0})
+    assert lay.trades["odds"].tolist() == pytest.approx(bt.lay_price(sel, 0.0).tolist())
+    assert lay.trades["book_odds"].tolist() == [1.80, 2.10]
+    # a quota equa back e lay sono a somma zero: il lay non incassa piu' il margine del bookmaker
+    fair_back = bt.backtest_selections(sel.assign(odds=bt.lay_price(sel, 0.0)), {"side": "back"})
+    lay_stake = bt.backtest_selections(sel, {"side": "lay", "lay_spread": 0.0, "lay_mode": "stake"})
+    assert lay_stake.metrics["profit"] == pytest.approx(-fair_back.metrics["profit"])
+    assert back.metrics["profit"] < fair_back.metrics["profit"]
 
 
 def test_first_set_is_read_from_score():
@@ -942,10 +967,8 @@ def test_cashout_breakeven_matches_simulation():
     need = be["need"].set_index("recupero_pct")["quota_perdenti_da_tagliare_pct"]
     assert need[80] < need[50] < need[20]                                             # piu' recuperi, meno devi tagliare
     assert an.breakeven_custom(be, need[50], 50) == pytest.approx(0.0, abs=1e-9)      # alla soglia il ROI atteso e' zero
-    # il valore atteso coincide con la simulazione manuale (a meno della sorte)
-    sim = bt.backtest_selections(sel, {"cashout": {"mode": "manual", "lose_cut_share": 40, "lose_cut_recover": 50,
-                                                   "win_early_share": 30, "win_early_keep": 70}}).metrics["roi_pct"]
-    assert an.breakeven_custom(be, 40, 50, 30, 70) == pytest.approx(sim, abs=1.0)
+    profit = t["pnl"].sum() + 0.4 * 0.5 * t.loc[t["pnl"] < 0, "risk"].sum() - 0.3 * 0.3 * t.loc[t["pnl"] > 0, "pnl"].sum()
+    assert an.breakeven_custom(be, 40, 50, 30, 70) == pytest.approx(profit / t["risk"].sum() * 100)
     winning = an.breakeven(bt.settle(make_sel([2.0, 2.0, 2.0], [True, True, False])))
     assert (winning["need"]["quota_perdenti_da_tagliare_pct"] == 0).all()
     hopeless = an.breakeven(bt.settle(make_sel([1.05] * 10, [True] + [False] * 9)))
@@ -1310,8 +1333,8 @@ def test_live_entry_uses_prematch_odds_filter_and_live_price():
     assert bt.entry_point({"sport": "tennis", "filters": {"ip_break1": {"in": ["Fatto"]}}}) == "break1"
     assert bt.entry_point({"sport": "tennis", "filters": {"ip_break1": {"in": ["Fatto"]}, "ip_set1_tb": {"in": ["No"]}}}) == "set1"
     assert bt.entry_point({"sport": "football", "filters": {"ip_ht": {"in": ["Pari"]}}}) == "ht"
-    smart = bt.backtest_selections(s, {**cfg, "cashout": {"mode": "smart"}})
-    assert smart.live["smart_cashout_skipped"] and "cashout" not in smart.trades.columns
+    late = bt.backtest_selections(s, {**cfg, "cashout": {"mode": "tpsl", "when": "set1", "tp": 1, "sl": 1}})
+    assert (late.trades["cashout"] == "").all()      # il controllo a fine primo set coincide con l'ingresso: nessun cash out
 
 
 def test_break_price_and_conditional_stats():
@@ -1423,3 +1446,89 @@ def test_manual_live_odds_override():
     assert bt.backtest_selections(s, {**cfg, "live_odds_override": None}).live["override"] is None
     no_live = bt.backtest_selections(s, {**cfg, "filters": {}, "live_odds_override": 1.80})
     assert no_live.live is None and sorted(no_live.trades["odds"]) == sorted(s[s["selection"] == "underdog"].query("odds >= 2.6 and odds <= 4")["odds"])
+
+
+# ------------------------------------------------------------------ scalping con TP/SL, etichette uniformi, fonti
+def test_scalping_tpsl_on_point_path():
+    t = sc.game_table(np.array([0.6]))[0]
+    price = lambda a, b: t[a, b] * 0.55 + (1 - t[a, b]) * 0.40
+    seqs = ["1111", "0000", "1111", "001111", "1111"]
+    g = scalp_games(seqs).assign(set_no=[1, 1, 1, 2, 2], game_no=[1, 2, 3, 1, 2], db_match_id="m", server="S", returner="R")
+    meta, vals, final = sc.scalp_paths(g, spread_pct=0.0, skip_games=2)
+    assert len(meta) == 3 and meta["game_no"].tolist() == [3, 1, 2]                        # saltati i primi due game del match
+    p0 = price(0, 0)
+    assert vals[0, 0] == pytest.approx(price(1, 0) / p0 - 1) and final[0] == pytest.approx(0.55 / p0 - 1)
+    assert np.isnan(vals[0, 4]) and final[1] == pytest.approx(0.55 / p0 - 1)
+    tr = sc.scalp_trades(g, tp=5, sl=10, spread_pct=0.0, skip_games=2)
+    first_tp = int(np.argmax(vals[0] >= 0.05))
+    assert tr["cashout"].iloc[0] == "tp" and tr["pnl"].iloc[0] == pytest.approx(vals[0, first_tp])
+    assert tr.loc[tr["game_no"] == 1, "cashout"].iloc[0] == "sl"                             # 0-15, 0-30: stop loss
+    lay = sc.scalp_trades(g, tp=0, sl=0, side="lay", spread_pct=0.0, skip_games=2)
+    assert lay["pnl"].iloc[0] == pytest.approx((p0 - 0.55) / (1 - p0))                       # bancare chi tiene: perdita
+    assert sc.scalp_paths(g.assign(v_hold=0.99, v_break=0.98), skip_games=2)[0].empty      # match deciso: niente ingresso
+    bp, _, fin_bp = sc.scalp_paths(g, spread_pct=0.0, skip_games=2, stop_at_bp=True)
+    assert fin_bp[1] == pytest.approx(final[1])                                             # 0-30 non e' palla break
+    g2 = scalp_games(["0001111"]).assign(set_no=2, game_no=5, db_match_id="m", server="S", returner="R")
+    _, _, fin2 = sc.scalp_paths(g2, spread_pct=0.0, skip_games=2, stop_at_bp=True)
+    assert fin2[0] == pytest.approx(price(0, 3) / p0 - 1)                                    # 0-40: uscita alla palla break
+    tm = sc.typical_moves(pd.concat([g] * 3, ignore_index=True), spread_pct=0.0, skip_games=0)
+    row = tm.iloc[0]
+    assert row["game"] == 15 and row["guadagno_tenuto_pct"] == pytest.approx((0.55 / p0 - 1) * 100)
+    assert row["perdita_break_pct"] == pytest.approx((0.40 / p0 - 1) * 100) and row["tenuti_pct"] == pytest.approx(80.0)
+
+
+def test_scalping_from_strategy_in_backtest():
+    m = tennis_frame().assign(score=["6-4 6-2", "6-1 6-1", "6-4 3-6 6-2"], status="Completed")
+    s = bt.tennis_selections(m, "avg")
+    games = scalp_games(["1111", "0000", "1111", "1111"]).assign(db_match_id=["a", "a", "a", "c"], set_no=1, game_no=[3, 4, 5, 3],
+                                                                   server=["A", "B", "A", "E"], returner=["B", "A", "B", "F"])
+    cfg = {"sport": "tennis", "selection": ["favourite"], "cashout": {"mode": "tpsl", "when": "scalping", "tp": 0, "sl": 0,
+                                                                         "who": "player", "spread_pct": 0.0}}
+    r = bt.backtest_selections(s, cfg, games=games)
+    assert len(r.trades) == 2 and set(r.trades["event"]) == {"A (serve) vs B"}             # solo i game del favorito di 'a'
+    both = bt.backtest_selections(s, {**cfg, "cashout": {**cfg["cashout"], "who": "both"}}, games=games)
+    assert len(both.trades) == 4                                                            # anche i game dell'avversario e del match c
+    assert bt.backtest_selections(s, cfg).trades.empty                                       # senza dati punto per punto
+
+
+def test_uniform_round_and_level_labels(tmp_path):
+    import duckdb
+    assert bt.level_label("A", "ATP500") == "ATP 500" and bt.level_label("250", "ATP500") == "ATP 250"
+    assert bt.level_label("G", None) == "Grand Slam" and bt.level_label(None, "Masters Cup") == "ATP Finals"
+    assert bt.level_label("C", None) == "Challenger" and bt.level_label("A", None) == "ATP 250/500"
+    con = duckdb.connect(str(tmp_path / "r.duckdb"))
+    ud.init_db(con)
+    rows = [("a", 2024, "Slam", "1st Round"), ("b", 2024, "Slam", "4th Round"), ("c", 2024, "Slam", "Quarterfinals"),
+            ("d", 2024, "Small", "1st Round"), ("e", 2024, "Small", "2nd Round"), ("f", 2024, "Small", "The Final"), ("g", 2024, "X", "R32")]
+    for mid, season, t, rnd in rows:
+        con.execute("INSERT INTO tennis_matches (match_id, season, tourney_name, round) VALUES (?, ?, ?, ?)", [mid, season, t, rnd])
+    ud.normalize_tennis_labels(con)
+    got = dict(con.execute("SELECT match_id, round FROM tennis_matches").fetchall())
+    assert got == {"a": "R128", "b": "R16", "c": "QF", "d": "R32", "e": "R16", "f": "F", "g": "R32"}
+    con.close()
+    flt = bt.apply_filters(pd.DataFrame({"odds": [2.0, 2.0], "level": ["Masters 1000", "ATP 250"], "round": ["QF", "R32"]}),
+                           {"filters": {"level": {"in": ["M"]}, "round": {"in": ["Quarterfinals"]}}})
+    assert len(flt) == 1                                                   # i valori salvati con i vecchi nomi funzionano
+
+
+def test_fetch_best_keeps_most_complete_source(tmp_path, monkeypatch):
+    files = {"u1": b"winner_name\n1\n", "u2": b"winner_name\n1\n2\n3\n", "u3": None}
+    monkeypatch.setattr(ud, "http_get", lambda url, retries=3: files[url])
+    ok = lambda b: b"winner_name" in b
+    raw, src, new = ud.fetch_best(tmp_path / "x.csv", ["u1", "u2", "u3"], True, ok)
+    assert src == "u2" and new and raw == files["u2"]
+    files["u2"] = None                                                      # fonte sparita: resta la copia piu' completa
+    assert ud.fetch_best(tmp_path / "x.csv", ["u1", "u2"], True, ok)[0] == b"winner_name\n1\n2\n3\n"
+
+
+@needs_db
+def test_scalping_typical_moves_on_real_games(con):
+    g = sc.load_games(con)
+    if g.empty:
+        pytest.skip("dati punto per punto non scaricati")
+    tm = sc.typical_moves(g, spread_pct=0.0).set_index(["superficie", "battitore"])
+    for surf in ("Clay", "Grass", "Hard"):
+        assert tm.loc[(surf, "Sfavorito"), "guadagno_tenuto_pct"] > tm.loc[(surf, "Favorito"), "guadagno_tenuto_pct"] > 0
+        assert tm.loc[(surf, "Favorito"), "perdita_break_pct"] < 0 and tm.loc[(surf, "Favorito"), "tenuti_pct"] > tm.loc[(surf, "Sfavorito"), "tenuti_pct"]
+    assert tm.loc[("Clay", "Sfavorito"), "guadagno_tenuto_pct"] > tm.loc[("Grass", "Sfavorito"), "guadagno_tenuto_pct"]
+    assert tm.loc[("Clay", "Sfavorito"), "perdita_break_pct"] > tm.loc[("Grass", "Sfavorito"), "perdita_break_pct"]   # sulla terra il break costa meno
