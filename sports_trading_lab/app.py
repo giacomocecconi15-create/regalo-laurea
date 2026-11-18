@@ -173,12 +173,34 @@ ENTRY_FILTERS = {"break_made": ("ip_break1", "Fatto"), "break_suffered": ("ip_br
                  "ht_2": ("ip_ht_goals", "2")}
 
 
-def entry_options(sport: str, market: str) -> dict:
-    return ENTRY_OPTIONS["tennis" if sport == "tennis" else market]
+EVENT_OPTIONS = {
+    "tennis": {"pre": "Pre-partita (entrambi i giocatori)", "break_made": "Su chi fa il primo break",
+               "break_suffered": "Su chi subisce il primo break", "set1_won": "Su chi vince il primo set",
+               "set1_lost": "Su chi perde il primo set"},
+    "1x2": {"pre": "Pre-partita (tutte le selezioni)", "ht_lead": "Sulla squadra in vantaggio all'intervallo",
+            "ht_draw": "Sulle squadre in parità all'intervallo", "ht_trail": "Sulla squadra in svantaggio all'intervallo"},
+}
+
+
+def event_mode(sport: str, market: str, selection) -> bool:
+    """Nessun lato fisso (né favorito né sfavorito, né solo casa o solo ospite): si opera su chi fa o subisce l'evento."""
+    sel = set(selection or [])
+    if sport == "tennis":
+        return not sel or {"favourite", "underdog"} <= sel
+    return market == "1x2" and (not sel or {"home", "away"} <= sel)
+
+
+def entry_options(sport: str, market: str, selection=None) -> dict:
+    key = "tennis" if sport == "tennis" else market
+    if selection is not None and event_mode(sport, market, selection) and key in EVENT_OPTIONS:
+        return EVENT_OPTIONS[key]
+    return ENTRY_OPTIONS[key]
 
 
 def entry_from_filters(sport: str, market: str, filters: dict) -> str:
     """Ricava il momento di ingresso dai filtri in partita di una strategia salvata."""
+    if (filters.get("ip_ht_sel") or {}).get("in") == ["Pari"]:
+        return "ht_draw"
     for key in entry_options(sport, market):
         if key in ENTRY_FILTERS:
             col, val = ENTRY_FILTERS[key]
@@ -216,10 +238,14 @@ def apply_pending() -> None:
     for k in ("tp", "sl", "margin_pct", "spread_pct", "decided_pct"):
         ss[f"bt_co_{k}"] = float(c[k])
     ss["bt_co_who"], ss["bt_co_stop_at_bp"] = c["who"], bool(c["stop_at_bp"])
+    ss["bt_co_method"] = c["method"] if c["mode"] == "tpsl" else "odds"
+    for point, row in c["quotes"].items():
+        for k, v in row.items():
+            ss[f"bt_q_{point}_{k}"] = float(v)
     ss[f"bt_entry_{sport}_{market}"] = entry_from_filters(sport, market, cfg.get("filters") or {})
     if c.get("legacy_manual"):
         ss["_legacy_note"] = ("Questa strategia era salvata con il vecchio cash out a frequenze, che non esiste più: il cash out è "
-                              "ora Take Profit / Stop Loss. Sceglilo nel riquadro *Ingresso e cash out* e salva di nuovo la strategia.")
+                              "ora a quote o a Take Profit / Stop Loss. Sceglilo nel riquadro *Piano di trading* e salva di nuovo la strategia.")
     specs = {f[0]: f for f in bt.FILTERS[sport]}
     for col, rule in (cfg.get("filters") or {}).items():
         spec = specs.get(col)
@@ -615,12 +641,13 @@ Più filtri provi, più è facile trovare per caso una combinazione che ha reso 
 strategia solo se supera i controlli e ha una logica che sai spiegare.
 
 ### 5 · Dal test alla pratica
-- **Quando entri** (riquadro *Ingresso e cash out*, in alto nel Backtester): pre-partita oppure dopo il primo break fatto o
+- **Quando entri** (riquadro *Piano di trading*, in alto nel Backtester): pre-partita oppure dopo il primo break fatto o
   subito, dopo il primo set vinto o perso, all'intervallo. Le quote scelte restano pre-partita, ma l'operazione entra dopo
   l'evento alla quota live stimata; la vista *In partita* mostra quante partite vince la selezione in ogni situazione.
-- **Cash out**: due numeri, *Take Profit* e *Stop Loss* (in % della somma rischiata), e quando controllarli: al primo
-  break, a fine primo o secondo set, in ogni momento disponibile, all'intervallo nel calcio, oppure *scalping sul
-  servizio* game per game. La vista *Cash out* mostra l'effetto e la mappa di tutte le combinazioni.
+  Se nella *Selezione* non scegli né favorito né sfavorito, operi su chi fa o subisce l'evento (es. chi perde il primo set).
+- **Uscita**: scegli il momento (primo break, fine primo o secondo set, in ogni momento, intervallo, scalping) e come esci:
+  *a quote* (per ogni esito reale indichi la quota a cui chiudi, il ROI si calcola dalla tua quota di ingresso) oppure con
+  *Take Profit / Stop Loss in %* di ROI sull'unità. La vista *Uscita* dà l'analisi finale per momento ed esito.
 - **Oggi**: le partite in programma con classifica, form e precedenti a quote simili, e le strategie che attivano.
 - **Rischio**: simula 1.000 futuri possibili e confronta stake fisso e Kelly frazionario.
 - **Strategie**: salva le strategie valide, poi scarica con un clic le partite in programma (calcio) e ottieni
@@ -746,8 +773,11 @@ def describe_cashout(cfg: dict) -> str:
     if not co.is_active(cfg):
         return ""
     when = co.WHEN.get(cfg.get("sport", "tennis"), {}).get(c["when"], c["when"]).lower()
+    if c["method"] == "odds":
+        parts = [f"{co.OUTCOMES[p][k]} a {v:.2f}" for p, row in c["quotes"].items() for k, v in row.items()]
+        return f"uscita {when} a quota: " + ", ".join(parts)
     parts = ([f"take profit +{c['tp']:g}%"] if c["tp"] > 0 else []) + ([f"stop loss -{c['sl']:g}%"] if c["sl"] > 0 else [])
-    return f"cash out {when}: " + (", ".join(parts) if parts else "uscita a fine game")
+    return f"uscita {when}: " + (", ".join(parts) if parts else "a fine game")
 
 
 def _reset_filters(sport: str) -> None:
@@ -845,7 +875,7 @@ def sidebar_config() -> dict:
     for spec in bt.FILTERS[sport]:
         groups.setdefault(spec[2], []).append(spec)
     for group, specs in groups.items():
-        if group == "In partita":          # l'ingresso in partita si sceglie nel riquadro "Ingresso e cash out"
+        if group == "In partita":          # l'ingresso in partita si sceglie nel riquadro "Piano di trading"
             continue
         with sb.expander(group):
             for spec in specs:
@@ -968,9 +998,9 @@ def tab_summary(cfg: dict, res: bt.BacktestResult, bank: float) -> None:
     if "cashout" in trades.columns:
         closed = int((trades["cashout"] != "").sum())
         delta = float(trades["pnl"].sum() - trades["pnl_hold"].sum())
-        st.caption(f":material/currency_exchange: Cash out simulato: {num_it(closed)} giocate chiuse in anticipo "
+        st.caption(f":material/currency_exchange: Uscita anticipata: {num_it(closed)} operazioni chiuse prima della fine "
                    f"({closed / len(trades) * 100:.0f}%), effetto sul profitto {delta:+.2f} u rispetto a tenerle fino alla fine. "
-                   "Dettaglio nella vista *Cash out*.")
+                   "Analisi completa nella vista *Uscita*.")
     if cfg["side"] == "lay":
         st.caption(":material/warning: Lay: il prezzo di banca è la quota back selezionata. Sull'exchange la quota lay reale è più alta "
                    "e bancare a quote da bookmaker non è possibile: usa *Betfair Exchange* dove disponibile, imposta la commissione "
@@ -1083,11 +1113,12 @@ def tab_robustness(cfg: dict, res: bt.BacktestResult, sel_args: tuple, bank: flo
                    "Il *massimo mercato* è il tetto raggiungibile avendo conti su molti bookmaker.")
 
 
-def tpsl_heatmap(grid: pd.DataFrame, current: tuple[float, float], roi_hold: float) -> go.Figure:
-    """Mappa di calore del ROI per ogni coppia Take Profit (colonne) / Stop Loss (righe)."""
+def tpsl_heatmap(grid: pd.DataFrame, current: tuple[float, float], roi_hold: float, unit: str = "%",
+                 xlabel: str = "Take Profit", ylabel: str = "Stop Loss", mark_best: bool = True) -> go.Figure:
+    """Mappa di calore del ROI per ogni coppia Take Profit (colonne) / Stop Loss (righe): soglie in % o quote di uscita."""
     z = grid.to_numpy(dtype=float)
     lim = max(float(np.nanmax(np.abs(z))), 1.0)
-    lab = lambda v: "off" if v == 0 else f"{v:g}%"
+    lab = (lambda v: "off" if v == 0 else f"{v:g}%") if unit == "%" else (lambda v: "off" if v == 0 else f"{v:.2f}")
     fig = go.Figure(go.Heatmap(
         z=z, x=[lab(v) for v in grid.columns], y=[lab(v) for v in grid.index], zmid=0, zmin=-lim, zmax=lim,
         colorscale=[[0.0, "#b3261e"], [0.35, "#7a2f2b"], [0.5, "#2a3140"], [0.65, "#1f6b2a"], [1.0, "#16a34a"]],
@@ -1096,10 +1127,11 @@ def tpsl_heatmap(grid: pd.DataFrame, current: tuple[float, float], roi_hold: flo
         hovertemplate="Take Profit %{x}<br>Stop Loss %{y}<br>ROI %{z:+.2f}%<extra></extra>"))
     base_layout(fig, 470, f"ROI (%) per Take Profit e Stop Loss - tenendo tutto fino alla fine: {roi_hold:+.2f}%")
     fig.update_layout(hovermode="closest", margin=dict(l=70, r=20, t=52, b=56))
-    fig.update_xaxes(title_text="Take Profit", title_font=dict(color=MUTED, size=11), type="category", showgrid=False, ticks="")
-    fig.update_yaxes(title_text="Stop Loss", title_font=dict(color=MUTED, size=11), type="category", showgrid=False)
-    i, j = np.unravel_index(np.nanargmax(z), z.shape)
-    fig.add_shape(type="rect", x0=j - 0.5, x1=j + 0.5, y0=i - 0.5, y1=i + 0.5, line=dict(color=INK, width=2), xref="x", yref="y")
+    fig.update_xaxes(title_text=xlabel, title_font=dict(color=MUTED, size=11), type="category", showgrid=False, ticks="")
+    fig.update_yaxes(title_text=ylabel, title_font=dict(color=MUTED, size=11), type="category", showgrid=False)
+    if mark_best:
+        i, j = np.unravel_index(np.nanargmax(z), z.shape)
+        fig.add_shape(type="rect", x0=j - 0.5, x1=j + 0.5, y0=i - 0.5, y1=i + 0.5, line=dict(color=INK, width=2), xref="x", yref="y")
     tp, sl = current
     if tp in list(grid.columns) and sl in list(grid.index):
         ci, cj = list(grid.index).index(sl), list(grid.columns).index(tp)
@@ -1111,25 +1143,77 @@ def tab_cashout(cfg: dict, res: bt.BacktestResult, sel_args: tuple, bank: float)
     c = co.settings(cfg)
     trades = res.trades
     if not co.is_active(cfg):
-        st.info("Scegli nel riquadro **Ingresso e cash out**, in alto, *quando* controllare il cash out (al primo break, a fine primo "
-                "o secondo set, all'intervallo, oppure scalping sul servizio) e imposta Take Profit e Stop Loss. Qui vedrai l'effetto "
-                "rispetto a tenere fino alla fine e la mappa di tutte le combinazioni di soglie.")
+        st.info("Nel riquadro **Piano di trading**, in alto, scegli *in quale momento* uscire (primo break, fine primo o secondo set, "
+                "intervallo, scalping) e *come*: a quote che inserisci per ogni esito, oppure con Take Profit e Stop Loss in % di ROI. "
+                "Qui trovi l'analisi finale rispetto a tenere fino alla fine.")
         return
     scal = c["when"] == "scalping"
+    odds_mode = c["method"] == "odds"
     hold = trades.assign(pnl=trades["pnl_hold"])
     hold["equity"] = hold["pnl"].cumsum()
     mh, m = bt.compute_metrics(hold, bank), res.metrics
     closed = int((trades["cashout"] != "").sum())
-    kpis([("ROI con cash out", f"{m['roi_pct']:+.2f}%", f"senza cash out: {mh['roi_pct']:+.2f}%", sign_tone(m["roi_pct"])),
+    kpis([("ROI con uscita", f"{m['roi_pct']:+.2f}%", f"tenendo fino alla fine: {mh['roi_pct']:+.2f}%", sign_tone(m["roi_pct"])),
           ("Effetto sul profitto", f"{m['profit'] - mh['profit']:+.2f} u", "rispetto a tenere fino alla fine", sign_tone(m["profit"] - mh["profit"])),
-          ("Chiuse con TP o SL", f"{closed / len(trades) * 100:.0f}%", f"{num_it(closed)} su {num_it(len(trades))}", None),
+          ("Uscite anticipate", f"{closed / len(trades) * 100:.0f}%", f"{num_it(closed)} su {num_it(len(trades))}", None),
           ("Max drawdown", f"-{m['max_dd_units']:.1f} u", f"senza: -{mh['max_dd_units']:.1f} u",
            "good" if m["max_dd_units"] < mh["max_dd_units"] else None)])
-    st.subheader("Per esito e momento di uscita")
-    st.dataframe(co.summary(trades), hide_index=True, width="stretch", column_config={
+    st.subheader("Analisi finale per momento ed esito")
+    summ = co.summary(trades)
+    if not odds_mode:
+        summ = summ.drop(columns="quota_uscita")
+    st.dataframe(summ, hide_index=True, width="stretch", column_config={
+        "quota_pct": st.column_config.NumberColumn("% operazioni", format="%.1f"),
+        "quota_ingresso": st.column_config.NumberColumn("quota ingresso media", format="%.2f"),
+        "quota_uscita": st.column_config.NumberColumn("quota uscita", format="%.2f"),
+        "roi_uscita_pct": st.column_config.NumberColumn("ROI all'uscita %", format="%+.1f"),
         "profitto": st.column_config.NumberColumn("profitto ottenuto (u)", format="%+.2f"),
         "profitto_tenendo": st.column_config.NumberColumn("tenendole fino alla fine (u)", format="%+.2f"),
         "differenza": st.column_config.NumberColumn("differenza (u)", format="%+.2f")})
+    if not scal:
+        lines = []
+        for point in co.checkpoints(cfg):
+            n = co.outcome_counts(trades, point)
+            parts = [f"{co.OUTCOMES[point][k]} **{num_it(v)}**" for k, v in n.items() if k is not None and v]
+            if n.get(None):
+                parts.append(f"momento non disponibile **{num_it(n[None])}**")
+            lines.append(f"*{co.CHECKPOINT_LABEL[point]}*: " + ", ".join(parts))
+        st.caption(":material/fact_check: Esiti reali nel database, operazione per operazione (stessi filtri del backtest): "
+                   + " · ".join(lines) + ". *Momento non disponibile*: nessun break nel primo set, match senza dati punto per "
+                   "punto, partita già finita o ritiro; in quel caso l'operazione resta aperta fino al momento successivo o alla fine.")
+
+    if odds_mode:
+        pts = co.checkpoints(cfg)
+        side = cfg.get("side", "back")
+        if len(pts) == 1 and pts[0] in co.GOOD:
+            point = pts[0]
+            st.subheader("Mappa quote di uscita: Take Profit × Stop Loss")
+            est = co.estimated_quotes(trades, point)
+            tp_k, sl_k = co.side_outcomes(point, side)
+            # dalla stima del modello (quota equa) verso quote meno favorevoli: piu' realistiche, con margine e ritardo
+            factors = (0.95, 1.0, 1.05, 1.1, 1.15, 1.2, 1.3) if side == "back" else (1.05, 1.0, 0.95, 0.91, 0.87, 0.83, 0.77)
+
+            def around(x, cur):
+                vals = sorted({round(x * f, 2) for f in factors} | ({round(cur, 2)} if cur else set()))
+                return [0.0] + [v for v in vals if v > 1.01]
+            q = c["quotes"].get(point, {})
+            tps, sls = around(est.get(tp_k, 1.5), q.get(tp_k)), around(est.get(sl_k, 3.0), q.get(sl_k))
+            grid = co.quotes_grid(trades, point, tps, sls, float(cfg.get("commission") or 0.0))
+            if not grid.empty:
+                show(tpsl_heatmap(grid, (q.get(tp_k, 0.0), q.get(sl_k, 0.0)), mh["roi_pct"], unit="quota", mark_best=False,
+                                  xlabel=f"Take Profit: quota se {co.OUTCOMES[point][tp_k]}",
+                                  ylabel=f"Stop Loss: quota se {co.OUTCOMES[point][sl_k]}"))
+                st.caption(f"Ogni cella è il ROI della strategia uscendo a quelle due quote (off = con quell'esito non esci). Le "
+                           f"quote partono da poco meglio della stima del modello ({est.get(tp_k, float('nan')):.2f} e "
+                           f"{est.get(sl_k, float('nan')):.2f}, quota equa) e peggiorano fino al 30%, come succede con margine e "
+                           "ritardo nel chiudere; bordo blu tratteggiato: le quote impostate. Una quota più favorevole rende sempre di "
+                           "più, quindi la mappa non indica una combinazione «migliore»: serve a vedere fino a quale quota uscire "
+                           "conviene rispetto a non uscire (colonna e riga *off*).")
+        st.caption(":material/info: Esiti reali dal database (break, set, intervallo); il ROI di ogni operazione è calcolato dalla "
+                   "sua quota di ingresso (pre-partita, live stimata o inserita a mano) alla quota di uscita che hai indicato: "
+                   "back = ingresso/uscita − 1, lay = (1 − ingresso/uscita)/(ingresso − 1), commissione sui profitti. Il "
+                   "risultato vale se nella realtà trovi quelle quote in quel momento.")
+        return
 
     st.subheader("Mappa Take Profit × Stop Loss")
     key = json.dumps([cfg, db_version()], sort_keys=True, default=str)
@@ -1179,9 +1263,12 @@ def tab_cashout(cfg: dict, res: bt.BacktestResult, sel_args: tuple, bank: float)
                    "molto meno del break, e sulla terra il guadagno è più alto e la perdita più bassa. Online non si trovano "
                    "misure affidabili di questi movimenti (solo osservazioni dei trader sull'asimmetria tra tenuto e break): i "
                    "valori vengono dai game reali punto per punto, con le quote stimate dal modello tarato.")
-    note = ("Nello scalping gli esiti dei punti sono reali e le quote sono stimate a ogni punto." if scal else
-            "Nei momenti di controllo la quota è stimata da modelli tarati sui risultati reali (primo break, primo set, secondo "
-            "set, intervallo); il margine impostato viene sottratto. Chiudere prima costa il margine e lo spread.")
+    note = ("Nello scalping gli esiti dei punti sono reali e le quote sono stimate a ogni punto; si esce al prezzo del punto, che "
+            "può superare la soglia (come sul mercato vero, dove la quota salta da un punto all'altro)." if scal else
+            "Take Profit e Stop Loss sono ROI sull'unità (SL 25% = esci quando la posizione perde 0,25 u), controllati solo nel "
+            "momento scelto: si esce al valore che la posizione ha allora, che a fine set è spesso ben oltre la soglia (colonna "
+            "*ROI all'uscita* qui sopra). Per un ROI esatto usa *A quote che inserisci tu*. Nei momenti di controllo la quota è stimata da modelli tarati sui risultati reali (primo break, primo set, secondo "
+              "set, intervallo); il margine impostato viene sottratto.")
     st.caption(":material/info: " + note)
 
 
@@ -1204,7 +1291,7 @@ def tab_trades(cfg: dict, trades: pd.DataFrame) -> None:
                        file_name=f"operazioni_{cfg['sport']}_{date.today():%Y%m%d}.csv", mime="text/csv", icon=":material/download:")
 
 
-VIEWS = ["Riepilogo", "In partita", "Analisi", "Robustezza", "Cash out", "Operazioni", "Salva"]
+VIEWS = ["Riepilogo", "In partita", "Analisi", "Robustezza", "Uscita", "Operazioni", "Salva"]
 
 
 def tab_inplay(cfg: dict, sel: pd.DataFrame) -> None:
@@ -1246,60 +1333,121 @@ def tab_inplay(cfg: dict, sel: pd.DataFrame) -> None:
     st.caption("Per usare una situazione come strategia, selezionala nel pannello laterale, gruppo *In partita*.")
 
 
-def entry_cashout_panel(cfg: dict) -> dict:
-    """Riquadro principale: quando si entra e come si esce (Take Profit / Stop Loss e quando controllarli)."""
+def quote_inputs(cfg: dict, points: list[str]) -> dict:
+    """Una riga per ogni momento di uscita valido, con la quota di uscita per ciascun esito reale."""
+    side = cfg.get("side", "back")
+    sel = set(cfg.get("selection") or [])
+    quotes: dict = {}
+    for point in points:
+        st.markdown(f"<small><b>{co.CHECKPOINT_LABEL[point].capitalize()}</b></small>", unsafe_allow_html=True)
+        if point in co.GOOD:
+            tp_k, sl_k = co.side_outcomes(point, side)
+            items = [(tp_k, f"Take Profit · quota se {co.OUTCOMES[point][tp_k]}"), (sl_k, f"Stop Loss · quota se {co.OUTCOMES[point][sl_k]}")]
+        else:
+            groups = (["goals"] if cfg["market"] == "ou25" else
+                      (["team"] if not sel or sel - {"draw"} else []) + (["draw"] if not sel or "draw" in sel else []))
+            prefix = {"team": "Squadra scelta", "draw": "X (pareggio)", "goals": "Over/Under"}
+            items = [(k, f"{prefix[g]} · quota se {co.OUTCOMES[point][k]}") for g in groups for k in co.HT_GROUPS[g]]
+        cols = st.columns(max(len(items), 2))
+        row = {}
+        for col, (k, label) in zip(cols, items):
+            key = f"bt_q_{point}_{k}"
+            ss.setdefault(key, None)
+            v = col.number_input(label, min_value=1.01, max_value=1000.0, step=0.05, format="%.2f", key=key,
+                                 placeholder="vuoto = non esci",
+                                 help="Quota della selezione a cui chiudi la posizione se succede questo. Il ROI si calcola dalla quota "
+                                      "di ingresso di ogni operazione (pre-partita, live stimata o quella che hai inserito a mano). "
+                                      "Vuoto: non esci e passi al momento successivo o alla fine della partita.")
+            if v:
+                row[k] = float(v)
+        if row:
+            quotes[point] = row
+    return quotes
+
+
+def entry_cashout_panel(cfg: dict) -> tuple[dict, object]:
+    """Riquadro principale: su chi e quando si entra e come si esce (quote per esito oppure Take Profit / Stop Loss in %).
+    Ritorna la configurazione e un segnaposto per l'anteprima dei ROI di uscita (riempito dopo il backtest)."""
     sport, market = cfg["sport"], cfg["market"]
-    opts = entry_options(sport, market)
+    events = event_mode(sport, market, cfg.get("selection"))
+    opts = entry_options(sport, market, cfg.get("selection"))
     when_opts = co.WHEN[sport]
+    preview = None
     with st.container(border=True):
-        st.markdown("#### Ingresso e cash out")
+        st.markdown("#### Piano di trading: ingresso e uscita")
         ekey = f"bt_entry_{sport}_{market}"
         ss.setdefault(ekey, "pre")
         if ss[ekey] not in opts:
             ss[ekey] = "pre"
-        entry = st.segmented_control("Quando entri", list(opts), format_func=opts.get, key=ekey) or "pre"
+        entry = st.segmented_control("Su chi e quando entri" if events else "Quando entri", list(opts), format_func=opts.get,
+                                     key=ekey) or "pre"
+        if events and entry != "pre":
+            st.caption(":material/swap_horiz: Nessun lato fisso nella *Selezione*: in ogni partita operi sul "
+                       + ("giocatore" if sport == "tennis" else "la squadra") + " che vive l'evento scelto. Il range di quota del "
+                       "pannello vale sulla sua quota pre-partita; *Punta* o *Banca* restano quelli scelti a sinistra.")
+        filters = {k: v for k, v in cfg["filters"].items() if k not in bt.INPLAY.get(sport, set())}
+        if entry in ENTRY_FILTERS:
+            col, val = ENTRY_FILTERS[entry]
+            if entry == "ht_draw" and events:
+                col = "ip_ht_sel"                          # solo le due squadre, non il pareggio
+            filters[col] = {"in": [val]}
         ss.setdefault("bt_co_when", "off")
         if ss["bt_co_when"] not in when_opts:
             ss["bt_co_when"] = "off"
-        when = st.segmented_control("Cash out: quando controlli Take Profit e Stop Loss", list(when_opts), format_func=when_opts.get,
-                                    key="bt_co_when") or "off"
+        when = st.segmented_control("Uscita: in quale momento", list(when_opts), format_func=when_opts.get, key="bt_co_when") or "off"
         for k, v in (("tp", 30.0), ("sl", 50.0), ("margin_pct", 5.0), ("spread_pct", 0.5), ("decided_pct", 5.0)):
             ss.setdefault(f"bt_co_{k}", v)
         ss.setdefault("bt_co_who", "both")
         ss.setdefault("bt_co_stop_at_bp", False)
+        ss.setdefault("bt_co_method", "odds")
         out = {"mode": "off" if when == "off" else "tpsl", "when": when}
         if when != "off":
-            c = st.columns([1, 1, 1, 1.3] if when == "scalping" else [1, 1, 1, 2])
             scal = when == "scalping"
-            out["tp"] = c[0].number_input("Take Profit (%)", 0.0, 500.0, step=0.5 if scal else 5.0, key="bt_co_tp",
-                                          help="Chiudi in utile quando il cash out vale almeno questa percentuale dell'importo a rischio. 0 = disattivo.")
-            out["sl"] = c[1].number_input("Stop Loss (%)", 0.0, 100.0, step=0.5 if scal else 5.0, key="bt_co_sl",
-                                          help="Chiudi in perdita quando il cash out scende a meno questa percentuale dell'importo a rischio. 0 = disattivo.")
-            if scal:
-                out["spread_pct"] = c[2].number_input("Spread per lato (%)", 0.0, 5.0, step=0.1, key="bt_co_spread_pct",
-                                                      help="Quanto peggio della quota teorica entri ed esci a ogni operazione.")
-                out["who"] = c[3].radio("Servizio di", ["both", "player", "opponent"], horizontal=True, key="bt_co_who",
-                                        format_func={"both": "Entrambi", "player": "Giocatore scelto", "opponent": "Avversario"}.get)
-                d = st.columns([1.2, 1.2, 3])
-                out["decided_pct"] = d[0].number_input("Salta se il match è deciso (%)", 1.0, 25.0, step=1.0, key="bt_co_decided_pct",
-                                                       help="Non entra nei game in cui chi serve ha meno di questa probabilità di vincere il match, "
-                                                            "o più di 100 meno questa: a match deciso non ci sono quote utili.")
-                out["stop_at_bp"] = d[1].checkbox("Esci alla prima palla break", key="bt_co_stop_at_bp")
-                d[2].caption("Un'operazione per ogni game di servizio dei match della strategia, entrando a 0-0 su chi serve. Esclusi "
-                             "i primi due game della partita e i game a match ormai deciso. Si esce al Take Profit o allo Stop Loss "
-                             "punto per punto, altrimenti a fine game (servizio tenuto o break). Valori tipici nella vista *Cash out*.")
-            else:
-                out["margin_pct"] = c[2].number_input("Margine del cash out (%)", 0.0, 30.0, step=1.0, key="bt_co_margin_pct",
-                                                      help="Quanto trattiene chi offre il cash out: 1-2% su un exchange, 5-10% su un bookmaker.")
-                valid = co.checkpoints({**cfg, "filters": {**cfg["filters"], **({ENTRY_FILTERS[entry][0]: {"in": [ENTRY_FILTERS[entry][1]]}}
-                                                                                   if entry in ENTRY_FILTERS else {})}, "cashout": out})
+            method = "pct" if scal else (st.segmented_control("Come esci", list(co.METHODS), format_func=co.METHODS.get,
+                                                              key="bt_co_method") or "odds")
+            out["method"] = method
+            valid = co.checkpoints({**cfg, "filters": filters, "cashout": out})
+            if method == "odds":
                 if not valid:
-                    c[3].warning("Questo controllo non arriva dopo il momento di ingresso: nessun cash out possibile.")
-                elif when in ("break1", "all"):
-                    c[3].caption("Il primo break è noto solo per i match registrati punto per punto (circa uno su cinque): con "
-                                 "*Al primo break* il backtest usa solo quei match.")
+                    st.warning("Questo momento non arriva dopo l'ingresso: scegli un'uscita successiva.")
                 else:
-                    c[3].caption("Il valore del cash out in quel momento è stimato da modelli tarati sui risultati reali.")
+                    out["quotes"] = quote_inputs(cfg, valid)
+                    if when in ("break1", "all"):
+                        st.caption("Il primo break è noto solo per i match registrati punto per punto (circa uno su cinque): "
+                                   "con *Al primo break* il backtest usa solo quei match; con *In ogni momento* gli altri passano al set.")
+                    preview = st.empty()
+            else:
+                c = st.columns([1, 1, 1, 1.3] if scal else [1, 1, 1, 2])
+                out["tp"] = c[0].number_input("Take Profit (% di ROI)", 0.0, 500.0, step=0.5 if scal else 5.0, key="bt_co_tp",
+                                              help="Guadagno sull'importo rischiato a cui chiudi: 25 = +25% dell'unità. 0 = disattivo.")
+                out["sl"] = c[1].number_input("Stop Loss (% di ROI)", 0.0, 100.0, step=0.5 if scal else 5.0, key="bt_co_sl",
+                                              help="Perdita sull'importo rischiato a cui chiudi: 25 = perdi il 25% dell'unità. 0 = disattivo.")
+                if scal:
+                    out["spread_pct"] = c[2].number_input("Spread per lato (%)", 0.0, 5.0, step=0.1, key="bt_co_spread_pct",
+                                                          help="Quanto peggio della quota teorica entri ed esci a ogni operazione.")
+                    out["who"] = c[3].radio("Servizio di", ["both", "player", "opponent"], horizontal=True, key="bt_co_who",
+                                            format_func={"both": "Entrambi", "player": "Giocatore scelto", "opponent": "Avversario"}.get)
+                    d = st.columns([1.2, 1.2, 3])
+                    out["decided_pct"] = d[0].number_input("Salta se il match è deciso (%)", 1.0, 25.0, step=1.0, key="bt_co_decided_pct",
+                                                           help="Non entra nei game in cui chi serve ha meno di questa probabilità di vincere il match, "
+                                                                "o più di 100 meno questa: a match deciso non ci sono quote utili.")
+                    out["stop_at_bp"] = d[1].checkbox("Esci alla prima palla break", key="bt_co_stop_at_bp")
+                    d[2].caption("Un'operazione per ogni game di servizio dei match della strategia, entrando a 0-0 su chi serve. Esclusi "
+                                 "i primi due game della partita e i game a match ormai deciso. Si esce al Take Profit o allo Stop Loss "
+                                 "punto per punto (al prezzo del punto: può superare la soglia), altrimenti a fine game. Valori "
+                                 "tipici nella vista *Uscita*.")
+                else:
+                    out["margin_pct"] = c[2].number_input("Margine del cash out (%)", 0.0, 30.0, step=1.0, key="bt_co_margin_pct",
+                                                          help="Quanto trattiene chi offre il cash out: 1-2% su un exchange, 5-10% su un bookmaker.")
+                    c[3].caption("Il controllo avviene solo nel momento scelto: se la soglia è superata esci al valore di "
+                                 "quel momento, che può essere oltre la soglia (a fine set il prezzo si è già mosso molto). "
+                                 "Per un ROI esatto usa *A quote che inserisci tu*.")
+                    preview = st.empty()
+                    if not valid:
+                        st.warning("Questo momento non arriva dopo l'ingresso: nessuna uscita possibile.")
+                    elif when in ("break1", "all"):
+                        st.caption("Il primo break è noto solo per i match registrati punto per punto (circa uno su cinque): con "
+                                   "*Al primo break* il backtest usa solo quei match.")
         live = {}
         if entry != "pre":
             with st.expander("Quota live di ingresso"):
@@ -1313,18 +1461,83 @@ def entry_cashout_panel(cfg: dict) -> dict:
                 ss.setdefault("bt_live_override", 1.50)
                 c2.number_input("Quota live di entrata", 1.01, 1000.0, step=0.05, key="bt_live_override", disabled=not on)
                 live["live_odds_override"] = float(ss["bt_live_override"]) if on else None
-    filters = {k: v for k, v in cfg["filters"].items() if k not in bt.INPLAY.get(sport, set())}
-    if entry in ENTRY_FILTERS:
-        col, val = ENTRY_FILTERS[entry]
-        filters[col] = {"in": [val]}
-    return {**cfg, "filters": filters, "cashout": out, **live}
+    return {**cfg, "filters": filters, "cashout": out, **live}, preview
+
+
+def pct_preview(slot, cfg: dict, trades: pd.DataFrame) -> None:
+    """Traduce Take Profit e Stop Loss in quote equivalenti (sulla quota di ingresso mediana) e mostra il ROI medio
+    effettivo delle uscite nello storico."""
+    c = co.settings(cfg)
+    if not co.is_active(cfg) or "cashout" not in trades.columns:
+        return
+    o = float(trades["odds"].median())
+    m = c["margin_pct"] / 100
+    lay = cfg.get("side") == "lay"
+    parts = []
+    for kind, pct in (("tp", c["tp"]), ("sl", c["sl"])):
+        if pct <= 0:
+            continue
+        r = pct / 100 * (1 if kind == "tp" else -1)
+        den = (1 - r * (o - 1)) if lay else (1 + r)
+        q = (o * (1 + m) if lay else o * (1 - m)) / den if den > 0 else float("inf")
+        sel = trades["cashout"] == kind
+        real = float(trades.loc[sel, "pnl"].sum() / trades.loc[sel, "risk"].sum() * 100) if sel.any() else float("nan")
+        name = "Take Profit" if kind == "tp" else "Stop Loss"
+        verb = ("sale" if lay else "scende") if kind == "tp" else ("scende" if lay else "sale")
+        target = (f"esci se la quota {verb} a **{q:.2f}** o " + ("più" if verb == "sale" else "meno")) if np.isfinite(q) else \
+            "soglia irraggiungibile con questa quota"
+        parts.append(f"**{name} {'+' if kind == 'tp' else '-'}{pct:g}%** = {target}; nello storico le uscite {name} hanno reso in media "
+                     + (f"**{real:+.1f}%**" if np.isfinite(real) else "n/d"))
+    if parts:
+        slot.caption(f":material/calculate: Con la quota di ingresso mediana **{o:.2f}**: " + " · ".join(parts) + ".")
+
+
+def quote_preview(slot, cfg: dict, trades: pd.DataFrame) -> None:
+    """Anteprima sotto le quote di uscita: ROI per la quota di ingresso mediana e stima del modello per ogni esito."""
+    c = co.settings(cfg)
+    if slot is None or trades.empty:
+        return
+    if c["method"] == "pct":
+        pct_preview(slot, cfg, trades)
+        return
+    side = cfg.get("side", "back")
+    comm = float(cfg.get("commission") or 0.0)
+    entry = float(trades["odds"].median())
+    rows = []
+    for point in co.checkpoints(cfg):
+        est = co.estimated_quotes(trades, point)
+        n = co.outcome_counts(trades, point)
+        for k, label in co.OUTCOMES[point].items():
+            if k not in est and k not in c["quotes"].get(point, {}):
+                continue
+            x = c["quotes"].get(point, {}).get(k)
+            rows.append({"momento": co.CHECKPOINT_LABEL[point], "esito": label, "operazioni": n.get(k, 0),
+                         "quota di uscita": x, "stima modello (equa)": est.get(k),
+                         "ROI all'uscita %": float(co.exit_return(entry, x, side, comm) * 100) if x else None})
+    far = [f"*{r['esito']}* a {r['quota di uscita']:.2f} (stima {r['stima modello (equa)']:.2f})" for r in rows
+           if r["quota di uscita"] and r["stima modello (equa)"]
+           and co.exit_return(entry, r["quota di uscita"], side, comm) - co.exit_return(entry, r["stima modello (equa)"], side, comm) > 0.10]
+    if rows:
+        with slot.container():
+            if far:
+                st.warning("Quote molto più favorevoli di dove arriva di solito il prezzo: " + "; ".join(far) + ". Il ROI vale solo "
+                           "se trovi davvero quelle quote: così com'è il risultato è ottimistico.", icon=":material/warning:")
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", column_config={
+                "quota di uscita": st.column_config.NumberColumn(format="%.2f"),
+                "stima modello (equa)": st.column_config.NumberColumn(format="%.2f"),
+                "ROI all'uscita %": st.column_config.NumberColumn(format="%+.1f")})
+            st.caption(f"ROI calcolato sulla quota di ingresso mediana **{entry:.2f}** "
+                       + ("(inserita a mano)" if cfg.get("live_odds_override") else "")
+                       + "; nel backtest ogni operazione usa la propria. La stima del modello indica dove si troverebbe la quota "
+                         "in media dopo quell'esito. Esiti reali dal database: le operazioni senza l'esito (es. nessun break nel "
+                         "primo set) restano aperte.")
 
 
 def page_backtester() -> None:
     header("Backtester")
     if need_db():
         return
-    cfg = entry_cashout_panel(sidebar_config())
+    cfg, preview = entry_cashout_panel(sidebar_config())
     args = (cfg["sport"], cfg["market"], cfg["price"], cfg["price_timing"])
     bank = float(ss.get("bt_bank", 100.0))
     key = json.dumps([cfg, bank, db_version()], sort_keys=True, default=str)
@@ -1334,6 +1547,7 @@ def page_backtester() -> None:
         ss["_bt_key"] = key
         ss.pop("_bt_scan", None)
     res = ss["_bt_res"]
+    quote_preview(preview, cfg, res.trades)
     ss["last"] = {"cfg": cfg, "metrics": res.metrics, "trades": res.trades}
     if ss.get("_legacy_note"):
         st.info(ss.pop("_legacy_note"), icon=":material/info:")
@@ -1345,7 +1559,8 @@ def page_backtester() -> None:
         else:
             st.warning("Nessun match soddisfa i filtri selezionati: allarga i criteri nel pannello laterale o premi *Azzera*.")
         return
-    ss.setdefault("bt_view", VIEWS[0])
+    if ss.get("bt_view") not in VIEWS:
+        ss["bt_view"] = "Uscita" if ss.get("bt_view") == "Cash out" else VIEWS[0]
     # un secondo clic sulla vista attiva la deseleziona: in quel caso resta aperta l'ultima vista scelta
     view = st.segmented_control("Vista", VIEWS, key="bt_view", label_visibility="collapsed") or ss.get("_bt_view_last", VIEWS[0])
     ss["_bt_view_last"] = view
@@ -1357,7 +1572,7 @@ def page_backtester() -> None:
         tab_robustness(cfg, res, args, bank)
     elif view == "In partita":
         tab_inplay(cfg, selections(*args, db_version()))
-    elif view == "Cash out":
+    elif view == "Uscita":
         tab_cashout(cfg, res, args, bank)
     elif view == "Operazioni":
         tab_trades(cfg, res.trades)

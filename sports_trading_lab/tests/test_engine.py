@@ -1532,3 +1532,87 @@ def test_scalping_typical_moves_on_real_games(con):
         assert tm.loc[(surf, "Favorito"), "perdita_break_pct"] < 0 and tm.loc[(surf, "Favorito"), "tenuti_pct"] > tm.loc[(surf, "Sfavorito"), "tenuti_pct"]
     assert tm.loc[("Clay", "Sfavorito"), "guadagno_tenuto_pct"] > tm.loc[("Grass", "Sfavorito"), "guadagno_tenuto_pct"]
     assert tm.loc[("Clay", "Sfavorito"), "perdita_break_pct"] > tm.loc[("Grass", "Sfavorito"), "perdita_break_pct"]   # sulla terra il break costa meno
+
+
+def test_exit_return_from_entry_odds():
+    # back a 2.00, chiuso a 1.60: +25% dell'unita'; a 2.50: -20%
+    assert co.exit_return(2.0, 1.6, "back") == pytest.approx(0.25)
+    assert co.exit_return(2.0, 2.5, "back") == pytest.approx(-0.2)
+    # lay a 3.00 (responsabilita' 1 = puntata del banco 0.5): ribancato... chiuso puntando a 4.00 -> +12.5%, a 2.00 -> -25%
+    assert co.exit_return(3.0, 4.0, "lay") == pytest.approx((1 - 3 / 4) / 2)
+    assert co.exit_return(3.0, 2.0, "lay") == pytest.approx(-0.25)
+    assert co.exit_return(2.0, 1.6, "back", commission=0.05) == pytest.approx(0.25 * 0.95)   # commissione solo sui profitti
+    assert co.exit_return(2.0, 1000.0, "back") == pytest.approx(-0.998)
+
+
+def test_exit_at_user_odds_follows_real_outcomes():
+    sel = make_sel([2.0, 2.0, 2.0, 2.0, 2.0], [True, False, True, False, False])
+    sel["opp_odds"], sel["best_of"] = 2.0, 3.0
+    sel["set1_won"] = [1.0, 1.0, 0.0, 0.0, np.nan]
+    sel["set2_sets"] = [2.0, 1.0, 1.0, 0.0, np.nan]
+    sel["ip_break1"] = ["Fatto", "Subito", None, "Nessun break", "Subito"]
+    q = {"mode": "tpsl", "method": "odds", "when": "set1", "quotes": {"set1": {"won": 1.6, "lost": 4.0}}}
+    t = bt.backtest_selections(sel, {"sport": "tennis", "cashout": q}).trades
+    assert t["exit_point"].tolist() == ["fine primo set: vince il primo set"] + ["fine primo set: vince il primo set"] \
+        + ["fine primo set: perde il primo set"] * 2 + ["fine partita"]
+    assert t["pnl"].tolist() == pytest.approx([0.25, 0.25, -0.5, -0.5, -1.0])
+    assert t["exit_odds"].tolist()[:4] == [1.6, 1.6, 4.0, 4.0] and t["cashout"].tolist() == ["tp", "tp", "sl", "sl", ""]
+    # solo una quota: l'altro esito resta aperto fino alla fine
+    only = bt.backtest_selections(sel, {"sport": "tennis", "cashout": {**q, "quotes": {"set1": {"lost": 4.0}}}}).trades
+    assert only["pnl"].tolist() == pytest.approx([1.0, -1.0, -0.5, -0.5, -1.0])
+    # in ogni momento: primo break, poi fine primo set, poi secondo set (2-0 al meglio dei tre = partita finita)
+    allq = {**q, "when": "all", "quotes": {"break1": {"suffered": 2.5}, "set2": {"won": 1.25, "lost": 5.0}}}
+    a = bt.backtest_selections(sel, {"sport": "tennis", "cashout": allq}).trades
+    assert a["exit_point"].tolist() == ["fine partita", "primo break: subisce il primo break", "fine secondo set: vince il secondo set",
+                                        "fine partita", "primo break: subisce il primo break"]
+    assert a["pnl"].tolist() == pytest.approx([1.0, -0.2, 0.6, -1.0, -0.2])
+    # lay: chi banca incassa quando la selezione perde il set (quota che sale)
+    lay = bt.backtest_selections(sel, {"sport": "tennis", "side": "lay", "lay_spread": 0.0, "cashout": q}).trades
+    o = lay["odds"].to_numpy()
+    assert lay["pnl"].tolist()[:4] == pytest.approx(list((1 - o[:4] / np.array([1.6, 1.6, 4.0, 4.0])) / (o[:4] - 1)))
+    assert lay["cashout"].tolist()[:4] == ["sl", "sl", "tp", "tp"]
+    # mappa delle quote: la cella delle quote impostate coincide con il backtest
+    grid = co.quotes_grid(t, "set1", [0.0, 1.6], [0.0, 4.0], 0.0)
+    assert grid.loc[4.0, 1.6] == pytest.approx(t["pnl"].sum() / t["risk"].sum() * 100)
+    assert grid.loc[0.0, 0.0] == pytest.approx(t["pnl_hold"].sum() / t["risk"].sum() * 100)
+    s = co.summary(t).set_index(["esito", "momento"])
+    assert s.loc[("Stop Loss", "fine primo set: perde il primo set"), "roi_uscita_pct"] == pytest.approx(-50.0)
+    assert s["quota_pct"].sum() == pytest.approx(100.0)
+
+
+def test_exit_settings_and_football_outcomes():
+    c = co.settings({"sport": "tennis", "cashout": {"mode": "tpsl", "method": "odds", "when": "scalping"}})
+    assert c["method"] == "pct"                                   # lo scalping esce solo a percentuale
+    c = co.settings({"sport": "tennis", "cashout": {"mode": "tpsl", "method": "odds", "when": "set1",
+                                                     "quotes": {"set1": {"won": "1.5", "lost": 0.9, "x": 3}, "zz": {"a": 2}}}})
+    assert c["quotes"] == {"set1": {"won": 1.5}} and co.is_active({"sport": "tennis", "cashout": c})
+    assert not co.is_active({"sport": "tennis", "cashout": {"mode": "tpsl", "method": "odds", "when": "set1"}})
+    assert co.side_outcomes("set1", "back") == ("won", "lost") and co.side_outcomes("break1", "lay") == ("suffered", "made")
+    t = pd.DataFrame({"selection": ["home", "away", "draw", "draw", "over", "under"],
+                      "ip_ht_sel": ["In vantaggio", "In svantaggio", None, None, None, None],
+                      "ip_ht": ["Casa avanti", "Casa avanti", "Pari", "Ospite avanti", "Pari", "Pari"],
+                      "ip_ht_goals": ["1", "1", "0", "1", "2", "3+"]})
+    assert list(co.checkpoint_outcome(t, "ht")) == ["lead", "trail", "level", "notlevel", "g2", None]
+
+
+@needs_db
+def test_percent_exit_is_roi_on_the_unit_at_the_checkpoint():
+    """TP/SL in % = ROI sull'unita': si esce quando il valore nel momento di controllo supera la soglia, al valore di quel
+    momento (oltre la soglia); senza margine il cash out stimato non crea ne' distrugge valore (modello tarato)."""
+    base = {"sport": "tennis", "market": "h2h", "selection": ["underdog"], "side": "back", "price": "max", "odds_min": 2, "odds_max": 3.5}
+    t = bt.run_backtest({**base, "cashout": {"mode": "tpsl", "when": "set1", "tp": 25, "sl": 25, "margin_pct": 5}}).trades
+    r = t["pnl"] / t["risk"]
+    assert (r[t["cashout"] == "tp"] >= 0.25).all() and (r[t["cashout"] == "sl"] <= -0.25).all()
+    assert r[t["cashout"] == "sl"].mean() < -0.4                     # a fine primo set il prezzo si e' gia' mosso molto
+    fair = bt.run_backtest({**base, "cashout": {"mode": "tpsl", "when": "set1", "tp": 25, "sl": 25, "margin_pct": 0}}).metrics["roi_pct"]
+    assert abs(fair - bt.run_backtest(base).metrics["roi_pct"]) < 2.5
+
+
+@needs_db
+def test_no_fixed_side_trades_who_suffers_the_break():
+    cfg = {"sport": "tennis", "market": "h2h", "selection": [], "side": "back", "price": "avg",
+           "filters": {"ip_break1": {"in": ["Subito"]}}}
+    t = bt.run_backtest(cfg).trades
+    assert len(t) > 500 and (t["ip_break1"] == "Subito").all()
+    assert t["match_id"].is_unique                                 # una sola operazione per partita: chi subisce il break
+    assert set(t["selection"]) <= {"favourite", "underdog", "pick"} and t["selection"].nunique() >= 2

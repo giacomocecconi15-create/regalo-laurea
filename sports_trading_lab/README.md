@@ -26,7 +26,7 @@ Uso manuale:
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python src/update_data.py        # scarica / aggiorna il database
-.venv/bin/python -m pytest tests -q        # 86 test
+.venv/bin/python -m pytest tests -q        # 91 test
 .venv/bin/python -m streamlit run app.py   # dashboard
 ```
 
@@ -47,7 +47,7 @@ attiva_avvisi_mac.sh   attiva il controllo automatico dei segnali su Mac
 src/analysis.py        partite del giorno, punto di pareggio, monitor delle strategie, calcolatore di copertura
 src/scalping.py        scalping sul servizio: dati punto per punto, modello delle quote, simulatore
 src/betfair.py         importazione dei dati storici Betfair e cash out su prezzi reali
-src/cashout.py         cash out Take Profit / Stop Loss ai punti di controllo (break, set, intervallo)
+src/cashout.py         uscita a quote per esito o con Take Profit / Stop Loss (break, set, intervallo)
 src/fixtures.py        partite in programma con quote (calcio gratis, tennis con chiave gratuita) e impostazioni
 assets/                icona dell'app
 crea_app_mac.sh        crea l'app da doppio clic per Mac
@@ -184,10 +184,16 @@ spread e commissione configurabili.
 - La tabella *Punti reali contro modello* confronta, da ogni punteggio, quante volte chi serve tiene davvero il
   servizio con quanto previsto; *Dove rende* prova la stessa regola di uscita da tutti i punteggi di ingresso.
 
-### Ingresso e cash out (pannello principale del Backtester)
+### Piano di trading: ingresso e uscita (pannello principale del Backtester)
 
-In cima al Backtester, sopra i risultati, il riquadro **Ingresso e cash out** riunisce le due scelte che contano di più;
-a sinistra restano i filtri di quota, torneo, calendario, giocatori.
+In cima al Backtester, sopra i risultati, il riquadro **Piano di trading** riunisce le due scelte che contano di più:
+su chi e quando entri, e come esci. A sinistra restano i filtri di quota, torneo, calendario, giocatori.
+
+**Nessun lato fisso.** Se nella *Selezione* non scegli né favorito né sfavorito (o li scegli entrambi), il riquadro
+propone *Su chi fa / subisce il primo break* e *Su chi vince / perde il primo set*: in ogni partita si opera sul
+giocatore che vive quell'evento, una sola operazione per partita. Il range di quota vale sulla sua quota pre-partita;
+punta o banca restano quelli scelti a sinistra. Nel calcio 1X2 lo stesso con la squadra in vantaggio, in parità o in
+svantaggio all'intervallo.
 
 **Quando entri.** Tennis: pre-partita, dopo il primo break fatto o subito, dopo il primo set vinto o perso. Calcio 1X2:
 pre-partita, all'intervallo in vantaggio, sul pari o in svantaggio. Over/Under: pre-partita o all'intervallo con 0, 1,
@@ -226,20 +232,32 @@ Pagina *Quote reali*: il cash out simulato su prezzi veri in corso di partita, i
 - **Limite**: il piano BASIC registra circa un prezzo al minuto, quindi va bene per il cash out ma non per lo scalping
   punto per punto. I dati restano in `data/betfair.duckdb`.
 
-### Cash out: Take Profit e Stop Loss
+### Uscita: a quote per esito oppure Take Profit / Stop Loss in %
 
-Il cash out ha solo due numeri: il **Take Profit** (profitto in % della somma rischiata a cui chiudi) e lo **Stop Loss**
-(perdita in % a cui tagli); 0 = non usato. Poi scegli **quando** li controlli:
+Prima scegli **in quale momento** puoi uscire: al primo break, a fine primo set, a fine secondo set, in ogni momento
+disponibile (in ordine dopo l'ingresso), all'intervallo (calcio) oppure *scalping sul servizio*. Un momento che arriva
+prima dell'ingresso viene ignorato e l'app lo segnala. Poi **come esci**:
 
-- **Tennis**: al primo break, a fine primo set, a fine secondo set, in ogni momento disponibile (tutti i punti di
-  controllo dopo l'ingresso, in ordine: chiude al primo che tocca una soglia), oppure *scalping sul servizio*.
-- **Calcio**: all'intervallo.
+- **A quote che inserisci tu** (consigliato). Per ogni momento e per ogni esito reale indichi la quota a cui chiudi:
+  tennis *Take Profit · quota se vince il primo set* e *Stop Loss · quota se perde il primo set* (al primo break: fa /
+  subisce il break; per chi banca i due ruoli si invertono); calcio *in vantaggio / in parità / in svantaggio*, per il
+  pareggio *pari / non pari*, per l'Over/Under *0, 1, 2 gol* nel primo tempo. Vuoto = con quell'esito non esci. Il ROI di
+  ogni operazione si calcola dalla **sua** quota di ingresso (pre-partita, live stimata o quella inserita a mano):
+  punta `ingresso/uscita − 1`, banca `(1 − ingresso/uscita)/(ingresso − 1)`, commissione sui profitti. Gli esiti sono
+  quelli reali del database, partita per partita. Sotto le quote una tabella mostra per ogni esito quante operazioni lo
+  hanno, la quota media stimata dal modello e il ROI con la quota di ingresso mediana; se una quota è molto più
+  favorevole della stima compare un avviso (il risultato sarebbe ottimistico).
+- **Take Profit / Stop Loss in % di ROI** sull'unità rischiata (SL 25% = esci quando la posizione perde 0,25 u). Il
+  controllo avviene solo nel momento scelto, con il valore stimato da modelli tarati sui risultati reali, e si esce al
+  valore che la posizione ha allora: a fine set il prezzo si è già mosso molto, quindi l'uscita è spesso ben oltre la
+  soglia (es. sfavoriti 2,00-3,50 con SL 25% a fine primo set: uscita media −61%). L'app traduce le soglie in quote
+  equivalenti e mostra il ROI medio effettivo delle uscite. Senza margine il risultato coincide con il tenere fino alla
+  fine entro circa un punto: il modello non crea né distrugge valore.
 
-A ogni punto di controllo un modello tarato sui risultati reali (set e break nel tennis, Poisson sul secondo tempo nel
-calcio) stima la probabilità della selezione e quindi il valore del cash out, meno il margine impostato. Se il valore
-supera il Take Profit o scende sotto lo Stop Loss la posizione si chiude, altrimenti si tiene fino alla fine. Un punto di
-controllo che arriva prima dell'ingresso (es. ingresso dopo il primo set e controllo al primo break) viene ignorato e
-l'app lo segnala.
+*Perché non punto per punto.* Ho provato a ricostruire la quota dopo ogni punto sui ~3.400 match registrati punto per
+punto, per uscire nel punto esatto in cui la soglia viene toccata. Anche dopo la taratura, nei momenti in cui le soglie
+scattano il modello sbaglia la probabilità di 2-5 punti, che su uno sfavorito a 3,20 valgono fino al 15% di ROI per
+operazione: non abbastanza affidabile, quindi non è nell'app.
 
 **Scalping sul servizio.** Un'operazione per ogni game di servizio dei match della strategia (servizio del giocatore
 scelto, dell'avversario o di entrambi), entrando a 0-0. Esclusi i primi due game della partita e i game a match ormai
@@ -261,15 +279,17 @@ Valori tipici per game (puntando chi serve a 0-0, spread 0,5%, giochi reali 2019
 Tenere il servizio vale molto meno che subire il break, e la differenza cambia con superficie e ruolo: sulla terra il
 break pesa meno (si recupera più spesso), sull'erba di più; lo sfavorito al servizio muove la quota molto di più. Online
 non esistono misure numeriche affidabili di questi movimenti (solo regole dei trader), quindi i valori vengono dal
-modello applicato ai punti reali; la vista *Cash out* li ricalcola sul campione della strategia.
+modello applicato ai punti reali; la vista *Uscita* li ricalcola sul campione della strategia.
 
-**Vista Cash out.** ROI con e senza cash out, effetto sul profitto, quota di operazioni chiuse, tabella per esito e
-momento di uscita e mappa di calore del ROI per ogni coppia Take Profit × Stop Loss (bordo bianco = combinazione
-migliore, bordo blu tratteggiato = quella scelta). Chiudere prima costa margine e spread, quindi in media riduce il
-rendimento: la mappa mostra se e dove una combinazione compensa.
+**Vista Uscita (analisi finale).** ROI con e senza uscita anticipata, effetto sul profitto, quota di operazioni chiuse,
+drawdown; tabella per esito e momento (operazioni, % sul totale, quota di ingresso media, quota di uscita, ROI
+all'uscita, profitto, profitto tenendo fino alla fine, differenza) e il conteggio degli esiti reali per ogni momento
+(compresi i casi senza dato, che restano aperti). Con le quote: mappa del ROI per quota di Take Profit × quota di Stop
+Loss, da poco meglio della stima del modello fino al 30% peggio. Con le percentuali: mappa del ROI per ogni coppia di
+soglie (bordo bianco = combinazione migliore nello storico, bordo blu = quella scelta).
 
 Le strategie salvate con il vecchio cash out (regole manuali o modello "intelligente") si riaprono convertite in Take
-Profit / Stop Loss a fine primo set (tennis) o all'intervallo (calcio); le vecchie regole manuali vengono ignorate e
+Profit / Stop Loss in % a fine primo set (tennis) o all'intervallo (calcio); le vecchie regole manuali vengono ignorate e
 l'app lo segnala.
 
 **Quota di ingresso.** Con ingresso pre-partita ogni operazione entra alla propria quota pre-partita (il Riepilogo lo
@@ -285,15 +305,15 @@ Navigazione in alto tra le pagine; il pannello laterale compare solo nel Backtes
 a ogni pagina c'è lo stato dei dati. Tema scuro, senza animazioni: i mini-grafici nelle schede sono SVG statici.
 
 1. **Backtester** – pannello laterale con esempi pronti e filtri a gruppi (torneo/lega, calendario,
-   giocatore/squadra, avversario, confronto); in alto il riquadro *Ingresso e cash out* (quando entri, Take Profit,
-   Stop Loss e quando controllarli). Viste:
+   giocatore/squadra, avversario, confronto); in alto il riquadro *Piano di trading* (su chi e quando entri, in
+   quale momento e come esci). Viste:
    - *Riepilogo*: KPI, equity curve, drawdown, rendimenti mensili.
    - *In partita*: operazioni divise per situazione di gioco (set, break, intervallo) con vittorie reali e intervallo di confidenza.
    - *Analisi*: risultato scomposto per anno, fascia di quota, torneo, superficie...; elenco automatico dei
      segmenti migliori e peggiori, applicabili come filtro con un clic.
    - *Robustezza*: sei controlli (campione, significatività, intervallo di confidenza del ROI, CLV, tenuta
      fuori campione, costanza negli anni), confronto studio/verifica, anno per anno, confronto tra bookmaker.
-   - *Cash out*: effetto di Take Profit e Stop Loss rispetto a tenere fino alla fine, mappa di calore TP × SL e, nello
+   - *Uscita*: analisi finale delle uscite rispetto a tenere fino alla fine, per momento ed esito, mappa di calore e, nello
      scalping, valori tipici di game tenuto e break per superficie e ruolo.
    - *Operazioni*: tabella esportabile in CSV.  *Salva*: archivia la strategia.
 

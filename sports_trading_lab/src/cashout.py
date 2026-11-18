@@ -1,9 +1,15 @@
-"""Cash out con Take Profit e Stop Loss.
+"""Uscita dalla posizione (cash out): a quote scelte per ogni esito, oppure con Take Profit e Stop Loss in %.
 
-Due sole soglie, in percentuale dell'importo a rischio:
-    Take Profit  -> chiudi in utile quando il cash out vale almeno +TP%
-    Stop Loss    -> chiudi in perdita quando il cash out vale -SL% o meno
-e un "quando": i momenti della partita in cui il cash out viene controllato.
+Due metodi:
+  quote   ("odds") -> per ogni momento (primo break, fine primo set, fine secondo set, intervallo) e per ogni esito
+                      reale (break fatto/subito, set vinto/perso, in vantaggio/pari/in svantaggio...) si indica la quota
+                      a cui si chiude. Il ROI si calcola dalla quota di ingresso di ogni operazione (pre-partita, live
+                      stimata o inserita a mano):  back = ingresso/uscita - 1;  lay = (1 - ingresso/uscita) / (ingresso - 1)
+  percentuale ("pct") -> Take Profit e Stop Loss come ROI sull'importo rischiato (SL 25% = perdi il 25% dell'unita').
+                      Si controlla il valore nel momento scelto e si esce a quel valore: a fine set il prezzo si e' gia'
+                      mosso molto, quindi l'uscita e' spesso ben oltre la soglia (la vista Uscita mostra il ROI medio
+                      effettivo). Per un ROI esatto si usa il metodo a quote.
+e un "quando": i momenti della partita in cui l'uscita e' possibile.
 
   tennis:  al primo break del primo set, a fine primo set, a fine secondo set, oppure in ognuno di questi momenti
   calcio:  all'intervallo
@@ -30,13 +36,25 @@ SET_MOMENTUM = 0.2          # spostamento (logit) dopo il primo set: chi lo vinc
 SET2_MOMENTUM = 0.08        # idem dopo il secondo set: sull'1-1 chi ha vinto il secondo set vince di piu' (tarato 2019-2022, verificato 2023+)
 MAX_GOALS = 12
 WHEN = {
-    "tennis": {"off": "Nessun cash out", "break1": "Al primo break", "set1": "A fine primo set", "set2": "A fine secondo set",
+    "tennis": {"off": "Nessuna uscita anticipata", "break1": "Al primo break", "set1": "A fine primo set", "set2": "A fine secondo set",
                "all": "In ogni momento disponibile", "scalping": "Scalping sul servizio"},
-    "football": {"off": "Nessun cash out", "ht": "All'intervallo"},
+    "football": {"off": "Nessuna uscita anticipata", "ht": "All'intervallo"},
 }
 CHECKPOINT_LABEL = {"break1": "primo break", "set1": "fine primo set", "set2": "fine secondo set", "ht": "intervallo"}
 ORDER = ["break1", "set1", "set2"]
-DEFAULTS = {"mode": "off", "when": "set1", "tp": 30.0, "sl": 50.0, "margin_pct": 5.0,
+METHODS = {"odds": "A quote che inserisci tu", "pct": "Take Profit / Stop Loss in % di ROI"}
+# esiti reali di ogni momento di controllo, dal punto di vista della selezione
+OUTCOMES = {
+    "break1": {"made": "fa il primo break", "suffered": "subisce il primo break"},
+    "set1": {"won": "vince il primo set", "lost": "perde il primo set"},
+    "set2": {"won": "vince il secondo set", "lost": "perde il secondo set"},
+    "ht": {"lead": "in vantaggio", "draw": "in parità", "trail": "in svantaggio",
+           "level": "pari all'intervallo", "notlevel": "non pari all'intervallo",
+           "g0": "0 gol nel primo tempo", "g1": "1 gol nel primo tempo", "g2": "2 gol nel primo tempo"},
+}
+HT_GROUPS = {"team": ["lead", "draw", "trail"], "draw": ["level", "notlevel"], "goals": ["g0", "g1", "g2"]}
+GOOD = {"break1": "made", "set1": "won", "set2": "won"}       # esito favorevole a chi punta (back) la selezione
+DEFAULTS = {"mode": "off", "method": "pct", "quotes": {}, "when": "set1", "tp": 30.0, "sl": 50.0, "margin_pct": 5.0,
             # solo scalping
             "who": "both", "skip_games": 2, "decided_pct": 5.0, "stop_at_bp": False, "spread_pct": 0.5}
 REASONS = {"": "Tenuta fino alla fine", "tp": "Take Profit", "sl": "Stop Loss"}
@@ -58,12 +76,174 @@ def settings(cfg: dict | None) -> dict:
     out = {**DEFAULTS, **raw}
     if out["when"] not in WHEN.get(sport, {}) or out["when"] == "off":
         out["mode"] = "off"
+    if out["method"] not in METHODS or out["when"] == "scalping":
+        out["method"] = "pct"
+    out["quotes"] = clean_quotes(out.get("quotes"))
+    return out
+
+
+def clean_quotes(q) -> dict:
+    """{momento: {esito: quota}} tenendo solo quote valide (> 1)."""
+    out: dict = {}
+    for point, row in (q or {}).items():
+        if point not in OUTCOMES or not isinstance(row, dict):
+            continue
+        vals = {}
+        for k, v in row.items():
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                continue
+            if k in OUTCOMES[point] and np.isfinite(v) and v > 1.0:
+                vals[k] = v
+        if vals:
+            out[point] = vals
     return out
 
 
 def is_active(cfg: dict | None) -> bool:
     c = settings(cfg)
-    return c["mode"] == "tpsl" and (c["tp"] > 0 or c["sl"] > 0 or c["when"] == "scalping")
+    if c["mode"] != "tpsl":
+        return False
+    if c["method"] == "odds":
+        return bool(c["quotes"])
+    return c["tp"] > 0 or c["sl"] > 0 or c["when"] == "scalping"
+
+
+def side_outcomes(point: str, side: str) -> tuple[str, str] | None:
+    """(esito Take Profit, esito Stop Loss) di un momento a due esiti, per chi punta o banca la selezione."""
+    if point not in GOOD:
+        return None
+    good, bad = [k for k in OUTCOMES[point] if k == GOOD[point]][0], [k for k in OUTCOMES[point] if k != GOOD[point]][0]
+    return (good, bad) if side == "back" else (bad, good)
+
+
+def ht_group(selection) -> str:
+    return "draw" if selection == "draw" else "goals" if selection in ("over", "under") else "team"
+
+
+def checkpoint_outcome(trades: pd.DataFrame, point: str) -> np.ndarray:
+    """Esito reale di ogni operazione nel momento indicato (None = momento non disponibile: niente break nel
+    primo set, dato punto per punto mancante, partita gia' finita, 3+ gol per l'Over/Under...)."""
+    n = len(trades)
+    none = np.full(n, None, dtype=object)
+    if n == 0:
+        return none
+    if point == "break1":
+        if "ip_break1" not in trades.columns:
+            return none
+        b = trades["ip_break1"].to_numpy(dtype=object)
+        return np.where(b == "Fatto", "made", np.where(b == "Subito", "suffered", None)).astype(object)
+    if point == "set1":
+        if "set1_won" not in trades.columns:
+            return none
+        w = trades["set1_won"].to_numpy(dtype=float)
+        return np.where(w == 1, "won", np.where(w == 0, "lost", None)).astype(object)
+    if point == "set2":
+        if "set2_sets" not in trades.columns or "set1_won" not in trades.columns:
+            return none
+        k, w = trades["set2_sets"].to_numpy(dtype=float), trades["set1_won"].to_numpy(dtype=float)
+        bo = trades["best_of"].to_numpy(dtype=float) if "best_of" in trades.columns else np.full(n, 3.0)
+        won2 = k - w
+        over = (bo != 5) & ((k == 0) | (k == 2))                  # 2-0 al meglio dei tre: partita finita
+        ok = np.isfinite(won2) & ~over
+        return np.where(ok & (won2 == 1), "won", np.where(ok & (won2 == 0), "lost", None)).astype(object)
+    if point == "ht":
+        sel = trades["selection"].to_numpy(dtype=object) if "selection" in trades.columns else np.full(n, "home", dtype=object)
+        team = trades["ip_ht_sel"].to_numpy(dtype=object) if "ip_ht_sel" in trades.columns else none
+        res = trades["ip_ht"].to_numpy(dtype=object) if "ip_ht" in trades.columns else none
+        goals = trades["ip_ht_goals"].to_numpy(dtype=object) if "ip_ht_goals" in trades.columns else none
+        t_out = np.where(team == "In vantaggio", "lead", np.where(team == "Pari", "draw", np.where(team == "In svantaggio", "trail", None)))
+        d_out = np.where(res == "Pari", "level", np.where(pd.isna(res), None, "notlevel"))
+        g_out = np.where(goals == "0", "g0", np.where(goals == "1", "g1", np.where(goals == "2", "g2", None)))
+        grp = np.array([ht_group(x) for x in sel], dtype=object)
+        return np.where(grp == "draw", d_out, np.where(grp == "goals", g_out, t_out)).astype(object)
+    raise ValueError(point)
+
+
+def exit_return(entry_odds, exit_odds, side: str, commission: float = 0.0) -> np.ndarray:
+    """Profitto per unita' di rischio chiudendo alla quota `exit_odds` una posizione aperta a `entry_odds`.
+    back (rischio = puntata):        ingresso/uscita - 1
+    lay  (rischio = responsabilita'): (1 - ingresso/uscita) / (ingresso - 1)
+    La commissione si applica solo ai profitti."""
+    o, x = np.asarray(entry_odds, dtype=float), np.asarray(exit_odds, dtype=float)
+    r = o / x - 1 if side == "back" else (1 - o / x) / (o - 1)
+    r = np.where(r > 0, r * (1 - commission), r)
+    return np.maximum(r, -1.0)
+
+
+def apply_quotes(trades: pd.DataFrame, points: list[str], quotes: dict, commission: float
+                 ) -> tuple[np.ndarray, np.ndarray, list[str], np.ndarray]:
+    """Uscita alle quote indicate per esito. Ritorna (profitto, motivo, momento ed esito, quota di uscita)."""
+    n = len(trades)
+    pnl = trades["pnl"].to_numpy(dtype=float).copy()
+    risk = trades["risk"].to_numpy(dtype=float)
+    side = trades["side"].to_numpy(dtype=object) if "side" in trades.columns else np.full(n, "back", dtype=object)
+    entry = trades["odds"].to_numpy(dtype=float)
+    reason = np.full(n, "", dtype=object)
+    label = np.full(n, "fine partita", dtype=object)
+    exit_odds = np.full(n, np.nan)
+    still = np.ones(n, dtype=bool)
+    for point in points:
+        q = quotes.get(point) or {}
+        if not q:
+            continue
+        out = checkpoint_outcome(trades, point)
+        x = np.array([q.get(o, np.nan) if o is not None else np.nan for o in out], dtype=float)
+        go = still & np.isfinite(x) & np.isfinite(entry)
+        if not go.any():
+            continue
+        r = np.where(side == "lay", exit_return(entry, x, "lay", commission), exit_return(entry, x, "back", commission))
+        pnl = np.where(go, r * risk, pnl)
+        exit_odds = np.where(go, x, exit_odds)
+        pair = side_outcomes(point, str(side[0])) if n else None
+        role = np.where(r >= 0, "tp", "sl") if pair is None else np.where(out == pair[0], "tp", "sl")
+        reason = np.where(go, role, reason)
+        label = np.where(go, np.array([f"{CHECKPOINT_LABEL[point]}: {OUTCOMES[point].get(o, '')}" for o in out], dtype=object), label)
+        still &= ~go
+    return pnl, reason, list(label), exit_odds
+
+
+def estimated_quotes(trades: pd.DataFrame, point: str) -> dict:
+    """Quota equa mediana stimata dal modello per ogni esito del momento (dalle quote pre-partita)."""
+    if trades.empty:
+        return {}
+    p = checkpoint_prob(trades, point)
+    out = checkpoint_outcome(trades, point)
+    res = {}
+    for k in OUTCOMES[point]:
+        m = (out == k) & np.isfinite(p) & (p > 0)
+        if m.any():
+            res[k] = float(np.median(1 / p[m]))
+    return res
+
+
+def outcome_counts(trades: pd.DataFrame, point: str) -> dict:
+    """Quante operazioni hanno ciascun esito reale nel momento (None = momento non disponibile)."""
+    out = pd.Series(checkpoint_outcome(trades, point), dtype=object)
+    return {k: int((out == k).sum()) for k in OUTCOMES[point]} | {None: int(out.isna().sum())}
+
+
+def quotes_grid(trades: pd.DataFrame, point: str, tp_quotes, sl_quotes, commission: float) -> pd.DataFrame:
+    """ROI (%) per ogni coppia di quote di uscita in un momento a due esiti (righe = quota Stop Loss, colonne =
+    quota Take Profit; 0 = non esci). Le operazioni senza quell'esito restano tenute fino alla fine."""
+    side = str(trades["side"].iloc[0]) if "side" in trades.columns and len(trades) else "back"
+    pair = side_outcomes(point, side)
+    if pair is None or trades.empty:
+        return pd.DataFrame()
+    out = checkpoint_outcome(trades, point)
+    risk = trades["risk"].to_numpy(dtype=float)
+    hold = trades["pnl_hold"].to_numpy(dtype=float) if "pnl_hold" in trades.columns else trades["pnl"].to_numpy(dtype=float)
+    entry = trades["odds"].to_numpy(dtype=float)
+    good, bad = out == pair[0], out == pair[1]
+    other = hold[~(good | bad)].sum()
+
+    def part(mask, quotes):
+        return np.array([hold[mask].sum() if not x else (exit_return(entry[mask], x, side, commission) * risk[mask]).sum()
+                         for x in quotes])
+    g, b = part(good, tp_quotes), part(bad, sl_quotes)
+    total = b[:, None] + g[None, :] + other
+    return pd.DataFrame(total / risk.sum() * 100, index=list(sl_quotes), columns=list(tp_quotes))
 
 
 def checkpoints(cfg: dict) -> list[str]:
@@ -305,10 +485,11 @@ def first_hit(values: np.ndarray, tp: float, sl: float) -> np.ndarray:
 
 
 def apply_tpsl(values: np.ndarray, hold: np.ndarray, tp: float, sl: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Applica le soglie. Ritorna (rendimento, motivo '', 'tp', 'sl', indice del momento di uscita)."""
+    """Applica le soglie. Ritorna (rendimento, motivo '', 'tp', 'sl', indice del momento di uscita).
+    Si esce al valore del momento in cui la soglia risulta superata (puo' essere oltre la soglia)."""
     k = first_hit(values, tp, sl)
     rows = np.arange(len(hold))
-    v = np.where(k >= 0, values[rows, np.maximum(k, 0)], hold)
+    v = np.where(k >= 0, values[rows, np.maximum(k, 0)] if values.shape[1] else hold, hold)
     reason = np.where(k < 0, "", np.where(v >= 0, "tp", "sl"))
     return v, reason, k
 
@@ -333,7 +514,14 @@ def apply(trades: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     if not points or t.empty:
         t["cashout"], t["exit_point"] = "", ""
         return t
-    vals = checkpoint_values(t, points, c["margin_pct"], float(cfg.get("commission") or 0.0))
+    commission = float(cfg.get("commission") or 0.0)
+    if c["method"] == "odds":
+        pnl, reason, label, xo = apply_quotes(t, points, c["quotes"], commission)
+        t["pnl"], t["cashout"], t["exit_point"], t["exit_odds"] = pnl, reason, label, xo
+        t["trade_won"] = t["pnl"] > 0
+        t["equity"] = np.cumsum(t["pnl"].to_numpy())
+        return t
+    vals = checkpoint_values(t, points, c["margin_pct"], commission)
     risk = t["risk"].to_numpy(dtype=float)
     v, reason, k = apply_tpsl(vals, hold / risk, c["tp"], c["sl"])
     t["pnl"] = v * risk
@@ -357,14 +545,19 @@ def tpsl_grid(values: np.ndarray, hold: np.ndarray, risk: np.ndarray, tps, sls) 
 def summary(trades: pd.DataFrame) -> pd.DataFrame:
     """Effetto del cash out per motivo e momento: operazioni, profitto ottenuto e profitto tenendo fino alla fine."""
     if "cashout" not in trades.columns or trades.empty:
-        return pd.DataFrame(columns=["esito", "momento", "operazioni", "profitto", "profitto_tenendo", "differenza"])
+        return pd.DataFrame(columns=["esito", "momento", "operazioni", "quota_pct", "quota_ingresso", "quota_uscita",
+                                     "roi_uscita_pct", "profitto", "profitto_tenendo", "differenza"])
     point = trades["exit_point"].astype(object) if "exit_point" in trades.columns else pd.Series("", index=trades.index, dtype=object)
     n = pd.to_numeric(point.astype(str).str.extract(r"^dopo (\d+) punt", expand=False), errors="coerce")
     point = point.where(n.isna(), np.select([n <= 3, n <= 6], ["durante il game: punti 1-3", "durante il game: punti 4-6"],
                                             "durante il game: punti 7+"))
     key = [trades["cashout"].map(REASONS).rename("esito"), point.rename("momento")]
-    g = trades.groupby(key, sort=False)
-    out = pd.DataFrame({"operazioni": g.size(), "profitto": g["pnl"].sum(), "profitto_tenendo": g["pnl_hold"].sum()})
+    t = trades.assign(_xo=trades["exit_odds"] if "exit_odds" in trades.columns else np.nan)
+    g = t.groupby(key, sort=False)
+    out = pd.DataFrame({"operazioni": g.size(), "quota_ingresso": g["odds"].mean(), "quota_uscita": g["_xo"].mean(),
+                        "profitto": g["pnl"].sum(), "rischio": g["risk"].sum(), "profitto_tenendo": g["pnl_hold"].sum()})
+    out.insert(1, "quota_pct", out["operazioni"] / len(trades) * 100)
+    out.insert(4, "roi_uscita_pct", out["profitto"] / out.pop("rischio") * 100)
     out["differenza"] = out["profitto"] - out["profitto_tenendo"]
     out = out.rename_axis(["esito", "momento"]).reset_index()
     order = {v: i for i, v in enumerate(REASONS.values())}

@@ -618,7 +618,6 @@ def backtest_selections(sel: pd.DataFrame, cfg: dict, bankroll: float = 100.0, g
         picked = picked.assign(odds=odds, close_odds=np.nan, p_close=np.nan)
     trades = settle(picked, side, float(cfg.get("commission") or 0.0),
                     cfg.get("lay_mode", "liability"), float(cfg.get("stake") or 1.0))
-    smart_skipped = False
     if co_cfg["mode"] == "tpsl" and co_cfg["when"] == "scalping":
         from src import scalping
         if games is None or games.empty or cfg.get("sport") != "tennis":
