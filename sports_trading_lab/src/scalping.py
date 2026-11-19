@@ -254,7 +254,7 @@ def update_points(con, refresh: bool = False) -> dict:
     have = "tennis_service_games" in {r[0] for r in con.execute("SHOW TABLES").fetchall()}
     if have:   # tabella di una versione precedente (senza collegamento ai match del database): va ricostruita
         cols = {r[0] for r in con.execute("DESCRIBE tennis_service_games").fetchall()}
-        have = "db_match_id" in cols and "tennis_match_events" in {r[0] for r in con.execute("SHOW TABLES").fetchall()}
+        have = "db_match_id" in cols and events_current(con)
     if have and not changed and not refresh:
         n = con.execute("SELECT count(*), count(DISTINCT match_id) FROM tennis_service_games").fetchone()
         return {"games": n[0], "matches": n[1], "note": "gia' aggiornati"}
@@ -277,37 +277,129 @@ def update_points(con, refresh: bool = False) -> dict:
     return {"games": len(games), "matches": int(games["match_id"].nunique()), "note": "ricostruiti"}
 
 
+EVENT_COLUMNS = ["db_match_id", "complete", "fb_breaker", "fb_prob", "fb_game", "cb_breaker", "cb_prob", "cb_game", "breaks",
+                 "pa_name", "pa_press_set", "pa_press_game", "pa_press_prob", "pb_name", "pb_press_set", "pb_press_game", "pb_press_prob"]
+
+
+def point_scores(seq: str) -> tuple[str, int, bool]:
+    """Punteggio dopo ogni punto dal punto di vista di chi serve ('V' = vantaggio), numero di palle break giocate e se
+    si e' arrivati ai vantaggi. Esempio: '1101' -> '15-0 · 30-0 · 30-15 · 40-15'."""
+    names = ["0", "15", "30", "40"]
+    a = b = bp = 0
+    deuce = False
+    out = []
+    for ch in str(seq):
+        if b >= 3 and b > a:
+            bp += 1                                  # il punto che si gioca e' una palla break
+        a, b = (a + 1, b) if ch == "1" else (a, b + 1)
+        if (a >= 4 or b >= 4) and abs(a - b) >= 2:
+            out.append("game" if a > b else "break")
+            break
+        if a >= 3 and b >= 3:
+            deuce = True
+            out.append("40-40" if a == b else ("V-40" if a > b else "40-V"))
+        else:
+            out.append(f"{names[min(a, 3)]}-{names[min(b, 3)]}")
+    return " · ".join(out), bp, deuce
+
+
+def pressure_flags(seq: pd.Series) -> tuple[np.ndarray, np.ndarray]:
+    """Per ogni game: chi serve ha affrontato almeno una palla break / si e' arrivati ai vantaggi (40-40)."""
+    if len(seq) == 0:
+        return np.zeros(0, dtype=bool), np.zeros(0, dtype=bool)
+    pts, lens = _matrix(seq)
+    a, b = np.cumsum(pts == 1, axis=1), np.cumsum(pts == 0, axis=1)          # punteggio dopo ogni punto
+    before_end = np.arange(MAXLEN)[None, :] < (lens[:, None] - 1)              # stati prima dell'ultimo punto
+    bp = ((b >= 3) & (b > a) & before_end).any(axis=1)
+    deuce = ((a >= 3) & (b >= 3) & before_end).any(axis=1)
+    return bp, deuce
+
+
 def build_events(games: pd.DataFrame) -> pd.DataFrame:
-    """Per ogni match del database con dati punto per punto: chi ha fatto il primo break nel primo set e la
-    probabilita' di vittoria del match (modello) del giocatore che ha breakkato subito dopo il break.
-    Se nel primo set non ci sono break, `fb_breaker` e' vuoto (il set si e' deciso al tie-break)."""
-    cols = ["db_match_id", "fb_breaker", "fb_prob", "fb_game"]
+    """Eventi in partita di ogni match del database registrato punto per punto.
+    - primo break del primo set (chi, game, probabilita' di vittoria del match di chi breakka subito dopo);
+    - controbreak nel primo set: chi aveva subito il primo break breakka a sua volta, in qualsiasi game successivo
+      del set (anche l'ultimo);
+    - tutti i break del match (set, game, chi breakka, sua probabilita' dopo il game), per "il prossimo break";
+    - sotto pressione: la prima volta che un giocatore tiene due turni di servizio consecutivi dello stesso set
+      affrontando palle break o arrivando ai vantaggi (40-40) in entrambi.
+    Le probabilita' sono quelle del modello a punti indipendenti (tarate poi in src/backtester.py). Se i game di un
+    set non sono registrati tutti di fila (`complete` falso) controbreak, break successivi e pressione restano vuoti;
+    se nel primo set non ci sono break `fb_breaker` e' vuoto (set deciso al tie-break)."""
+    import json
     if games.empty:
-        return pd.DataFrame(columns=cols)
-    g = games[games["db_match_id"].notna() & (games["set_no"] == 1)].sort_values(["db_match_id", "game_no"], kind="stable")
+        return pd.DataFrame(columns=EVENT_COLUMNS)
+    g = games[games["db_match_id"].notna()].sort_values(["db_match_id", "set_no", "game_no"], kind="stable").reset_index(drop=True)
+    bp, deuce = pressure_flags(g["seq"])
+    g["pressured"] = g["held"].astype(bool).to_numpy() & (bp | deuce)
     rows = []
     for mid, x in g.groupby("db_match_id", sort=False):
-        nums = x["game_no"].to_numpy()
-        if len(x) < 6 or nums[0] != 1:            # primo set registrato in modo incompleto: niente dato
+        sets, nums = x["set_no"].to_numpy(), x["game_no"].to_numpy()
+        contiguous = {s: bool((nums[sets == s] == np.arange(1, (sets == s).sum() + 1)).all()) for s in np.unique(sets)}
+        s1 = x[x["set_no"] == 1]
+        if len(s1) < 6 or not contiguous.get(1, False):       # primo set registrato in modo incompleto: niente dato
             continue
-        broken = x[~x["held"].astype(bool)]
-        if broken.empty:
-            rows.append({"db_match_id": mid, "fb_breaker": None, "fb_prob": np.nan, "fb_game": np.nan})
-        else:
-            b = broken.iloc[0]
-            rows.append({"db_match_id": mid, "fb_breaker": b["returner"], "fb_prob": 1 - float(b["v_break"]), "fb_game": int(b["game_no"])})
-    return pd.DataFrame(rows, columns=cols)
+        complete = all(contiguous.values())
+        held = x["held"].astype(bool).to_numpy()
+        srv, ret = x["server"].to_numpy(), x["returner"].to_numpy()
+        row = {"db_match_id": mid, "complete": complete, "fb_breaker": None, "fb_prob": np.nan, "fb_game": np.nan,
+               "cb_breaker": None, "cb_prob": np.nan, "cb_game": np.nan, "breaks": None,
+               "pa_name": srv[0], "pa_press_set": np.nan, "pa_press_game": np.nan, "pa_press_prob": np.nan,
+               "pb_name": ret[0], "pb_press_set": np.nan, "pb_press_game": np.nan, "pb_press_prob": np.nan}
+        in1 = sets == 1
+        brk1 = np.flatnonzero(in1 & ~held)
+        if len(brk1):
+            i = brk1[0]
+            row.update(fb_breaker=ret[i], fb_prob=1 - float(x["v_break"].iloc[i]), fb_game=int(nums[i]))
+            back = np.flatnonzero(in1 & ~held & (np.arange(len(x)) > i) & (srv == ret[i]))   # chi ha breakkato perde il servizio
+            if len(back):
+                j = back[0]
+                row.update(cb_breaker=ret[j], cb_prob=1 - float(x["v_break"].iloc[j]), cb_game=int(nums[j]))
+        if complete:
+            vb = x["v_break"].to_numpy(dtype=float) if "v_break" in x.columns else np.full(len(x), np.nan)
+            row["breaks"] = json.dumps([[int(sets[k]), int(nums[k]), str(ret[k]), round(1 - float(vb[k]), 5)]
+                                        for k in np.flatnonzero(~held)])
+            press = x["pressured"].to_numpy()
+            vh = x["v_hold"].to_numpy(dtype=float) if "v_hold" in x.columns else np.full(len(x), np.nan)
+            for tag, name in (("pa", srv[0]), ("pb", ret[0])):
+                mine = np.flatnonzero(srv == name)
+                for k0, k1 in zip(mine[:-1], mine[1:]):
+                    if sets[k0] == sets[k1] and nums[k1] == nums[k0] + 2 and press[k0] and press[k1]:
+                        row.update({f"{tag}_press_set": int(sets[k1]), f"{tag}_press_game": int(nums[k1]),
+                                    f"{tag}_press_prob": float(vh[k1])})
+                        break
+        rows.append(row)
+    return pd.DataFrame(rows, columns=EVENT_COLUMNS)
+
+
+def events_current(con) -> bool:
+    tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
+    if "tennis_match_events" not in tables:
+        return False
+    return set(EVENT_COLUMNS) <= {r[0] for r in con.execute("DESCRIBE tennis_match_events").fetchall()}
+
+
+def rebuild_events(con) -> int:
+    """Ricalcola gli eventi dai game gia' nel database (senza scaricare nulla)."""
+    games = load_games(con)
+    events = build_events(games)
+    con.register("_events", events)
+    con.execute("CREATE OR REPLACE TABLE tennis_match_events AS SELECT * FROM _events")
+    con.unregister("_events")
+    return len(events)
 
 
 def ensure_events(con) -> bool:
     """Ricostruisce dalla cache locale (senza scaricare nulla) le tabelle dei punti se sono di una versione
     precedente. Ritorna True se ha ricostruito."""
-    if not all((C.RAW_DIR / "points" / f).exists() for f in FILES.values()):
-        return False
     tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
-    ok = "tennis_service_games" in tables and "tennis_match_events" in tables and \
-        "db_match_id" in {r[0] for r in con.execute("DESCRIBE tennis_service_games").fetchall()}
-    if ok:
+    games_ok = "tennis_service_games" in tables and "db_match_id" in {r[0] for r in con.execute("DESCRIBE tennis_service_games").fetchall()}
+    if games_ok and events_current(con):
+        return False
+    if games_ok:                       # solo la tabella degli eventi e' di una versione precedente
+        rebuild_events(con)
+        return True
+    if not all((C.RAW_DIR / "points" / f).exists() for f in FILES.values()):
         return False
     update_points(con, refresh=False)
     return True

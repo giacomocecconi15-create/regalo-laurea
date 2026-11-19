@@ -26,7 +26,7 @@ Uso manuale:
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python src/update_data.py        # scarica / aggiorna il database
-.venv/bin/python -m pytest tests -q        # 91 test
+.venv/bin/python -m pytest tests -q        # 96 test
 .venv/bin/python -m streamlit run app.py   # dashboard
 ```
 
@@ -139,7 +139,8 @@ curve, rendimenti mensili. Ogni operazione rischia 1 unità.
 - **Lay**: responsabilità fissa 1u (puntata del banco `1/(quota-1)`) oppure puntata fissa 1u. Il prezzo di banca è la
   quota **equa** (senza il margine del bookmaker) più lo *spread lay sull'exchange* (2% di default). Prima si bancava
   alla quota back del bookmaker, che contiene il margine: per questo back e lay risultavano entrambi in perdita o con
-  segni incoerenti. Ora, a parità di condizioni, back + lay ≈ -(margine + spread + commissione).
+  segni incoerenti. Ora, a parità di condizioni, back + lay ≈ -(margine + spread + commissione). Le partite senza la
+  quota dell'altro lato (poche, per esempio Over/Under senza Under) non sono prezzabili in banca e vengono escluse.
 - **CLV %**: back `quota/chiusura - 1`, lay `1 - quota/chiusura`.
 
 ### Modello di probabilità e incroci
@@ -195,7 +196,9 @@ giocatore che vive quell'evento, una sola operazione per partita. Il range di qu
 punta o banca restano quelli scelti a sinistra. Nel calcio 1X2 lo stesso con la squadra in vantaggio, in parità o in
 svantaggio all'intervallo.
 
-**Quando entri.** Tennis: pre-partita, dopo il primo break fatto o subito, dopo il primo set vinto o perso. Calcio 1X2:
+**Quando entri.** Tennis: pre-partita, dopo il primo break fatto o subito, dopo il primo set vinto o perso, quando il
+giocatore va **sotto pressione** (tiene due turni di servizio consecutivi dello stesso set affrontando palle break o
+arrivando ai vantaggi in entrambi; si entra alla fine del secondo, solo match punto per punto). Calcio 1X2:
 pre-partita, all'intervallo in vantaggio, sul pari o in svantaggio. Over/Under: pre-partita o all'intervallo con 0, 1,
 2 gol. Il primo set vale per tutti i match completati (un ritiro a metà primo set lascia il dato vuoto); il primo break
 esiste solo per i match registrati punto per punto (circa uno su cinque, soprattutto nei tornei maggiori). La squadra
@@ -204,15 +207,31 @@ che segna per prima non è disponibile: la fonte non riporta i minuti dei gol.
 I range di quota restano sulle quote **pre-partita**, ma con un filtro in partita l'operazione entra **dopo l'evento**
 (dopo il break, a fine primo set, all'intervallo) alla quota live stimata, meno un margine configurabile: così ROI e
 profitto non usano informazioni future. Il Riepilogo mostra quota media pre-partita, quota live di entrata (mediana),
-vittorie reali e probabilità stimata al momento. La vista *In partita* divide le operazioni per situazione di gioco
-con il numero di partite, la percentuale di vittorie (conteggio esatto) e il suo intervallo di confidenza al 95%.
+vittorie reali con l'intervallo di confidenza al 95% e la probabilità stimata al momento: se la stima cade dentro
+l'intervallo lo scarto è spiegato dal campione. Nel riquadro *Quota live di ingresso* si può anche filtrare per quota live
+stimata (minima e massima), che è nota al momento dell'ingresso. La vista *In partita* divide le operazioni per situazione
+di gioco (primo set, primo break, controbreak, sotto pressione, tie-break) con il numero di partite, la percentuale di
+vittorie (conteggio esatto) e il suo intervallo di confidenza al 95%.
 
 **Taratura delle quote live.** Non esistono quote in partita gratuite, e online non si trovano misure affidabili del
-calo medio delle quote (solo regole dei trader, per esempio "la quota dello sfavorito che vince il primo set si divide
-per 4-4,5"). La stima viene quindi dai modelli dell'app, tarati sui risultati reali: primo set su tutti i match,
-primo break sui match punto per punto (chi breakka per primo vince circa 8 punti più di quanto preveda un modello a punti
-indipendenti), intervallo sulle partite di calcio 2019-2022 con verifica sul 2023 in poi. Un test controlla che, per ogni
-situazione, la probabilità stimata coincida con la frequenza reale (entro 1,5 punti nel calcio e 2 nel tennis).
+calo medio delle quote (solo regole dei trader). La stima viene dai modelli dell'app, tarati sui risultati reali:
+la forma di ogni correzione è scelta allenando sul 2019-2022 e verificando sul 2023 in poi (log-loss fuori campione), i
+coefficienti finali sono stimati su tutti gli anni.
+
+| Momento | Modello | Correzione tarata |
+|---|---|---|
+| Fine primo set | set indipendenti dalla quota pre-partita | inerzia del set; nei match punto per punto anche *come* è stato vinto: break fatto e mai ripreso (chi lo vince vince l'84,9%, il modello semplice diceva 81,0%), rimonta dopo il break subito, tie-break |
+| Primo break | modello a punti dopo il game | inerzia +0,43 sul logit, dimezzata al meglio dei 5 set |
+| Controbreak (primo set) | modello a punti | -0,11: dopo il controbreak il modello a punti è quasi giusto |
+| Break successivi | modello a punti | +0,11, più +0,19 per chi ha fatto il primo break del match |
+| Sotto pressione | modello a punti dopo il secondo game tenuto | -0,12 e -0,26 × forza pre-partita: il favorito sotto pressione vince meno di quanto dica il punteggio (66% contro 72% stimato), lo sfavorito un po' di più |
+| Intervallo (calcio) | Poisson sul secondo tempo | vantaggio, pareggio e gol |
+
+Un test controlla che per ogni situazione la probabilità stimata coincida con la frequenza reale (entro 1,5 punti; per
+ruolo e per storia del set entro 2,5-3). Il punteggio del primo set (6-0 contro 7-6) invece non aggiunge nulla fuori
+campione e non è usato. Punta e banca usano la stessa probabilità: quota per chi punta = equa × (1 − margine), per chi
+banca = equa × (1 + margine); con margine zero il valore atteso secondo la stima è zero per entrambi, quindi non c'è un
+lato favorito dall'errore di stima.
 
 Lo **Scalping** può partire da una strategia salvata: simula solo i game dei match in cui la strategia avrebbe operato,
 scegliendo se serve il giocatore scelto, l'avversario o entrambi, ed eventualmente solo dopo il momento di ingresso.
@@ -232,27 +251,37 @@ Pagina *Quote reali*: il cash out simulato su prezzi veri in corso di partita, i
 - **Limite**: il piano BASIC registra circa un prezzo al minuto, quindi va bene per il cash out ma non per lo scalping
   punto per punto. I dati restano in `data/betfair.duckdb`.
 
-### Uscita: a quote per esito oppure Take Profit / Stop Loss in %
+### Uscita: Take Profit e Stop Loss separati
 
-Prima scegli **in quale momento** puoi uscire: al primo break, a fine primo set, a fine secondo set, in ogni momento
-disponibile (in ordine dopo l'ingresso), all'intervallo (calcio) oppure *scalping sul servizio*. Un momento che arriva
-prima dell'ingresso viene ignorato e l'app lo segnala. Poi **come esci**:
+L'uscita ha due regole indipendenti, ognuna con il proprio evento; vale quella che scatta per prima dopo l'ingresso, e se
+nessuna scatta la posizione resta aperta fino alla fine.
 
-- **A quote che inserisci tu** (consigliato). Per ogni momento e per ogni esito reale indichi la quota a cui chiudi:
-  tennis *Take Profit · quota se vince il primo set* e *Stop Loss · quota se perde il primo set* (al primo break: fa /
-  subisce il break; per chi banca i due ruoli si invertono); calcio *in vantaggio / in parità / in svantaggio*, per il
-  pareggio *pari / non pari*, per l'Over/Under *0, 1, 2 gol* nel primo tempo. Vuoto = con quell'esito non esci. Il ROI di
-  ogni operazione si calcola dalla **sua** quota di ingresso (pre-partita, live stimata o quella inserita a mano):
-  punta `ingresso/uscita − 1`, banca `(1 − ingresso/uscita)/(ingresso − 1)`, commissione sui profitti. Gli esiti sono
-  quelli reali del database, partita per partita. Sotto le quote una tabella mostra per ogni esito quante operazioni lo
-  hanno, la quota media stimata dal modello e il ROI con la quota di ingresso mediana; se una quota è molto più
-  favorevole della stima compare un avviso (il risultato sarebbe ottimistico).
-- **Take Profit / Stop Loss in % di ROI** sull'unità rischiata (SL 25% = esci quando la posizione perde 0,25 u). Il
-  controllo avviene solo nel momento scelto, con il valore stimato da modelli tarati sui risultati reali, e si esce al
-  valore che la posizione ha allora: a fine set il prezzo si è già mosso molto, quindi l'uscita è spesso ben oltre la
-  soglia (es. sfavoriti 2,00-3,50 con SL 25% a fine primo set: uscita media −61%). L'app traduce le soglie in quote
-  equivalenti e mostra il ROI medio effettivo delle uscite. Senza margine il risultato coincide con il tenere fino alla
-  fine entro circa un punto: il modello non crea né distrugge valore.
+- **Take Profit · esci in positivo quando la selezione…** fa il primo break, fa il controbreak, fa il prossimo break, vince
+  il primo set, vince il secondo set.
+- **Stop Loss · esci in negativo quando la selezione…** subisce il primo break, subisce il controbreak, subisce il prossimo
+  break, perde il primo set, perde il secondo set.
+
+Per chi banca i due elenchi si invertono. Nel calcio gli eventi sono gli esiti all'intervallo (in vantaggio, in parità, in
+svantaggio; pari / non pari per il pareggio; 0, 1, 2 gol per l'Over/Under). Esempio: punti chi fa il primo break, Take
+Profit a fine primo set se lo vince, Stop Loss al controbreak se lo subisce.
+
+- **Controbreak**: il break di chi aveva subito il primo break, in qualsiasi game successivo del primo set (anche
+  l'ultimo). **Prossimo break**: il primo break dopo l'ingresso, in qualsiasi set. Primo break, controbreak e prossimo
+  break esistono solo nei match registrati punto per punto (circa uno su cinque): con queste regole il backtest usa solo
+  quei match.
+- **Come esci**:
+  - *A quote che inserisci tu*: per ogni regola la quota di uscita; il ROI di ogni operazione si calcola dalla **sua**
+    quota di ingresso (pre-partita, live stimata o inserita a mano): punta `ingresso/uscita − 1`, banca
+    `(1 − ingresso/uscita)/(ingresso − 1)`, commissione sui profitti. **Quota vuota** = ogni partita esce alla quota
+    stimata per lei in quel momento (modello tarato, meno il *margine all'uscita*): con quote di ingresso molto diverse una
+    quota fissa non vale per tutte (una partita entrata a 13,0 non può uscire a 1,20 dopo il set vinto) e l'app avvisa
+    quando per oltre il 20% delle partite la quota inserita rende più di 10 punti oltre la stima di quella partita.
+  - *Take Profit / Stop Loss in % di ROI* sull'unità rischiata (SL 25% = esci quando la posizione perde 0,25 u),
+    controllati nel momento dell'evento con il valore stimato: si esce al valore di quel momento, che a fine set va spesso
+    ben oltre la soglia (es. sfavoriti 2,00-3,50 con SL 25% a fine primo set: uscita media −61%). L'app traduce le
+    soglie in quote equivalenti e mostra il ROI medio effettivo. *In ogni momento* controlla la soglia al primo break, al
+    controbreak e a fine primo e secondo set, nell'ordine in cui avvengono.
+  - *Scalping sul servizio*: vedi sotto.
 
 *Perché non punto per punto.* Ho provato a ricostruire la quota dopo ogni punto sui ~3.400 match registrati punto per
 punto, per uscire nel punto esatto in cui la soglia viene toccata. Anche dopo la taratura, nei momenti in cui le soglie
@@ -283,10 +312,19 @@ modello applicato ai punti reali; la vista *Uscita* li ricalcola sul campione de
 
 **Vista Uscita (analisi finale).** ROI con e senza uscita anticipata, effetto sul profitto, quota di operazioni chiuse,
 drawdown; tabella per esito e momento (operazioni, % sul totale, quota di ingresso media, quota di uscita, ROI
-all'uscita, profitto, profitto tenendo fino alla fine, differenza) e il conteggio degli esiti reali per ogni momento
-(compresi i casi senza dato, che restano aperti). Con le quote: mappa del ROI per quota di Take Profit × quota di Stop
-Loss, da poco meglio della stima del modello fino al 30% peggio. Con le percentuali: mappa del ROI per ogni coppia di
-soglie (bordo bianco = combinazione migliore nello storico, bordo blu = quella scelta).
+all'uscita, profitto, profitto tenendo fino alla fine, differenza) e quante partite hanno davvero ciascun evento dopo
+l'ingresso. Due riferimenti:
+
+- **Controllo del modello**: lo stesso piano uscendo alla quota stimata con margine zero. Se la stima è giusta per
+  *questo* piano, il risultato coincide con il tenere fino alla fine; lo scarto è mostrato con il suo errore standard
+  (verde se entro due errori standard). Sui piani tipici (primo break, set, controbreak, intervallo) lo scarto è entro
+  un punto; con il "prossimo break" dopo ingressi particolari può arrivare a 2-3 punti, e l'app lo segnala in rosso.
+- **ROI con le quote stimate**: le tue regole con quote realistiche partita per partita, da confrontare con le quote
+  inserite a mano.
+
+Poi la mappa: con le quote, ROI per quota di Take Profit × quota di Stop Loss, da poco meglio della stima del modello
+fino al 30% peggio (off = regola spenta); con le percentuali, ROI per ogni coppia di soglie (bordo bianco = combinazione
+migliore nello storico, bordo blu = quella scelta).
 
 Le strategie salvate con il vecchio cash out (regole manuali o modello "intelligente") si riaprono convertite in Take
 Profit / Stop Loss in % a fine primo set (tennis) o all'intervallo (calcio); le vecchie regole manuali vengono ignorate e
@@ -295,6 +333,19 @@ l'app lo segnala.
 **Quota di ingresso.** Con ingresso pre-partita ogni operazione entra alla propria quota pre-partita (il Riepilogo lo
 indica, con la quota mediana del campione). Con ingresso in partita la quota stimata si può sostituire con una quota fissa
 scelta a mano (riquadro *Quota live di ingresso*); se si discosta di oltre il 10% dalla stima compare un avviso.
+
+### Adjustment: togliere anni o partite
+
+Nella vista *Analisi*, scomponendo per anno, ogni riga ha la casella **escludi**: l'anno viene tolto dal backtest e tutte
+le viste (Riepilogo, Robustezza, Uscita, Operazioni) si aggiornano; gli anni esclusi restano nella tabella con i loro
+numeri per poterli rimettere. Nella vista *Operazioni* si clicca una riga e si apre la **scheda della partita**:
+risultato dal punto di vista del giocatore, statistiche ufficiali dei due giocatori (ace, doppi falli, prime, punti vinti,
+palle break salvate, quote) e, per i match registrati punto per punto, la sequenza game per game con il punteggio dopo ogni
+punto, palle break, vantaggi, eventi (primo break, controbreak, sotto pressione) e probabilità e quota stimate dopo ogni
+game, con il grafico. Dalla scheda *Escludi questa partita* la toglie dall'analisi. Il riquadro **Adjustment** sopra i
+risultati mostra le esclusioni e permette di ripristinarle; le esclusioni vengono salvate con la strategia ma lo scanner
+delle partite di oggi le ignora. Togliere a posteriori gli anni o le partite peggiori gonfia il risultato: va fatto solo
+con un motivo (dati incompleti, stagione anomala, regole diverse).
 
 Nel **Registro** una giocata reale si può chiudere come *Cash out* indicando a mano il profitto o la perdita
 effettivamente incassati.
@@ -313,9 +364,10 @@ a ogni pagina c'è lo stato dei dati. Tema scuro, senza animazioni: i mini-grafi
      segmenti migliori e peggiori, applicabili come filtro con un clic.
    - *Robustezza*: sei controlli (campione, significatività, intervallo di confidenza del ROI, CLV, tenuta
      fuori campione, costanza negli anni), confronto studio/verifica, anno per anno, confronto tra bookmaker.
-   - *Uscita*: analisi finale delle uscite rispetto a tenere fino alla fine, per momento ed esito, mappa di calore e, nello
+   - *Uscita*: analisi finale delle uscite rispetto a tenere fino alla fine, per momento ed esito, controllo del modello, mappa di calore e, nello
      scalping, valori tipici di game tenuto e break per superficie e ruolo.
-   - *Operazioni*: tabella esportabile in CSV.  *Salva*: archivia la strategia.
+   - *Operazioni*: tabella esportabile in CSV con risultato e disponibilità del punto per punto; clic su una riga = scheda
+     della partita. *Salva*: archivia la strategia.
 
    Ogni vista viene calcolata solo quando la apri, e il backtest si ricalcola solo se cambia la strategia.
 2. **Oggi** – le partite in programma (calcio) analizzate con lo storico: classifica, form, gol recenti; per ogni

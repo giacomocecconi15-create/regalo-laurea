@@ -1,6 +1,7 @@
 """Test del motore di backtesting (calcoli verificati a mano) e dell'integrita' del database."""
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -827,7 +828,7 @@ def test_tpsl_cashout_at_checkpoints(monkeypatch):
     t = r.trades
     # quota 2.0 alla pari: dopo il primo set vinto p = 0.75 -> cash out +0.5; perso p = 0.25 -> -0.5
     assert t["cashout"].tolist() == ["tp", "tp", "sl", ""]
-    assert t["exit_point"].tolist() == ["fine primo set"] * 3 + ["fine partita"]
+    assert t["exit_point"].tolist() == ["fine primo set: vince il primo set"] * 2 + ["fine primo set: perde il primo set", "fine partita"]
     assert t["pnl"].tolist() == pytest.approx([0.5, 0.5, -0.5, -1.0])
     assert t["pnl_hold"].tolist() == pytest.approx([1.0, -1.0, 1.0, -1.0])
     assert r.metrics["profit"] == pytest.approx(-0.5) and t["equity"].tolist() == pytest.approx([0.5, 1.0, 0.5, -0.5])
@@ -839,23 +840,32 @@ def test_tpsl_cashout_at_checkpoints(monkeypatch):
     grid = co.tpsl_grid(vals, off["pnl"].to_numpy(), off["risk"].to_numpy(), (0, 30), (0, 40))
     assert grid.loc[40, 30] == pytest.approx(-0.5 / 4 * 100) and grid.loc[0, 0] == pytest.approx(0.0)
     s = co.summary(t).set_index(["esito", "momento"])
-    assert s.loc[("Take Profit", "fine primo set"), "operazioni"] == 2 and s["profitto"].sum() == pytest.approx(-0.5)
+    assert s.loc[("Take Profit", "fine primo set: vince il primo set"), "operazioni"] == 2 and s["profitto"].sum() == pytest.approx(-0.5)
 
 
 def test_cashout_settings_and_checkpoints():
     legacy = co.settings({"sport": "tennis", "cashout": {"mode": "smart", "take_profit": True, "tp_pct": 25, "stop_loss": False}})
-    assert legacy["mode"] == "tpsl" and legacy["when"] == "set1" and legacy["tp"] == 25 and legacy["sl"] == 0
-    assert co.settings({"sport": "football", "cashout": {"mode": "smart"}})["when"] == "ht"
+    assert legacy["mode"] == "tpsl" and legacy["method"] == "pct" and legacy["tp_event"] == "set1" and legacy["tp"] == 25
+    assert not co.rule_active(legacy, "sl")                                   # stop loss non attivo (soglia 0)
+    assert co.settings({"sport": "football", "cashout": {"mode": "smart"}})["tp_event"] == "ht"
     manual = co.settings({"cashout": {"mode": "manual", "win_early_share": 30}})
     assert manual["mode"] == "off" and manual["legacy_manual"]
-    base = {"sport": "tennis", "cashout": {"mode": "tpsl", "when": "all", "tp": 10, "sl": 10}}
-    assert co.checkpoints(base) == ["break1", "set1", "set2"]
-    assert co.checkpoints({**base, "filters": {"ip_break1": {"in": ["Fatto"]}}}) == ["set1", "set2"]   # solo dopo l'ingresso
-    assert co.checkpoints({**base, "filters": {"ip_set1": {"in": ["Vinto"]}}}) == ["set2"]
-    assert co.checkpoints({**base, "cashout": {**base["cashout"], "when": "set1"}, "filters": {"ip_set1": {"in": ["Vinto"]}}}) == []
-    assert co.checkpoints({"sport": "football", "cashout": {"mode": "tpsl", "when": "ht", "tp": 10}}) == ["ht"]
-    assert co.checkpoints({"sport": "football", "cashout": {"mode": "tpsl", "when": "ht", "tp": 10}, "filters": {"ip_ht": {"in": ["Pari"]}}}) == []
-    assert not co.is_active({"sport": "tennis", "cashout": {"mode": "tpsl", "when": "set1", "tp": 0, "sl": 0}})
+    # vecchio "quando" unico -> stesso evento per le due regole
+    old = co.settings({"sport": "tennis", "cashout": {"mode": "tpsl", "when": "all", "tp": 10, "sl": 10}})
+    assert old["method"] == "pct" and old["tp_event"] == old["sl_event"] == "all"
+    assert co.settings({"sport": "tennis", "cashout": {"mode": "tpsl", "when": "scalping"}})["method"] == "scalping"
+    assert co.valid_events("tennis", "odds") == ["off", "break1", "cbreak", "nbreak", "set1", "set2"]
+    assert "all" in co.valid_events("tennis", "pct") and "ht_lead" in co.valid_events("football", "odds")
+    assert not co.is_active({"sport": "tennis", "cashout": {"mode": "tpsl", "method": "pct", "tp_event": "set1", "tp": 0}})
+    assert co.is_active({"sport": "tennis", "cashout": {"mode": "tpsl", "method": "odds", "tp_event": "set1"}})   # quota stimata
+    # un evento conta solo se arriva dopo l'ingresso
+    on_break = {"sport": "tennis", "filters": {"ip_break1": {"in": ["Fatto"]}}}
+    assert not co.entry_valid(on_break, "break1") and co.entry_valid(on_break, "cbreak") and co.entry_valid(on_break, "set1")
+    on_set = {"sport": "tennis", "filters": {"ip_set1": {"in": ["Vinto"]}}}
+    assert not co.entry_valid(on_set, "cbreak") and co.entry_valid(on_set, "set2") and co.entry_valid(on_set, "nbreak")
+    assert not co.entry_valid({"sport": "football", "filters": {"ip_ht": {"in": ["Pari"]}}}, "ht_lead")
+    assert co.rule_outcome("set1", "tp", "back") == "won" and co.rule_outcome("set1", "tp", "lay") == "lost"
+    assert co.rule_outcome("cbreak", "sl", "back") == "suffered" and co.rule_outcome("ht_trail", "sl", "back") == "trail"
     v = np.array([[0.1, np.nan, -0.6], [np.nan, 0.35, 0.0], [0.0, 0.0, 0.0]])
     assert co.first_hit(v, 30, 50).tolist() == [2, 1, -1]
     pnl, reason, k = co.apply_tpsl(v, np.array([1.0, -1.0, 0.4]), 30, 50)
@@ -1348,7 +1358,7 @@ def test_break_price_and_conditional_stats():
     assert s.loc[("c", "E"), "ip_break1"] == "Nessun break" and pd.isna(s.loc[("b", "C"), "ip_break1"])
     s = s.reset_index()
     p = bt.live_prob(s[s["match_id"] == "a"], "break1")
-    up = 1 / (1 + np.exp(-(np.log(0.7 / 0.3) + bt.BREAK_MOMENTUM)))
+    up = 1 / (1 + np.exp(-(np.log(0.7 / 0.3) + bt.EVENT_CAL["break1"][0])))                 # al meglio dei 3 set
     assert p.tolist() == pytest.approx([up, 1 - up])                                       # correzione simmetrica
     stats = bt.conditional_stats(s[s["match_id"] != "b"], "tennis")
     first = stats["Primo set"].set_index("situazione")
@@ -1549,50 +1559,63 @@ def test_exit_at_user_odds_follows_real_outcomes():
     sel = make_sel([2.0, 2.0, 2.0, 2.0, 2.0], [True, False, True, False, False])
     sel["opp_odds"], sel["best_of"] = 2.0, 3.0
     sel["set1_won"] = [1.0, 1.0, 0.0, 0.0, np.nan]
-    sel["set2_sets"] = [2.0, 1.0, 1.0, 0.0, np.nan]
+    sel["set2_sets"] = [2.0, 1.0, 1.0, 1.0, np.nan]
     sel["ip_break1"] = ["Fatto", "Subito", None, "Nessun break", "Subito"]
-    q = {"mode": "tpsl", "method": "odds", "when": "set1", "quotes": {"set1": {"won": 1.6, "lost": 4.0}}}
+    sel["_fb_game"] = [3.0, 4.0, np.nan, np.nan, 2.0]
+    q = {"mode": "tpsl", "method": "odds", "tp_event": "set1", "tp_quote": 1.6, "sl_event": "set1", "sl_quote": 4.0}
     t = bt.backtest_selections(sel, {"sport": "tennis", "cashout": q}).trades
-    assert t["exit_point"].tolist() == ["fine primo set: vince il primo set"] + ["fine primo set: vince il primo set"] \
-        + ["fine primo set: perde il primo set"] * 2 + ["fine partita"]
+    assert t["exit_point"].tolist() == ["fine primo set: vince il primo set"] * 2 + ["fine primo set: perde il primo set"] * 2 \
+        + ["fine partita"]
     assert t["pnl"].tolist() == pytest.approx([0.25, 0.25, -0.5, -0.5, -1.0])
     assert t["exit_odds"].tolist()[:4] == [1.6, 1.6, 4.0, 4.0] and t["cashout"].tolist() == ["tp", "tp", "sl", "sl", ""]
-    # solo una quota: l'altro esito resta aperto fino alla fine
-    only = bt.backtest_selections(sel, {"sport": "tennis", "cashout": {**q, "quotes": {"set1": {"lost": 4.0}}}}).trades
+    # solo lo Stop Loss: chi vince il primo set resta aperto fino alla fine
+    only = bt.backtest_selections(sel, {"sport": "tennis", "cashout": {**q, "tp_event": "off"}}).trades
     assert only["pnl"].tolist() == pytest.approx([1.0, -1.0, -0.5, -0.5, -1.0])
-    # in ogni momento: primo break, poi fine primo set, poi secondo set (2-0 al meglio dei tre = partita finita)
-    allq = {**q, "when": "all", "quotes": {"break1": {"suffered": 2.5}, "set2": {"won": 1.25, "lost": 5.0}}}
-    a = bt.backtest_selections(sel, {"sport": "tennis", "cashout": allq}).trades
+    # regole in momenti diversi: Stop Loss al primo break subito, Take Profit a fine secondo set (2-0 = partita finita).
+    # Il primo break esiste solo nei match registrati punto per punto: la partita senza il dato (terza) viene esclusa.
+    mix = {**q, "tp_event": "set2", "tp_quote": 1.25, "sl_event": "break1", "sl_quote": 2.5}
+    a = bt.backtest_selections(sel, {"sport": "tennis", "cashout": mix}).trades
+    assert a["match_id"].tolist() == ["m000", "m001", "m003", "m004"]
     assert a["exit_point"].tolist() == ["fine partita", "primo break: subisce il primo break", "fine secondo set: vince il secondo set",
-                                        "fine partita", "primo break: subisce il primo break"]
-    assert a["pnl"].tolist() == pytest.approx([1.0, -0.2, 0.6, -1.0, -0.2])
-    # lay: chi banca incassa quando la selezione perde il set (quota che sale)
-    lay = bt.backtest_selections(sel, {"sport": "tennis", "side": "lay", "lay_spread": 0.0, "cashout": q}).trades
+                                        "primo break: subisce il primo break"]
+    assert a["pnl"].tolist() == pytest.approx([1.0, -0.2, 0.6, -0.2])
+    # lay: il Take Profit scatta quando la selezione perde il set (quota che sale)
+    lq = {**q, "tp_quote": 4.0, "sl_quote": 1.6}
+    lay = bt.backtest_selections(sel, {"sport": "tennis", "side": "lay", "lay_spread": 0.0, "cashout": lq}).trades
     o = lay["odds"].to_numpy()
     assert lay["pnl"].tolist()[:4] == pytest.approx(list((1 - o[:4] / np.array([1.6, 1.6, 4.0, 4.0])) / (o[:4] - 1)))
     assert lay["cashout"].tolist()[:4] == ["sl", "sl", "tp", "tp"]
-    # mappa delle quote: la cella delle quote impostate coincide con il backtest
-    grid = co.quotes_grid(t, "set1", [0.0, 1.6], [0.0, 4.0], 0.0)
+    # mappa delle quote: la cella delle quote impostate coincide con il backtest, "off" con tenere fino alla fine
+    grid = co.quotes_grid(t, {"sport": "tennis", "cashout": q}, [0.0, 1.6], [0.0, 4.0])
     assert grid.loc[4.0, 1.6] == pytest.approx(t["pnl"].sum() / t["risk"].sum() * 100)
     assert grid.loc[0.0, 0.0] == pytest.approx(t["pnl_hold"].sum() / t["risk"].sum() * 100)
     s = co.summary(t).set_index(["esito", "momento"])
     assert s.loc[("Stop Loss", "fine primo set: perde il primo set"), "roi_uscita_pct"] == pytest.approx(-50.0)
     assert s["quota_pct"].sum() == pytest.approx(100.0)
+    # quota vuota: esce alla quota stimata di ogni partita, coerente con il valore del cash out
+    est = bt.backtest_selections(sel, {"sport": "tennis", "cashout": {**q, "tp_quote": None, "sl_quote": None, "margin_pct": 0}}).trades
+    p = co.checkpoint_prob(co._book(est), "set1")
+    assert est["pnl"].tolist()[:4] == pytest.approx(list(2.0 * p[:4] - 1))
+    assert est["exit_odds"].tolist()[:4] == pytest.approx(list(1 / p[:4]))
 
 
 def test_exit_settings_and_football_outcomes():
-    c = co.settings({"sport": "tennis", "cashout": {"mode": "tpsl", "method": "odds", "when": "scalping"}})
-    assert c["method"] == "pct"                                   # lo scalping esce solo a percentuale
-    c = co.settings({"sport": "tennis", "cashout": {"mode": "tpsl", "method": "odds", "when": "set1",
-                                                     "quotes": {"set1": {"won": "1.5", "lost": 0.9, "x": 3}, "zz": {"a": 2}}}})
-    assert c["quotes"] == {"set1": {"won": 1.5}} and co.is_active({"sport": "tennis", "cashout": c})
-    assert not co.is_active({"sport": "tennis", "cashout": {"mode": "tpsl", "method": "odds", "when": "set1"}})
-    assert co.side_outcomes("set1", "back") == ("won", "lost") and co.side_outcomes("break1", "lay") == ("suffered", "made")
+    # vecchie quote per esito -> regole separate (per chi banca i ruoli si invertono)
+    old = {"mode": "tpsl", "method": "odds", "when": "set1", "quotes": {"set1": {"won": 1.5, "lost": 4.0}}}
+    c = co.settings({"sport": "tennis", "cashout": old})
+    assert (c["tp_event"], c["tp_quote"], c["sl_event"], c["sl_quote"]) == ("set1", 1.5, "set1", 4.0)
+    c = co.settings({"sport": "tennis", "side": "lay", "cashout": old})
+    assert (c["tp_quote"], c["sl_quote"]) == (4.0, 1.5)
+    c = co.settings({"sport": "football", "selection": ["home"], "cashout": {"mode": "tpsl", "method": "odds", "when": "ht",
+                                                                             "quotes": {"ht": {"lead": 1.4, "trail": 5.0}}}})
+    assert (c["tp_event"], c["tp_quote"], c["sl_event"], c["sl_quote"]) == ("ht_lead", 1.4, "ht_trail", 5.0)
+    assert co.settings({"sport": "tennis", "cashout": {"mode": "tpsl", "method": "odds", "tp_event": "set1", "tp_quote": "0.9"}})["tp_quote"] is None
     t = pd.DataFrame({"selection": ["home", "away", "draw", "draw", "over", "under"],
                       "ip_ht_sel": ["In vantaggio", "In svantaggio", None, None, None, None],
                       "ip_ht": ["Casa avanti", "Casa avanti", "Pari", "Ospite avanti", "Pari", "Pari"],
                       "ip_ht_goals": ["1", "1", "0", "1", "2", "3+"]})
     assert list(co.checkpoint_outcome(t, "ht")) == ["lead", "trail", "level", "notlevel", "g2", None]
+    assert co.exit_return(2.0, 1.6, "back") == pytest.approx(0.25) and co.exit_return(3.0, 2.0, "lay") == pytest.approx(-0.25)
 
 
 @needs_db
@@ -1616,3 +1639,120 @@ def test_no_fixed_side_trades_who_suffers_the_break():
     assert len(t) > 500 and (t["ip_break1"] == "Subito").all()
     assert t["match_id"].is_unique                                 # una sola operazione per partita: chi subisce il break
     assert set(t["selection"]) <= {"favourite", "underdog", "pick"} and t["selection"].nunique() >= 2
+
+
+# ------------------------------------------------------------------ controbreak, pressione, adjustment
+def _games(seqs: list[str], mid: str = "m1") -> pd.DataFrame:
+    rows = []
+    for k, seq in enumerate(seqs, start=1):
+        srv_a = k % 2 == 1
+        a = seq.count("1")                         # '1' = punto vinto da chi serve
+        rows.append({"match_id": "mcp" + mid, "db_match_id": mid, "set_no": 1, "game_no": k, "held": a > len(seq) - a,
+                     "server": "A B" if srv_a else "C D", "returner": "C D" if srv_a else "A B",
+                     "v_hold": 0.6 + k / 100, "v_break": 0.3 + k / 100, "seq": seq})
+    return pd.DataFrame(rows)
+
+
+def test_point_scores_counter_break_and_pressure_events():
+    assert sc.point_scores("1111") == ("15-0 · 30-0 · 40-0 · game", 0, False)
+    assert sc.point_scores("00011111") == ("0-15 · 0-30 · 0-40 · 15-40 · 30-40 · 40-40 · V-40 · game", 3, True)
+    assert sc.point_scores("0000")[0].endswith("break")
+    # A B serve nei game dispari: break di A B nel game 2, controbreak di C D nel game 3,
+    # C D tiene ai vantaggi i game 4 e 6 (due turni consecutivi sotto pressione)
+    g = _games(["1111", "0000", "0000", "11100011", "1111", "11100011"])
+    ev = sc.build_events(g).set_index("db_match_id")
+    assert ev.loc["m1", "fb_breaker"] == "A B" and ev.loc["m1", "fb_game"] == 2
+    assert ev.loc["m1", "cb_breaker"] == "C D" and ev.loc["m1", "cb_game"] == 3
+    assert ev.loc["m1", "cb_prob"] == pytest.approx(1 - 0.33)                  # probabilita' di chi fa il controbreak
+    assert [b[:3] for b in json.loads(ev.loc["m1", "breaks"])] == [[1, 2, "A B"], [1, 3, "C D"]]
+    assert ev.loc["m1", "pb_name"] == "C D" and ev.loc["m1", "pb_press_game"] == 6 and pd.isna(ev.loc["m1", "pa_press_game"])
+    assert ev.loc["m1", "pb_press_prob"] == pytest.approx(0.66)
+    # un game mancante nel primo set: niente eventi per quel match
+    assert sc.build_events(g[g["game_no"] != 4]).empty
+    # le colonne arrivano alle selezioni dal punto di vista di ciascun giocatore
+    m = tennis_frame().iloc[[0]].assign(match_id="m1", winner_name="A B", loser_name="C D", score="6-4 6-2", status="Completed")
+    e = ev.reset_index()
+    for col in sc.EVENT_COLUMNS[1:]:
+        m[col] = e[col].iloc[0]
+    m["_ev_match"] = "m1"
+    s = bt.tennis_selections(m, "avg").set_index("player")
+    assert s.loc["A B", "ip_break1"] == "Fatto" and s.loc["A B", "ip_cbreak"] == "Subito" and s.loc["C D", "ip_cbreak"] == "Fatto"
+    assert s.loc["C D", "ip_press"] == "Sì" and s.loc["C D", "_press_t"] == 106 and s.loc["A B", "ip_press"] == "No"
+    assert s.loc["C D", "score"] == "4-6 2-6" and s.loc["A B", "score"] == "6-4 6-2"
+    assert bt.entry_time(s.reset_index(), "press").tolist()[1] == 106 and bt.entry_time(s, "set1")[0] == 199
+
+
+def test_adjustments_live_odds_filter_and_scanner():
+    sel = make_sel([2.0, 2.2, 1.8, 2.5], [True, False, True, False], dates=["2020-03-01", "2021-03-01", "2021-05-01", "2022-01-01"])
+    assert len(bt.apply_filters(sel, {"exclude_years": [2021]})) == 2
+    assert bt.apply_filters(sel, {"exclude_matches": ["m000", "m003"]})["match_id"].tolist() == ["m001", "m002"]
+    # filtro sulla quota live stimata all'ingresso (dopo il primo set)
+    t = make_sel([2.0, 2.0, 3.0, 1.5], [True, False, True, False])
+    t["opp_odds"], t["best_of"], t["set1_won"] = [2.0, 2.0, 1.4, 2.6], 3.0, [1.0, 0.0, 1.0, 0.0]
+    t["ip_set1"] = np.where(t["set1_won"] == 1, "Vinto", "Perso")
+    base = {"sport": "tennis", "filters": {"ip_set1": {"in": ["Vinto", "Perso"]}}, "live_margin": 0.0}
+    every = bt.backtest_selections(t, base).trades
+    cut = bt.backtest_selections(t, {**base, "live_odds_min": 1.5, "live_odds_max": 3.0}).trades
+    assert len(every) == 4 and len(cut) < 4 and cut["odds"].between(1.5, 3.0).all()
+    # lo scanner delle partite di oggi ignora gli adjustment fatti sullo storico
+    vault = {"adj": {"config": {"sport": "tennis", "selection": ["underdog"], "exclude_years": [2026], "exclude_matches": ["x"]},
+                     "metrics": {}}}
+    up = pd.DataFrame({"date": ["2026-11-20"], "player1": ["Uno"], "player2": ["Due"], "odds1": [1.5], "odds2": [2.7], "best_of": [3]})
+    sig, _ = sv.scan(up, vault, 1000)
+    assert len(sig) == 1
+
+
+@needs_db
+def test_event_calibrations_match_real_frequencies(con):
+    sel = bt.load_selections("tennis", "h2h", "avg", con=con)
+    sel = sel[np.isfinite(bt.fair_prob(sel))]
+    for col, point, states in (("ip_break1", "break1", ["Fatto", "Subito"]), ("ip_cbreak", "cbreak", ["Fatto", "Subito"]),
+                               ("ip_press", "press", ["Sì"])):
+        x = sel[sel[col].isin(states)]
+        p = bt.live_prob(x, point)
+        ok = np.isfinite(p)
+        for st_ in states:
+            m = ok & (x[col] == st_).to_numpy()
+            assert abs(p[m].mean() - x["won"].to_numpy()[m].mean()) < 0.015, (point, st_)
+        if point == "press":                                       # anche per ruolo (favorito / sfavorito sotto pressione)
+            for role in ("favourite", "underdog"):
+                m = ok & (x["selection"] == role).to_numpy()
+                assert abs(p[m].mean() - x["won"].to_numpy()[m].mean()) < 0.03, role
+    # fine primo set con la storia dei break del set
+    s = sel[sel["ip_set1"].isin(["Vinto", "Perso"]) & sel["ip_cbreak"].notna()]
+    p = co.checkpoint_prob(s, "set1")
+    for keys, grp in s.assign(_p=p).groupby(["ip_set1", "ip_break1", "ip_cbreak"]):
+        if len(grp) >= 250:
+            assert abs(grp["_p"].mean() - grp["won"].mean()) < 0.025, keys
+
+
+@needs_db
+def test_pressure_entry_back_and_lay_use_the_same_estimate(con):
+    sel = bt.load_selections("tennis", "h2h", "avg", con=con)
+    cfg = {"sport": "tennis", "selection": [], "filters": {"ip_press": {"in": ["Sì"]}}}
+    back = bt.backtest_selections(sel, {**cfg, "side": "back", "live_margin": 3.0}).trades
+    lay = bt.backtest_selections(sel, {**cfg, "side": "lay", "live_margin": 3.0}).trades
+    assert len(back) == len(lay) > 1000
+    assert np.allclose(back["live_prob"], lay["live_prob"])                            # stessa probabilita' stimata
+    fair = 1 / back["live_prob"].to_numpy()
+    assert np.allclose(back["odds"], np.maximum(fair * 0.97, 1.01)) and np.allclose(lay["odds"], np.maximum(fair * 1.03, 1.01))
+    assert abs(back["live_prob"].mean() - back["won"].mean()) < 0.015                  # nessun errore di stima a favore di un lato
+    # senza margine il valore atteso secondo la stima e' zero per entrambi i lati
+    zb = bt.backtest_selections(sel, {**cfg, "side": "back", "live_margin": 0.0}).trades
+    assert (zb["live_prob"] * zb["odds"] - 1).abs().max() < 0.011
+
+
+@needs_db
+def test_separate_take_profit_and_stop_loss_events_on_real_matches(con):
+    base = {"sport": "tennis", "market": "h2h", "selection": [], "side": "back", "price": "avg",
+            "filters": {"ip_break1": {"in": ["Fatto"]}}}
+    plan = {**base, "cashout": {"mode": "tpsl", "method": "odds", "tp_event": "set1", "sl_event": "cbreak", "margin_pct": 0}}
+    t = bt.run_backtest(plan, con).trades
+    cb = t["ip_cbreak"] == "Subito"
+    assert (t.loc[cb, "cashout"] == "sl").all()                                         # il controbreak arriva prima della fine del set
+    est = np.isfinite(co.checkpoint_prob(co._book(t), "set1"))                         # quota stimabile a fine set
+    assert (t.loc[~cb & (t["set1_won"] == 1) & est, "cashout"] == "tp").all()
+    check = co.model_benchmark(t, plan)
+    assert abs(check["gap"]) <= 2 * check["se"] + 0.5                                  # uscita a quota stimata ~ tenere
+    excl = bt.run_backtest({**base, "exclude_years": [2020], "exclude_matches": [t["match_id"].iloc[0]]}, con).trades
+    assert not (excl["date"].dt.year == 2020).any() and t["match_id"].iloc[0] not in set(excl["match_id"])

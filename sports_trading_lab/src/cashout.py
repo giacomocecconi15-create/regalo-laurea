@@ -1,32 +1,36 @@
-"""Uscita dalla posizione (cash out): a quote scelte per ogni esito, oppure con Take Profit e Stop Loss in %.
+"""Uscita dalla posizione: Take Profit e Stop Loss come due regole separate, ognuna con il proprio evento.
 
-Due metodi:
-  quote   ("odds") -> per ogni momento (primo break, fine primo set, fine secondo set, intervallo) e per ogni esito
-                      reale (break fatto/subito, set vinto/perso, in vantaggio/pari/in svantaggio...) si indica la quota
-                      a cui si chiude. Il ROI si calcola dalla quota di ingresso di ogni operazione (pre-partita, live
-                      stimata o inserita a mano):  back = ingresso/uscita - 1;  lay = (1 - ingresso/uscita) / (ingresso - 1)
-  percentuale ("pct") -> Take Profit e Stop Loss come ROI sull'importo rischiato (SL 25% = perdi il 25% dell'unita').
-                      Si controlla il valore nel momento scelto e si esce a quel valore: a fine set il prezzo si e' gia'
-                      mosso molto, quindi l'uscita e' spesso ben oltre la soglia (la vista Uscita mostra il ROI medio
-                      effettivo). Per un ROI esatto si usa il metodo a quote.
-e un "quando": i momenti della partita in cui l'uscita e' possibile.
+    Take Profit (esci in positivo) -> al primo evento favorevole scelto: fa il primo break, fa il controbreak, fa il
+                                      prossimo break, vince il primo o il secondo set (calcio: un esito all'intervallo)
+    Stop Loss   (esci in negativo) -> al primo evento sfavorevole scelto: subisce il primo break / il controbreak /
+                                      il prossimo break, perde il primo o il secondo set
+Per chi banca (lay) favorevole e sfavorevole si invertono. Vale la prima regola che scatta dopo l'ingresso; se nessuna
+scatta l'operazione resta aperta fino alla fine. Esempio: punti chi fa il primo break, Take Profit a fine primo set
+se lo vince, Stop Loss al controbreak se lo subisce.
 
-  tennis:  al primo break del primo set, a fine primo set, a fine secondo set, oppure in ognuno di questi momenti
-  calcio:  all'intervallo
-  scalping sul servizio (tennis): ogni game di servizio e' un'operazione a se', controllata punto per punto
-                                   (vedi src/scalping.py)
+Tre metodi:
+  "odds"     -> per ciascuna regola la quota a cui chiudi. Il ROI si calcola dalla quota di ingresso di ogni
+                operazione (pre-partita, live stimata o inserita a mano):
+                    back = ingresso/uscita - 1;  lay = (1 - ingresso/uscita) / (ingresso - 1)
+                Quota lasciata vuota: ogni operazione esce alla quota stimata per lei in quel momento (modello tarato,
+                meno il margine), cosi' l'uscita resta realistica anche con quote di ingresso molto diverse.
+  "pct"      -> Take Profit e Stop Loss come ROI sull'importo rischiato (SL 25% = perdi il 25% dell'unita'), controllati
+                nel momento dell'evento con la quota stimata (modelli tarati sui risultati reali): si esce al valore di
+                quel momento, che puo' andare oltre la soglia. "In ogni momento" = primo break, controbreak, fine primo
+                e secondo set (o intervallo), in ordine.
+  "scalping" -> ogni game di servizio e' un'operazione a se', controllata punto per punto (src/scalping.py)
 
-Il database non contiene quote in corso di partita: nei momenti di controllo la quota viene stimata con
-modelli tarati sui risultati reali (primo set, secondo set, primo break, intervallo). Se nessuna soglia
-viene raggiunta l'operazione resta aperta fino alla fine.
+Tempi degli eventi: set*100 + game (fine set = set*100 + 99, intervallo = 45, pre-partita = 0). Un evento conta solo se
+avviene dopo l'ingresso. Primo break, controbreak e prossimo break esistono solo per i match registrati punto per punto.
 
-Valore del cash out per unita' di rischio (p = probabilita' stimata della selezione nel momento di controllo,
-m = margine del cash out):
+Valore del cash out per unita' di rischio (p = probabilita' stimata della selezione, m = margine):
     back: profitto = quota_ingresso * p * (1 - m) - 1
     lay : profitto = puntata_banco * (1 - quota_ingresso * p * (1 + m))
 Sui profitti si applica la commissione exchange della strategia.
 """
 from __future__ import annotations
+
+import json
 
 import numpy as np
 import pandas as pd
@@ -34,88 +38,190 @@ import pandas as pd
 SECOND_HALF_SHARE = 0.554   # quota dei gol segnati nel secondo tempo (misurata sul database)
 SET_MOMENTUM = 0.2          # spostamento (logit) dopo il primo set: chi lo vince rende piu' di quanto dica il modello a set indipendenti
 SET2_MOMENTUM = 0.08        # idem dopo il secondo set: sull'1-1 chi ha vinto il secondo set vince di piu' (tarato 2019-2022, verificato 2023+)
+# come e' stato vinto il primo set (solo match punto per punto): logit' = logit + a*pulito + b*rimonta + c*tie-break
+#   pulito  = primo break fatto e mai ripreso (+1 per chi vince il set, -1 per chi lo perde)
+#   rimonta = set vinto dopo aver subito il primo break (+1), perso dopo averlo fatto (-1)
+#   tie-break = nessun break nel set (+1 chi vince, -1 chi perde). Forma scelta sul 2019-2022 (log-loss 2023+:
+#   0.4087 -> 0.4055), coefficienti stimati su tutti gli anni.
+SET1_HISTORY = (0.315, -0.185, 0.139)
 MAX_GOALS = 12
+
+METHODS = {"odds": "A quote che inserisci tu", "pct": "Take Profit / Stop Loss in % di ROI", "scalping": "Scalping sul servizio"}
+EVENT_NAME = {"break1": "primo break", "cbreak": "controbreak", "nbreak": "prossimo break", "set1": "fine primo set",
+              "set2": "fine secondo set", "ht": "intervallo", "all": "in ogni momento"}
+TENNIS_EVENTS = ["break1", "cbreak", "nbreak", "set1", "set2"]
+GOOD = {"break1": "made", "cbreak": "made", "nbreak": "made", "set1": "won", "set2": "won"}   # favorevole a chi punta
+BAD = {"break1": "suffered", "cbreak": "suffered", "nbreak": "suffered", "set1": "lost", "set2": "lost"}
+POINT_DATA = {"break1", "cbreak", "nbreak"}           # eventi noti solo nei match registrati punto per punto
+ALL_POINTS = {"tennis": ["break1", "cbreak", "set1", "set2"], "football": ["ht"]}
+HT_GROUPS = {"team": ["lead", "draw", "trail"], "draw": ["level", "notlevel"], "goals": ["g0", "g1", "g2"]}
+OUTCOME_LABEL = {
+    ("break1", "made"): "fa il primo break", ("break1", "suffered"): "subisce il primo break",
+    ("cbreak", "made"): "fa il controbreak", ("cbreak", "suffered"): "subisce il controbreak",
+    ("nbreak", "made"): "fa il prossimo break", ("nbreak", "suffered"): "subisce il prossimo break",
+    ("set1", "won"): "vince il primo set", ("set1", "lost"): "perde il primo set",
+    ("set2", "won"): "vince il secondo set", ("set2", "lost"): "perde il secondo set",
+    ("ht", "lead"): "in vantaggio all'intervallo", ("ht", "draw"): "in parità all'intervallo",
+    ("ht", "trail"): "in svantaggio all'intervallo", ("ht", "level"): "pari all'intervallo",
+    ("ht", "notlevel"): "non pari all'intervallo", ("ht", "g0"): "0 gol nel primo tempo", ("ht", "g1"): "1 gol nel primo tempo",
+    ("ht", "g2"): "2 gol nel primo tempo",
+}
+# vecchie impostazioni ("quando" unico per Take Profit e Stop Loss)
 WHEN = {
     "tennis": {"off": "Nessuna uscita anticipata", "break1": "Al primo break", "set1": "A fine primo set", "set2": "A fine secondo set",
                "all": "In ogni momento disponibile", "scalping": "Scalping sul servizio"},
     "football": {"off": "Nessuna uscita anticipata", "ht": "All'intervallo"},
 }
-CHECKPOINT_LABEL = {"break1": "primo break", "set1": "fine primo set", "set2": "fine secondo set", "ht": "intervallo"}
-ORDER = ["break1", "set1", "set2"]
-METHODS = {"odds": "A quote che inserisci tu", "pct": "Take Profit / Stop Loss in % di ROI"}
-# esiti reali di ogni momento di controllo, dal punto di vista della selezione
-OUTCOMES = {
-    "break1": {"made": "fa il primo break", "suffered": "subisce il primo break"},
-    "set1": {"won": "vince il primo set", "lost": "perde il primo set"},
-    "set2": {"won": "vince il secondo set", "lost": "perde il secondo set"},
-    "ht": {"lead": "in vantaggio", "draw": "in parità", "trail": "in svantaggio",
-           "level": "pari all'intervallo", "notlevel": "non pari all'intervallo",
-           "g0": "0 gol nel primo tempo", "g1": "1 gol nel primo tempo", "g2": "2 gol nel primo tempo"},
-}
-HT_GROUPS = {"team": ["lead", "draw", "trail"], "draw": ["level", "notlevel"], "goals": ["g0", "g1", "g2"]}
-GOOD = {"break1": "made", "set1": "won", "set2": "won"}       # esito favorevole a chi punta (back) la selezione
-DEFAULTS = {"mode": "off", "method": "pct", "quotes": {}, "when": "set1", "tp": 30.0, "sl": 50.0, "margin_pct": 5.0,
+CHECKPOINT_LABEL = EVENT_NAME
+DEFAULTS = {"mode": "off", "method": "odds", "tp_event": "off", "sl_event": "off", "tp_quote": None, "sl_quote": None,
+            "tp": 30.0, "sl": 50.0, "margin_pct": 5.0,
             # solo scalping
             "who": "both", "skip_games": 2, "decided_pct": 5.0, "stop_at_bp": False, "spread_pct": 0.5}
 REASONS = {"": "Tenuta fino alla fine", "tp": "Take Profit", "sl": "Stop Loss"}
+_RANK = {"team": ["lead", "draw", "trail"], "draw": ["level", "notlevel"], "over": ["g2", "g1", "g0"], "under": ["g0", "g1", "g2"]}
+
+
+def _quote(v) -> float | None:
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    return v if np.isfinite(v) and v > 1.0 else None
+
+
+def _legacy(raw: dict, cfg: dict, sport: str) -> dict:
+    """Converte le impostazioni delle versioni precedenti (un solo "quando", quote per esito, modalita' smart/manual)."""
+    if raw.get("mode") == "smart":
+        return {"mode": "tpsl", "method": "pct", "tp_event": "ht" if sport == "football" else "set1",
+                "sl_event": "ht" if sport == "football" else "set1",
+                "tp": raw.get("tp_pct", 30.0) if raw.get("take_profit", True) else 0.0,
+                "sl": raw.get("sl_pct", 50.0) if raw.get("stop_loss", False) else 0.0, "margin_pct": raw.get("margin_pct", 5.0)}
+    if raw.get("mode") == "manual":
+        return {"mode": "off", "legacy_manual": True}
+    if "when" not in raw or "tp_event" in raw or "sl_event" in raw:
+        return raw
+    out = {k: v for k, v in raw.items() if k not in ("when", "quotes", "exec")}
+    when = raw.get("when")
+    if when == "scalping":
+        out["method"] = "scalping"
+        return out
+    if raw.get("method", "pct") != "odds":                    # percentuale: stesso momento per le due soglie
+        out.update(method="pct", tp_event=when, sl_event=when)
+        return out
+    side = (cfg or {}).get("side", "back")
+    quotes = {p: {k: _quote(v) for k, v in (row or {}).items()} for p, row in (raw.get("quotes") or {}).items()}
+    out.update(method="odds", tp_event="off", sl_event="off", tp_quote=None, sl_quote=None)
+    if sport == "football":
+        q = {k: v for k, v in (quotes.get("ht") or {}).items() if v}
+        sel = set((cfg or {}).get("selection") or [])
+        group = "draw" if sel == {"draw"} else "over" if sel == {"over"} else "under" if sel == {"under"} else "team"
+        ranked = [k for k in _RANK[group] if k in q]
+        if side == "lay":
+            ranked = ranked[::-1]
+        if ranked:
+            out.update(tp_event=f"ht_{ranked[0]}", tp_quote=q[ranked[0]])
+        if len(ranked) > 1:
+            out.update(sl_event=f"ht_{ranked[-1]}", sl_quote=q[ranked[-1]])
+        return out
+    points = [p for p in TENNIS_EVENTS if p in quotes] if when == "all" else [when]
+    for p in points:
+        row = quotes.get(p) or {}
+        good, bad = (GOOD[p], BAD[p]) if side == "back" else (BAD[p], GOOD[p])
+        if row.get(good) and out["tp_event"] == "off":
+            out.update(tp_event=p, tp_quote=row[good])
+        if row.get(bad) and out["sl_event"] == "off":
+            out.update(sl_event=p, sl_quote=row[bad])
+    return out
 
 
 def settings(cfg: dict | None) -> dict:
-    """Impostazioni complete del cash out di una strategia. Le strategie salvate con le versioni precedenti
-    (regole 'manuali' a frequenza o modalita' 'intelligente') vengono convertite: l'intelligente diventa
-    Take Profit / Stop Loss a fine primo set (intervallo nel calcio), il manuale viene disattivato."""
+    """Impostazioni complete dell'uscita di una strategia (con conversione delle versioni precedenti)."""
     raw = dict((cfg or {}).get("cashout") or {})
     sport = (cfg or {}).get("sport", "tennis")
-    if raw.get("mode") == "smart":
-        raw = {"mode": "tpsl", "when": "ht" if sport == "football" else "set1",
-               "tp": raw.get("tp_pct", 30.0) if raw.get("take_profit", True) else 0.0,
-               "sl": raw.get("sl_pct", 50.0) if raw.get("stop_loss", False) else 0.0,
-               "margin_pct": raw.get("margin_pct", 5.0)}
-    elif raw.get("mode") == "manual":
-        raw = {"mode": "off", "legacy_manual": True}
-    out = {**DEFAULTS, **raw}
-    if out["when"] not in WHEN.get(sport, {}) or out["when"] == "off":
+    out = {**DEFAULTS, **_legacy(raw, cfg or {}, sport)}
+    if out["method"] not in METHODS or (out["method"] == "scalping" and sport != "tennis"):
+        out["method"] = "pct" if out["method"] != "scalping" else "odds"
+    valid = valid_events(sport, out["method"])
+    for which in ("tp", "sl"):
+        if out[f"{which}_event"] not in valid:
+            out[f"{which}_event"] = "off"
+        out[f"{which}_quote"] = _quote(out.get(f"{which}_quote"))
+    for k in ("tp", "sl", "margin_pct", "spread_pct", "decided_pct"):
+        out[k] = float(out[k] or 0.0)
+    if out["mode"] == "tpsl" and out["method"] != "scalping" and out["tp_event"] == "off" and out["sl_event"] == "off":
         out["mode"] = "off"
-    if out["method"] not in METHODS or out["when"] == "scalping":
-        out["method"] = "pct"
-    out["quotes"] = clean_quotes(out.get("quotes"))
     return out
 
 
-def clean_quotes(q) -> dict:
-    """{momento: {esito: quota}} tenendo solo quote valide (> 1)."""
-    out: dict = {}
-    for point, row in (q or {}).items():
-        if point not in OUTCOMES or not isinstance(row, dict):
-            continue
-        vals = {}
-        for k, v in row.items():
-            try:
-                v = float(v)
-            except (TypeError, ValueError):
-                continue
-            if k in OUTCOMES[point] and np.isfinite(v) and v > 1.0:
-                vals[k] = v
-        if vals:
-            out[point] = vals
-    return out
+def valid_events(sport: str, method: str) -> list[str]:
+    if method == "scalping":
+        return ["off"]
+    if sport == "football":
+        evs = ["ht_" + k for g in HT_GROUPS.values() for k in g]
+        return ["off"] + (["ht"] + evs if method == "pct" else evs)
+    return ["off"] + TENNIS_EVENTS + (["all"] if method == "pct" else [])
+
+
+def rule_active(c: dict, which: str) -> bool:
+    if c["method"] == "scalping" or c[f"{which}_event"] == "off":
+        return False
+    return True if c["method"] == "odds" else c[which] > 0
 
 
 def is_active(cfg: dict | None) -> bool:
     c = settings(cfg)
     if c["mode"] != "tpsl":
         return False
-    if c["method"] == "odds":
-        return bool(c["quotes"])
-    return c["tp"] > 0 or c["sl"] > 0 or c["when"] == "scalping"
+    return c["method"] == "scalping" or rule_active(c, "tp") or rule_active(c, "sl")
 
 
-def side_outcomes(point: str, side: str) -> tuple[str, str] | None:
-    """(esito Take Profit, esito Stop Loss) di un momento a due esiti, per chi punta o banca la selezione."""
-    if point not in GOOD:
+def rule_outcome(event: str, which: str, side: str) -> str | None:
+    """Esito richiesto dalla regola (None = qualsiasi, per "in ogni momento" e "intervallo" a percentuale)."""
+    if event in ("all", "ht"):
         return None
-    good, bad = [k for k in OUTCOMES[point] if k == GOOD[point]][0], [k for k in OUTCOMES[point] if k != GOOD[point]][0]
-    return (good, bad) if side == "back" else (bad, good)
+    if event.startswith("ht_"):
+        return event[3:]
+    good = (which == "tp") == (side == "back")
+    return GOOD[event] if good else BAD[event]
+
+
+def rule_label(event: str, which: str, side: str) -> str:
+    if event == "off":
+        return "nessuno"
+    if event in ("all", "ht"):
+        return EVENT_NAME[event]
+    point = "ht" if event.startswith("ht_") else event
+    return OUTCOME_LABEL[(point, rule_outcome(event, which, side))]
+
+
+def needs_point_data(cfg: dict) -> set[str]:
+    """Eventi di uscita che richiedono i match registrati punto per punto."""
+    c = settings(cfg)
+    if c["mode"] != "tpsl" or c["method"] == "scalping":
+        return set()
+    return {c[f"{w}_event"] for w in ("tp", "sl") if rule_active(c, w)} & POINT_DATA
+
+
+def entry_valid(cfg: dict, event: str) -> bool:
+    """L'evento puo' arrivare dopo l'ingresso? (falso per esempio con ingresso a fine primo set e uscita al primo break)."""
+    from src import backtester as bt
+    entry = bt.entry_point(cfg)
+    if event in ("off", "all"):
+        return True
+    point = "ht" if event.startswith("ht") else event
+    if entry is None:
+        return True
+    if entry == "ht":
+        return point != "ht"
+    if point in ("set2", "nbreak"):
+        return True
+    if entry == "set1":
+        return False
+    if entry == "press":
+        return True                  # dipende dal momento della pressione: gli eventi gia' passati vengono ignorati
+    if entry == "cbreak":
+        return point == "set1"
+    return point in ("cbreak", "set1")          # ingresso al primo break
 
 
 def ht_group(selection) -> str:
@@ -129,10 +235,11 @@ def checkpoint_outcome(trades: pd.DataFrame, point: str) -> np.ndarray:
     none = np.full(n, None, dtype=object)
     if n == 0:
         return none
-    if point == "break1":
-        if "ip_break1" not in trades.columns:
+    if point in ("break1", "cbreak"):
+        col = "ip_break1" if point == "break1" else "ip_cbreak"
+        if col not in trades.columns:
             return none
-        b = trades["ip_break1"].to_numpy(dtype=object)
+        b = trades[col].to_numpy(dtype=object)
         return np.where(b == "Fatto", "made", np.where(b == "Subito", "suffered", None)).astype(object)
     if point == "set1":
         if "set1_won" not in trades.columns:
@@ -161,104 +268,101 @@ def checkpoint_outcome(trades: pd.DataFrame, point: str) -> np.ndarray:
     raise ValueError(point)
 
 
-def exit_return(entry_odds, exit_odds, side: str, commission: float = 0.0) -> np.ndarray:
+def exit_return(entry_odds, exit_odds, side, commission: float = 0.0) -> np.ndarray:
     """Profitto per unita' di rischio chiudendo alla quota `exit_odds` una posizione aperta a `entry_odds`.
     back (rischio = puntata):        ingresso/uscita - 1
     lay  (rischio = responsabilita'): (1 - ingresso/uscita) / (ingresso - 1)
-    La commissione si applica solo ai profitti."""
+    La commissione si applica solo ai profitti. `side` puo' essere una stringa o un vettore."""
     o, x = np.asarray(entry_odds, dtype=float), np.asarray(exit_odds, dtype=float)
-    r = o / x - 1 if side == "back" else (1 - o / x) / (o - 1)
+    lay = np.asarray(side) == "lay"
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r = np.where(lay, (1 - o / x) / (o - 1), o / x - 1)
     r = np.where(r > 0, r * (1 - commission), r)
     return np.maximum(r, -1.0)
 
 
-def apply_quotes(trades: pd.DataFrame, points: list[str], quotes: dict, commission: float
-                 ) -> tuple[np.ndarray, np.ndarray, list[str], np.ndarray]:
-    """Uscita alle quote indicate per esito. Ritorna (profitto, motivo, momento ed esito, quota di uscita)."""
-    n = len(trades)
-    pnl = trades["pnl"].to_numpy(dtype=float).copy()
-    risk = trades["risk"].to_numpy(dtype=float)
-    side = trades["side"].to_numpy(dtype=object) if "side" in trades.columns else np.full(n, "back", dtype=object)
-    entry = trades["odds"].to_numpy(dtype=float)
-    reason = np.full(n, "", dtype=object)
-    label = np.full(n, "fine partita", dtype=object)
-    exit_odds = np.full(n, np.nan)
-    still = np.ones(n, dtype=bool)
-    for point in points:
-        q = quotes.get(point) or {}
-        if not q:
-            continue
-        out = checkpoint_outcome(trades, point)
-        x = np.array([q.get(o, np.nan) if o is not None else np.nan for o in out], dtype=float)
-        go = still & np.isfinite(x) & np.isfinite(entry)
-        if not go.any():
-            continue
-        r = np.where(side == "lay", exit_return(entry, x, "lay", commission), exit_return(entry, x, "back", commission))
-        pnl = np.where(go, r * risk, pnl)
-        exit_odds = np.where(go, x, exit_odds)
-        pair = side_outcomes(point, str(side[0])) if n else None
-        role = np.where(r >= 0, "tp", "sl") if pair is None else np.where(out == pair[0], "tp", "sl")
-        reason = np.where(go, role, reason)
-        label = np.where(go, np.array([f"{CHECKPOINT_LABEL[point]}: {OUTCOMES[point].get(o, '')}" for o in out], dtype=object), label)
-        still &= ~go
-    return pnl, reason, list(label), exit_odds
+def _book(trades: pd.DataFrame) -> pd.DataFrame:
+    """Le probabilita' si stimano sempre dalle quote pre-partita del bookmaker (non dalla quota live o di banca)."""
+    return trades.assign(odds=trades["book_odds"]) if "book_odds" in trades.columns else trades
 
 
-def estimated_quotes(trades: pd.DataFrame, point: str) -> dict:
-    """Quota equa mediana stimata dal modello per ogni esito del momento (dalle quote pre-partita)."""
-    if trades.empty:
-        return {}
-    p = checkpoint_prob(trades, point)
-    out = checkpoint_outcome(trades, point)
-    res = {}
-    for k in OUTCOMES[point]:
-        m = (out == k) & np.isfinite(p) & (p > 0)
-        if m.any():
-            res[k] = float(np.median(1 / p[m]))
+def _next_break(t: pd.DataFrame, t0: np.ndarray, made: bool) -> tuple[np.ndarray, np.ndarray]:
+    """Primo break dopo l'ingresso fatto (made=True) o subito dal giocatore della riga: (tempo, probabilita' tarata)."""
+    from src import backtester as bt
+    n = len(t)
+    time, prob = np.full(n, np.nan), np.full(n, np.nan)
+    if "_breaks" not in t.columns or n == 0:
+        return time, prob
+    raw = t["_breaks"].to_numpy(dtype=object)
+    players = t["player"].to_numpy(dtype=object) if "player" in t.columns else np.full(n, "")
+    bo = t["best_of"].to_numpy(dtype=float) if "best_of" in t.columns else np.full(n, 3.0)
+    fb = t["_fb_game"].to_numpy(dtype=float) if "_fb_game" in t.columns else np.full(n, np.nan)
+    cb = t["_cb_game"].to_numpy(dtype=float) if "_cb_game" in t.columns else np.full(n, np.nan)
+    b1 = t["ip_break1"].to_numpy(dtype=object) if "ip_break1" in t.columns else np.full(n, None)
+    hist = np.where(b1 == "Fatto", 1.0, np.where(b1 == "Subito", -1.0, 0.0))
+    for i in np.flatnonzero(pd.notna(raw)):
+        me = bt._norm_name(players[i])
+        for s_, g_, name, p in json.loads(raw[i]):
+            tm = s_ * 100 + g_
+            mine = bt._norm_name(name) == me
+            if tm > t0[i] and mine == made:
+                # ogni tipo di break ha la sua taratura: primo break, controbreak del primo set, break successivi
+                kind = "break1" if (s_ == 1 and g_ == fb[i]) else "cbreak" if (s_ == 1 and g_ == cb[i]) else "nbreak"
+                time[i] = tm
+                prob[i] = float(bt.event_prob(p if mine else 1 - p, 1.0 if mine else -1.0, bo[i], kind, hist[i]))
+                break
+    return time, prob
+
+
+_EVENT_MEMO: dict = {}
+
+
+def _fingerprint(trades: pd.DataFrame) -> tuple:
+    cols = [c for c in ("match_id", "player", "odds", "book_odds", "risk", "entry_t", "selection") if c in trades.columns]
+    h = pd.util.hash_pandas_object(trades[cols], index=True).to_numpy() if cols and len(trades) else np.zeros(1, dtype=np.uint64)
+    return len(trades), int(h.sum()), int(h[::max(1, len(h) // 89)].sum())
+
+
+def event_data(trades: pd.DataFrame, event: str, t0: np.ndarray, outcome: str | None) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Per ogni operazione: (tempo dell'evento, evento valido dopo l'ingresso con l'esito richiesto, probabilita' della
+    selezione subito dopo l'evento, esito reale). I risultati vengono ricordati: la stessa strategia li richiede piu' volte."""
+    key = (_fingerprint(trades), event, outcome, hash(np.asarray(t0, dtype=float).tobytes()))
+    hit = _EVENT_MEMO.get(key)
+    if hit is not None:
+        return hit
+    res = _event_data(trades, event, t0, outcome)
+    if len(_EVENT_MEMO) > 48:
+        _EVENT_MEMO.clear()
+    _EVENT_MEMO[key] = res
     return res
 
 
-def outcome_counts(trades: pd.DataFrame, point: str) -> dict:
-    """Quante operazioni hanno ciascun esito reale nel momento (None = momento non disponibile)."""
-    out = pd.Series(checkpoint_outcome(trades, point), dtype=object)
-    return {k: int((out == k).sum()) for k in OUTCOMES[point]} | {None: int(out.isna().sum())}
-
-
-def quotes_grid(trades: pd.DataFrame, point: str, tp_quotes, sl_quotes, commission: float) -> pd.DataFrame:
-    """ROI (%) per ogni coppia di quote di uscita in un momento a due esiti (righe = quota Stop Loss, colonne =
-    quota Take Profit; 0 = non esci). Le operazioni senza quell'esito restano tenute fino alla fine."""
-    side = str(trades["side"].iloc[0]) if "side" in trades.columns and len(trades) else "back"
-    pair = side_outcomes(point, side)
-    if pair is None or trades.empty:
-        return pd.DataFrame()
-    out = checkpoint_outcome(trades, point)
-    risk = trades["risk"].to_numpy(dtype=float)
-    hold = trades["pnl_hold"].to_numpy(dtype=float) if "pnl_hold" in trades.columns else trades["pnl"].to_numpy(dtype=float)
-    entry = trades["odds"].to_numpy(dtype=float)
-    good, bad = out == pair[0], out == pair[1]
-    other = hold[~(good | bad)].sum()
-
-    def part(mask, quotes):
-        return np.array([hold[mask].sum() if not x else (exit_return(entry[mask], x, side, commission) * risk[mask]).sum()
-                         for x in quotes])
-    g, b = part(good, tp_quotes), part(bad, sl_quotes)
-    total = b[:, None] + g[None, :] + other
-    return pd.DataFrame(total / risk.sum() * 100, index=list(sl_quotes), columns=list(tp_quotes))
-
-
-def checkpoints(cfg: dict) -> list[str]:
-    """Momenti di controllo validi, in ordine cronologico, tenendo conto del momento di ingresso:
-    un controllo precedente o coincidente con l'ingresso viene escluso."""
-    c = settings(cfg)
-    if c["mode"] != "tpsl" or c["when"] == "scalping":
-        return []
+def _event_data(trades: pd.DataFrame, event: str, t0: np.ndarray, outcome: str | None) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     from src import backtester as bt
-    entry = bt.entry_point(cfg)
-    if cfg.get("sport") == "football":
-        return [] if entry == "ht" else ["ht"]
-    wanted = ORDER if c["when"] == "all" else [c["when"]]
-    start = {None: -1, "break1": 0, "set1": 1}[entry]
-    return [w for w in wanted if ORDER.index(w) > start]
+    n = len(trades)
+    t = _book(trades)
+    point = "ht" if event.startswith("ht") else event
+    if point == "nbreak":
+        made = outcome != "suffered"
+        time, prob = _next_break(t, t0, made)
+        out = np.where(np.isfinite(time), "made" if made else "suffered", None).astype(object)
+        return time, np.isfinite(time), prob, out
+    out = checkpoint_outcome(t, point)
+    if point == "break1":
+        g = t["_fb_game"].to_numpy(dtype=float) if "_fb_game" in t.columns else np.full(n, np.nan)
+        time, prob = 100 + g, bt.live_prob(t, "break1")
+    elif point == "cbreak":
+        g = t["_cb_game"].to_numpy(dtype=float) if "_cb_game" in t.columns else np.full(n, np.nan)
+        time, prob = 100 + g, bt.live_prob(t, "cbreak")
+    elif point == "set1":
+        time, prob = np.full(n, 199.0), checkpoint_prob(t, "set1")
+    elif point == "set2":
+        time, prob = np.full(n, 299.0), checkpoint_prob(t, "set2")
+    else:
+        time, prob = np.full(n, 45.0), checkpoint_prob(t, "ht")
+    has = pd.notna(out) & np.isfinite(time)
+    ok = has & (time > t0) & (out == outcome if outcome is not None else True)
+    return time, ok.astype(bool), prob, out
 
 
 def _poisson_pmf(lam: np.ndarray, kmax: int = MAX_GOALS) -> np.ndarray:
@@ -407,6 +511,18 @@ def tennis_checkpoint_prob(t: pd.DataFrame) -> np.ndarray:
     if ok.any():
         bo = t["best_of"].to_numpy(dtype=float)[ok]
         out[ok] = match_prob_after_first_set(set_prob_from_match(p0[ok], bo), bo, first[ok] > 0.5)
+    if "ip_break1" in t.columns and "ip_cbreak" in t.columns:     # storia dei break del set, se registrata
+        sg = np.where(first == 1, 1.0, np.where(first == 0, -1.0, 0.0))
+        b1, cb = t["ip_break1"].to_numpy(dtype=object), t["ip_cbreak"].to_numpy(dtype=object)
+        clean = np.where((sg > 0) & (b1 == "Fatto") & (cb == "Nessuno"), 1.0,
+                         np.where((sg < 0) & (b1 == "Subito") & (cb == "Nessuno"), -1.0, 0.0))
+        comeback = np.where((sg > 0) & (b1 == "Subito"), 1.0, np.where((sg < 0) & (b1 == "Fatto"), -1.0, 0.0))
+        tb = np.where(b1 == "Nessun break", sg, 0.0)
+        a, b, c = SET1_HISTORY
+        shift = a * clean + b * comeback + c * tb
+        pc = np.clip(out, 1e-6, 1 - 1e-6)
+        adj = 1 / (1 + np.exp(-(np.log(pc / (1 - pc)) + shift)))
+        out = np.where(np.isfinite(out) & (shift != 0), adj, out)
     return out
 
 
@@ -451,10 +567,11 @@ def checkpoint_prob(trades: pd.DataFrame, point: str | None = None) -> np.ndarra
     if point == "set2":
         p = tennis_set2_prob(t)
         return np.where((p <= 0) | (p >= 1), np.nan, p)       # partita gia' finita in due set: niente cash out
-    if point == "break1":
+    if point in ("break1", "cbreak"):
         from src import backtester as bt
-        p = bt.live_prob(t, "break1")
-        has = t["ip_break1"].isin(["Fatto", "Subito"]).to_numpy() if "ip_break1" in t.columns else np.zeros(len(t), bool)
+        col = "ip_break1" if point == "break1" else "ip_cbreak"
+        p = bt.live_prob(t, point)
+        has = t[col].isin(["Fatto", "Subito"]).to_numpy() if col in t.columns else np.zeros(len(t), bool)
         return np.where(has, p, np.nan)
     raise ValueError(point)
 
@@ -503,37 +620,204 @@ def checkpoint_values(trades: pd.DataFrame, points: list[str], margin_pct: float
     return np.stack(cols, axis=1)
 
 
-def apply(trades: pd.DataFrame, cfg: dict) -> pd.DataFrame:
-    """Cash out sulle operazioni a livello di match. Aggiunge `pnl_hold` (tenendo fino alla fine), `cashout`
-    ('', 'tp', 'sl'), `exit_point` (momento di uscita) e ricalcola `pnl`, `trade_won`, `equity`."""
+# --------------------------------------------------------------------------- regole di uscita
+def _side(trades: pd.DataFrame, cfg: dict) -> str:
+    if "side" in trades.columns and len(trades):
+        return str(trades["side"].iloc[0])
+    return cfg.get("side", "back")
+
+
+def model_exit_odds(trades: pd.DataFrame, prob: np.ndarray, margin: float, side: str) -> np.ndarray:
+    """Quota a cui si esce con il cash out stimato (coerente con `cashout_value`): chi punta chiude bancando a
+    1/(p*(1-m)), chi banca chiude puntando a 1/(p*(1+m))."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return 1 / (np.asarray(prob, dtype=float) * ((1 + margin) if side == "lay" else (1 - margin)))
+
+
+def rule_columns(trades: pd.DataFrame, cfg: dict, which: str, quote: float | None = None, model: bool = False) -> list[tuple]:
+    """Momenti candidati di una regola: lista di (tempo, valido, rendimento per unita' di rischio, etichetta, quota di
+    uscita) per ogni evento della regola (uno solo, oppure tutti per "in ogni momento"). `quote` sostituisce la quota
+    impostata; `model=True` esce sempre alla quota stimata dal modello."""
     c = settings(cfg)
-    points = checkpoints(cfg)
-    t = trades.copy()
-    hold = t["pnl"].to_numpy(dtype=float)
-    t["pnl_hold"] = hold
-    if not points or t.empty:
-        t["cashout"], t["exit_point"] = "", ""
-        return t
+    event = c[f"{which}_event"]
+    n = len(trades)
+    if event == "off" or n == 0:
+        return []
+    side = _side(trades, cfg)
+    t0 = trades["entry_t"].to_numpy(dtype=float) if "entry_t" in trades.columns else np.zeros(n)
+    t0 = np.where(np.isfinite(t0), t0, 0.0)
     commission = float(cfg.get("commission") or 0.0)
+    events = ALL_POINTS[cfg.get("sport", "tennis")] if event == "all" else [event]
+    outcome = None if event == "all" else rule_outcome(event, which, side)
+    risk = trades["risk"].to_numpy(dtype=float)
+    cols = []
+    m = c["margin_pct"] / 100
+    for ev in events:
+        time, ok, prob, out = event_data(trades, ev, t0, outcome)
+        q = quote if quote is not None else c[f"{which}_quote"]
+        if c["method"] == "odds" and q and not model:
+            value = exit_return(trades["odds"].to_numpy(dtype=float), q, side, commission) * np.ones(n)
+            xo = np.full(n, float(q))
+        else:
+            value = cashout_value(trades, prob, m, commission) / risk
+            xo = model_exit_odds(trades, prob, m, side)
+        point = "ht" if ev.startswith("ht") else ev
+        labels = np.array([f"{EVENT_NAME[point]}: {OUTCOME_LABEL.get((point, o), o or '')}" for o in out], dtype=object)
+        cols.append((time, ok, value, labels, xo))
+    return cols
+
+
+def first_trigger(cols: list[tuple], which: str, threshold: float | None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Primo momento in cui la regola scatta: (tempo, rendimento, etichetta). threshold None = scatta sempre (quote);
+    altrimenti Take Profit se il rendimento e' >= soglia, Stop Loss se e' <= -soglia."""
+    if not cols:
+        return np.zeros(0), np.zeros(0), np.zeros(0, dtype=object), np.zeros(0)
+    n = len(cols[0][0])
+    best_t, best_v, best_x = np.full(n, np.inf), np.full(n, np.nan), np.full(n, np.nan)
+    best_l = np.full(n, "", dtype=object)
+    for time, ok, value, labels, xo in cols:
+        trig = ok & np.isfinite(value)
+        if threshold is not None:
+            with np.errstate(invalid="ignore"):
+                trig &= (value >= threshold) if which == "tp" else (value <= -threshold)
+        better = trig & (time < best_t)
+        best_t, best_v = np.where(better, time, best_t), np.where(better, value, best_v)
+        best_l, best_x = np.where(better, labels, best_l), np.where(better, xo, best_x)
+    return best_t, best_v, best_l, best_x
+
+
+def _thresholds(c: dict) -> tuple[float | None, float | None]:
     if c["method"] == "odds":
-        pnl, reason, label, xo = apply_quotes(t, points, c["quotes"], commission)
-        t["pnl"], t["cashout"], t["exit_point"], t["exit_odds"] = pnl, reason, label, xo
-        t["trade_won"] = t["pnl"] > 0
-        t["equity"] = np.cumsum(t["pnl"].to_numpy())
-        return t
-    vals = checkpoint_values(t, points, c["margin_pct"], commission)
+        return None, None
+    return c["tp"] / 100, c["sl"] / 100
+
+
+def resolve(trades: pd.DataFrame, cfg: dict, model: bool = False) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Applica le due regole: vale quella che scatta per prima. Ritorna (profitto, motivo, momento, quota di uscita).
+    `model=True`: stesse regole ma uscita alla quota stimata di ogni operazione (confronto realistico)."""
+    c = settings(cfg)
+    n = len(trades)
+    hold = trades["pnl"].to_numpy(dtype=float)
+    risk = trades["risk"].to_numpy(dtype=float)
+    thr_tp, thr_sl = _thresholds(c)
+    inf = (np.full(n, np.inf), np.full(n, np.nan), np.full(n, "", dtype=object), np.full(n, np.nan))
+    tp = first_trigger(rule_columns(trades, cfg, "tp", model=model), "tp", thr_tp) if rule_active(c, "tp") else inf
+    sl = first_trigger(rule_columns(trades, cfg, "sl", model=model), "sl", thr_sl) if rule_active(c, "sl") else inf
+    use_tp = np.isfinite(tp[0]) & (tp[0] < sl[0])
+    use_sl = np.isfinite(sl[0]) & (sl[0] <= tp[0])
+    pnl = np.where(use_tp, tp[1] * risk, np.where(use_sl, sl[1] * risk, hold))
+    reason = np.where(use_tp, "tp", np.where(use_sl, "sl", "")).astype(object)
+    label = np.where(use_tp, tp[2], np.where(use_sl, sl[2], "fine partita")).astype(object)
+    xo = np.where(use_tp, tp[3], np.where(use_sl, sl[3], np.nan))
+    return pnl, reason, label, xo
+
+
+def model_benchmark(trades: pd.DataFrame, cfg: dict) -> dict:
+    """Stesse regole ma uscendo alla quota stimata di ogni operazione: ROI (%), scarto rispetto a tenere fino alla fine
+    (punti di ROI) e suo errore standard. Con margine zero, se la stima e' giusta per questo piano, lo scarto vale zero
+    piu' il rumore: |scarto| entro circa 2 errori standard e' compatibile con una stima corretta."""
+    nan = {"roi": float("nan"), "gap": float("nan"), "se": float("nan")}
+    if trades.empty or "pnl_hold" not in trades.columns:
+        return nan
+    t = trades.assign(pnl=trades["pnl_hold"])
+    pnl, *_ = resolve(t, cfg, model=True)
     risk = t["risk"].to_numpy(dtype=float)
-    v, reason, k = apply_tpsl(vals, hold / risk, c["tp"], c["sl"])
-    t["pnl"] = v * risk
-    t["cashout"] = reason
-    t["exit_point"] = [CHECKPOINT_LABEL[points[i]] if i >= 0 else "fine partita" for i in k]
+    diff = pnl - t["pnl"].to_numpy(dtype=float)
+    n = len(diff)
+    se = float(np.std(diff, ddof=1) * np.sqrt(n) / risk.sum() * 100) if n > 1 else float("nan")
+    return {"roi": float(pnl.sum() / risk.sum() * 100), "gap": float(diff.sum() / risk.sum() * 100), "se": se}
+
+
+def apply(trades: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    """Uscita sulle operazioni a livello di match. Aggiunge `pnl_hold` (tenendo fino alla fine), `cashout`
+    ('', 'tp', 'sl'), `exit_point` (momento ed esito), `exit_odds` e ricalcola `pnl`, `trade_won`, `equity`."""
+    t = trades.copy()
+    t["pnl_hold"] = t["pnl"].to_numpy(dtype=float)
+    if t.empty or not is_active(cfg):
+        t["cashout"], t["exit_point"], t["exit_odds"] = "", "", np.nan
+        return t
+    pnl, reason, label, xo = resolve(t, cfg)
+    t["pnl"], t["cashout"], t["exit_point"], t["exit_odds"] = pnl, reason, label, xo
     t["trade_won"] = t["pnl"] > 0
     t["equity"] = np.cumsum(t["pnl"].to_numpy())
     return t
 
 
+def rule_estimate(trades: pd.DataFrame, cfg: dict, which: str) -> dict:
+    """Per la regola: quante operazioni vedono l'evento dopo l'ingresso, quota equa mediana stimata dal modello in quel
+    momento e quota di ingresso mediana di quelle operazioni."""
+    c = settings(cfg)
+    cols = rule_columns(trades, cfg, which) if c[f"{which}_event"] not in ("off", "all") else []
+    if not cols:
+        return {"n": 0, "est": np.nan, "entry": np.nan}
+    t0 = trades["entry_t"].to_numpy(dtype=float) if "entry_t" in trades.columns else np.zeros(len(trades))
+    ev = c[f"{which}_event"]
+    side = _side(trades, cfg)
+    _, ok, prob, _ = event_data(trades, ev, np.where(np.isfinite(t0), t0, 0.0), rule_outcome(ev, which, side))
+    m = ok & np.isfinite(prob) & (prob > 0)
+    out = {"n": int(ok.sum()), "est": float(np.median(1 / prob[m])) if m.any() else np.nan,
+           "entry": float(np.median(trades["odds"].to_numpy(dtype=float)[ok])) if ok.any() else np.nan, "unreal_pct": np.nan}
+    q = c[f"{which}_quote"]
+    if q and m.any():
+        # partite in cui la quota inserita rende oltre 10 punti di ROI piu' della quota stimata per quella partita
+        o = trades["odds"].to_numpy(dtype=float)[m]
+        comm = float(cfg.get("commission") or 0.0)
+        gap = exit_return(o, q, side, comm) - exit_return(o, 1 / prob[m], side, comm)
+        out["unreal_pct"] = float((gap > 0.10).mean() * 100)
+    return out
+
+
+def quotes_grid(trades: pd.DataFrame, cfg: dict, tp_quotes, sl_quotes) -> pd.DataFrame:
+    """ROI (%) per ogni coppia di quote di uscita (righe = quota Stop Loss, colonne = quota Take Profit, 0 = regola
+    spenta). Quali operazioni escono e quando non dipende dalla quota, solo il rendimento."""
+    c = settings(cfg)
+    if trades.empty:
+        return pd.DataFrame()
+    n = len(trades)
+    hold = trades["pnl_hold"].to_numpy(dtype=float) if "pnl_hold" in trades.columns else trades["pnl"].to_numpy(dtype=float)
+    risk = trades["risk"].to_numpy(dtype=float)
+    entry = trades["odds"].to_numpy(dtype=float)
+    side, comm = _side(trades, cfg), float(cfg.get("commission") or 0.0)
+    on = {**cfg, "cashout": {**c, "tp_quote": 2.0, "sl_quote": 2.0}}      # quote fittizie: servono solo i tempi
+    t_tp = first_trigger(rule_columns(trades, on, "tp"), "tp", None)[0] if c["tp_event"] != "off" else np.full(n, np.inf)
+    t_sl = first_trigger(rule_columns(trades, on, "sl"), "sl", None)[0] if c["sl_event"] != "off" else np.full(n, np.inf)
+    gain = lambda m, q: float((exit_return(entry[m], q, side, comm) * risk[m]).sum())
+    out = np.full((len(sl_quotes), len(tp_quotes)), np.nan)
+    for i, qs in enumerate(sl_quotes):
+        for j, qt in enumerate(tp_quotes):
+            a = np.where(qt, t_tp, np.inf)
+            b = np.where(qs, t_sl, np.inf)
+            m_tp, m_sl = np.isfinite(a) & (a < b), np.isfinite(b) & (b <= a)
+            total = hold[~(m_tp | m_sl)].sum() + (gain(m_tp, qt) if qt else 0.0) + (gain(m_sl, qs) if qs else 0.0)
+            out[i, j] = total / risk.sum() * 100
+    return pd.DataFrame(out, index=list(sl_quotes), columns=list(tp_quotes))
+
+
+def pct_grid(trades: pd.DataFrame, cfg: dict, tps, sls) -> pd.DataFrame:
+    """ROI (%) per ogni coppia di soglie percentuali (righe = Stop Loss, colonne = Take Profit, 0 = spenta)."""
+    c = settings(cfg)
+    if trades.empty:
+        return pd.DataFrame()
+    n = len(trades)
+    hold = trades["pnl_hold"].to_numpy(dtype=float) if "pnl_hold" in trades.columns else trades["pnl"].to_numpy(dtype=float)
+    risk = trades["risk"].to_numpy(dtype=float)
+    cols_tp = rule_columns(trades, cfg, "tp") if c["tp_event"] != "off" else []
+    cols_sl = rule_columns(trades, cfg, "sl") if c["sl_event"] != "off" else []
+    none = (np.full(n, np.inf), np.full(n, np.nan))
+    tp_hits = {v: first_trigger(cols_tp, "tp", v / 100)[:2] if v and cols_tp else none for v in tps}
+    sl_hits = {v: first_trigger(cols_sl, "sl", v / 100)[:2] if v and cols_sl else none for v in sls}
+    out = np.full((len(sls), len(tps)), np.nan)
+    for i, s_ in enumerate(sls):
+        for j, t_ in enumerate(tps):
+            (a, va), (b, vb) = tp_hits[t_], sl_hits[s_]
+            m_tp, m_sl = np.isfinite(a) & (a < b), np.isfinite(b) & (b <= a)
+            pnl = np.where(m_tp, va * risk, np.where(m_sl, vb * risk, hold))
+            out[i, j] = pnl.sum() / risk.sum() * 100
+    return pd.DataFrame(out, index=list(sls), columns=list(tps))
+
+
 def tpsl_grid(values: np.ndarray, hold: np.ndarray, risk: np.ndarray, tps, sls) -> pd.DataFrame:
-    """ROI (%) per ogni coppia di soglie. Righe = Stop Loss, colonne = Take Profit (0 = disattivo)."""
+    """ROI (%) per ogni coppia di soglie su una matrice di valori (scalping punto per punto)."""
     out = np.full((len(sls), len(tps)), np.nan)
     for i, sl in enumerate(sls):
         for j, tp in enumerate(tps):
@@ -543,10 +827,11 @@ def tpsl_grid(values: np.ndarray, hold: np.ndarray, risk: np.ndarray, tps, sls) 
 
 
 def summary(trades: pd.DataFrame) -> pd.DataFrame:
-    """Effetto del cash out per motivo e momento: operazioni, profitto ottenuto e profitto tenendo fino alla fine."""
+    """Effetto dell'uscita per motivo e momento: operazioni, quote, ROI all'uscita, profitto ottenuto e tenendo fino alla fine."""
+    cols = ["esito", "momento", "operazioni", "quota_pct", "quota_ingresso", "quota_uscita", "roi_uscita_pct", "profitto",
+            "profitto_tenendo", "differenza"]
     if "cashout" not in trades.columns or trades.empty:
-        return pd.DataFrame(columns=["esito", "momento", "operazioni", "quota_pct", "quota_ingresso", "quota_uscita",
-                                     "roi_uscita_pct", "profitto", "profitto_tenendo", "differenza"])
+        return pd.DataFrame(columns=cols)
     point = trades["exit_point"].astype(object) if "exit_point" in trades.columns else pd.Series("", index=trades.index, dtype=object)
     n = pd.to_numeric(point.astype(str).str.extract(r"^dopo (\d+) punt", expand=False), errors="coerce")
     point = point.where(n.isna(), np.select([n <= 3, n <= 6], ["durante il game: punti 1-3", "durante il game: punti 4-6"],
@@ -560,5 +845,5 @@ def summary(trades: pd.DataFrame) -> pd.DataFrame:
     out.insert(4, "roi_uscita_pct", out["profitto"] / out.pop("rischio") * 100)
     out["differenza"] = out["profitto"] - out["profitto_tenendo"]
     out = out.rename_axis(["esito", "momento"]).reset_index()
-    order = {v: i for i, v in enumerate(REASONS.values())}
-    return out.sort_values(["esito", "momento"], key=lambda c: c.map(order) if c.name == "esito" else c).reset_index(drop=True)
+    order = {v: i for i, v in enumerate(["Take Profit", "Stop Loss", "Tenuta fino alla fine"])}
+    return out.sort_values(["esito", "momento"], key=lambda c: c.map(order) if c.name == "esito" else c).reset_index(drop=True)[cols]

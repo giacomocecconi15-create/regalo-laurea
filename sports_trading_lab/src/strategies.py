@@ -396,7 +396,9 @@ def scan(upload: pd.DataFrame, vault: dict, bankroll: float, con=None, method: s
         if sel["odds"].isna().all():
             notes.append(f"'{name}': nel CSV mancano le quote per il mercato {market}.")
             continue
-        live = {k: v for k, v in cfg.items() if k not in ("date_from", "date_to", "exclude_retirements")}
+        # le partite di oggi: niente limiti di data ne' adjustment fatti sullo storico (anni o partite esclusi a mano)
+        live = {k: v for k, v in cfg.items() if k not in ("date_from", "date_to", "exclude_retirements", "exclude_years",
+                                                         "exclude_matches", "live_odds_min", "live_odds_max")}
         live["filters"] = {}
         conds = []
         for col, rule in (cfg.get("filters") or {}).items():
