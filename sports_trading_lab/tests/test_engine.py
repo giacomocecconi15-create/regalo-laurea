@@ -1739,7 +1739,8 @@ def test_pressure_entry_back_and_lay_use_the_same_estimate(con):
     assert abs(back["live_prob"].mean() - back["won"].mean()) < 0.015                  # nessun errore di stima a favore di un lato
     # senza margine il valore atteso secondo la stima e' zero per entrambi i lati
     zb = bt.backtest_selections(sel, {**cfg, "side": "back", "live_margin": 0.0}).trades
-    assert (zb["live_prob"] * zb["odds"] - 1).abs().max() < 0.011
+    inside = zb["odds"] < 1000                                                          # sotto il tetto della scala di quote
+    assert (zb.loc[inside, "live_prob"] * zb.loc[inside, "odds"] - 1).abs().max() < 0.011
 
 
 @needs_db
