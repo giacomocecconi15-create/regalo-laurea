@@ -217,7 +217,7 @@ def entry_valid(cfg: dict, event: str) -> bool:
         return True
     if entry == "set1":
         return False
-    if entry == "press":
+    if entry in ("press", "pressing"):
         return True                  # dipende dal momento della pressione: gli eventi gia' passati vengono ignorati
     if entry == "cbreak":
         return point == "set1"

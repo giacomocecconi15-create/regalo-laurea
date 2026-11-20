@@ -162,7 +162,8 @@ def queue_cfg(cfg: dict) -> None:
 
 ENTRY_OPTIONS = {
     "tennis": {"pre": "Pre-partita", "break_made": "Dopo il primo break fatto", "break_suffered": "Dopo il primo break subito",
-               "set1_won": "Dopo il primo set vinto", "set1_lost": "Dopo il primo set perso", "press": "Quando va sotto pressione"},
+               "set1_won": "Dopo il primo set vinto", "set1_lost": "Dopo il primo set perso", "press": "Quando va sotto pressione",
+               "pressing": "Quando mette sotto pressione"},
     "1x2": {"pre": "Pre-partita", "ht_lead": "All'intervallo in vantaggio", "ht_draw": "All'intervallo sul pari",
             "ht_trail": "All'intervallo in svantaggio"},
     "ou25": {"pre": "Pre-partita", "ht_0": "All'intervallo con 0 gol", "ht_1": "All'intervallo con 1 gol", "ht_2": "All'intervallo con 2 gol"},
@@ -170,13 +171,14 @@ ENTRY_OPTIONS = {
 ENTRY_FILTERS = {"break_made": ("ip_break1", "Fatto"), "break_suffered": ("ip_break1", "Subito"), "set1_won": ("ip_set1", "Vinto"),
                  "set1_lost": ("ip_set1", "Perso"), "ht_lead": ("ip_ht_sel", "In vantaggio"), "ht_draw": ("ip_ht", "Pari"),
                  "ht_trail": ("ip_ht_sel", "In svantaggio"), "ht_0": ("ip_ht_goals", "0"), "ht_1": ("ip_ht_goals", "1"),
-                 "ht_2": ("ip_ht_goals", "2"), "press": ("ip_press", "Sì")}
+                 "ht_2": ("ip_ht_goals", "2"), "press": ("ip_press", "Sì"), "pressing": ("ip_pressing", "Sì")}
 
 
 EVENT_OPTIONS = {
     "tennis": {"pre": "Pre-partita (entrambi i giocatori)", "break_made": "Su chi fa il primo break",
                "break_suffered": "Su chi subisce il primo break", "set1_won": "Su chi vince il primo set",
-               "set1_lost": "Su chi perde il primo set", "press": "Su chi va sotto pressione"},
+               "set1_lost": "Su chi perde il primo set", "press": "Su chi va sotto pressione",
+               "pressing": "Su chi mette sotto pressione"},
     "1x2": {"pre": "Pre-partita (tutte le selezioni)", "ht_lead": "Sulla squadra in vantaggio all'intervallo",
             "ht_draw": "Sulle squadre in parità all'intervallo", "ht_trail": "Sulla squadra in svantaggio all'intervallo"},
 }
@@ -246,6 +248,7 @@ def apply_pending() -> None:
     ss["bt_live_min"], ss["bt_live_max"] = cfg.get("live_odds_min"), cfg.get("live_odds_max")
     ss["bt_excl_years"] = sorted(int(y) for y in cfg.get("exclude_years") or [])
     ss["bt_excl_matches"] = [str(m) for m in cfg.get("exclude_matches") or []]
+    ss["bt_odds_adj"] = {str(k): float(v) for k, v in (cfg.get("odds_adjust") or {}).items()}
     ss[f"bt_entry_{sport}_{market}"] = entry_from_filters(sport, market, cfg.get("filters") or {})
     if c.get("legacy_manual"):
         ss["_legacy_note"] = ("Questa strategia era salvata con il vecchio cash out a frequenze, che non esiste più: il cash out è "
@@ -961,7 +964,8 @@ STAT_COLS = {
 
 def trades_table(trades: pd.DataFrame, sport: str) -> pd.DataFrame:
     cols = TRADE_COLS[sport] + ["score", "pp", "set_no", "game_no", "role", "held", "side", "pre_odds", "book_odds", "odds", "live_prob",
-                                "close_odds", "clv_pct", "won", "risk", "cashout", "exit_point", "exit_odds", "pnl_hold", "pnl", "equity"]
+                                "model_odds", "odds_adj", "close_odds", "clv_pct", "won", "risk", "cashout", "exit_point", "exit_odds",
+                                "pnl_hold", "pnl", "equity"]
     trades = trades.assign(pp=np.where(trades["_pp"].fillna(False).astype(bool), "sì", "")) if "_pp" in trades.columns else trades
     out = trades[[c for c in cols if c in trades.columns]].copy()
     out["date"] = out["date"].dt.date
@@ -1508,6 +1512,31 @@ def match_dialog(trade: dict, cfg: dict) -> None:
     else:
         football_detail(trade, rec)
     st.divider()
+    key = f"{mid}|{trade.get('player') if trade.get('player') is not None else trade.get('selection')}"
+    adj = dict(ss.get("bt_odds_adj") or {})
+    model = trade.get("model_odds")
+    model = float(model) if model is not None and model == model else float(trade.get("odds") or 0)
+    if "|" not in str(trade.get("match_id", "")):           # non per lo scalping (operazioni game per game)
+        st.markdown("**Correggi la quota di ingresso** (adjustment)")
+        q1, q2, q3 = st.columns([1, 1, 2])
+        newq = q1.number_input("Quota corretta", min_value=1.01, max_value=1000.0, value=float(min(max(adj.get(key, model), 1.01), 1000.0)), step=0.01,
+                               format="%.2f", key=f"adjq_{key}",
+                               help="Per esempio la quota che c'era davvero in quel momento. Sostituisce quella stimata in tutta "
+                                    "l'analisi: profitto, uscite, quota live mediana.")
+        if q2.button("Applica", icon=":material/edit:", width="stretch"):
+            adj[key] = round(float(newq), 2)
+            ss["bt_odds_adj"] = adj
+            st.rerun()
+        if key in adj:
+            if q2.button("Torna alla stimata", icon=":material/undo:", width="stretch"):
+                adj.pop(key, None)
+                ss["bt_odds_adj"] = adj
+                st.rerun()
+            q3.caption(f"Quota stimata dal modello: **{model:.2f}**, corretta a mano: **{adj[key]:.2f}**.")
+        else:
+            live_entry = trade.get("pre_odds") == trade.get("pre_odds") and bool(trade.get("pre_odds"))
+            q3.caption(f"Quota attuale: **{model:.2f}** (" + ("stimata dal modello al momento dell'ingresso" if live_entry
+                                                             else "pre-partita") + ").")
     c1, c2 = st.columns([1, 2])
     if c1.button("Escludi questa partita", icon=":material/block:", type="primary", width="stretch"):
         ss["bt_excl_matches"] = sorted(set(ss.get("bt_excl_matches") or []) | {mid})
@@ -1523,7 +1552,7 @@ def tab_trades(cfg: dict, trades: pd.DataFrame) -> None:
         st.caption(f"Mostrate le ultime {num_it(MAX_TABLE_ROWS)} operazioni su {num_it(len(table))}; l'esportazione le contiene tutte.")
     st.caption(":material/touch_app: Clicca una riga per aprire la scheda della partita: risultato, statistiche e, quando registrato, "
                "il punto per punto game per game con la quota stimata. Dalla scheda puoi escludere la partita (adjustment).")
-    n_ex = len(ss.get("bt_excl_matches") or [])
+    n_ex = len(ss.get("bt_excl_matches") or []) * 1000 + len(ss.get("bt_odds_adj") or {})
     event = st.dataframe(shown, hide_index=True, width="stretch", height=460, on_select="rerun", selection_mode="single-row",
                          key=f"trades_tbl_{n_ex}_{len(trades)}", column_config={
         "odds": st.column_config.NumberColumn("quota", format="%.2f"), "close_odds": st.column_config.NumberColumn("chiusura", format="%.2f"),
@@ -1534,6 +1563,8 @@ def tab_trades(cfg: dict, trades: pd.DataFrame) -> None:
         "pnl_hold": st.column_config.NumberColumn("pnl tenendo", format="%.3f"),
         "exit_odds": st.column_config.NumberColumn("quota uscita", format="%.2f"),
         "score": st.column_config.TextColumn("risultato"), "pp": st.column_config.TextColumn("punto per punto"),
+        "model_odds": st.column_config.NumberColumn("quota stimata", format="%.2f"),
+        "odds_adj": st.column_config.CheckboxColumn("quota corretta"),
         "form10": st.column_config.NumberColumn(format="%.0f"), "form_surf": st.column_config.NumberColumn(format="%.0f"),
         "home_ppg5": st.column_config.NumberColumn(format="%.1f"), "away_ppg5": st.column_config.NumberColumn(format="%.1f"),
     })
@@ -1687,6 +1718,11 @@ def entry_cashout_panel(cfg: dict) -> tuple[dict, object]:
             st.caption(":material/swap_horiz: Nessun lato fisso nella *Selezione*: in ogni partita operi sul "
                        + ("giocatore" if sport == "tennis" else "la squadra") + " che vive l'evento scelto. Il range di quota del "
                        "pannello vale sulla sua quota pre-partita; *Punta* o *Banca* restano quelli scelti a sinistra.")
+        if entry == "pressing":
+            st.caption(":material/compress: *Mette sotto pressione*: l'avversario tiene due turni di servizio consecutivi dello "
+                       "stesso set solo dopo palle break o vantaggi, cioè il giocatore spinge ma non riesce a breakkare. Si entra "
+                       "alla fine del secondo turno, alla quota live stimata (stessa taratura di *sotto pressione*, vista dal lato "
+                       "di chi spinge). Solo match registrati punto per punto.")
         if entry == "press":
             st.caption(":material/compress: *Sotto pressione*: il giocatore tiene due turni di servizio consecutivi dello stesso set "
                        "affrontando palle break o arrivando ai vantaggi (40-40) in entrambi. Si entra alla fine del secondo, alla "
@@ -1822,11 +1858,14 @@ def with_adjustments(cfg: dict) -> dict:
     """Aggiunge alla strategia gli adjustment (anni e partite esclusi a mano), validi in tutte le viste."""
     years = sorted(int(y) for y in ss.get("bt_excl_years") or [])
     matches = [str(m) for m in ss.get("bt_excl_matches") or []]
-    out = {k: v for k, v in cfg.items() if k not in ("exclude_years", "exclude_matches")}
+    adj = {str(k): round(float(v), 2) for k, v in (ss.get("bt_odds_adj") or {}).items()}
+    out = {k: v for k, v in cfg.items() if k not in ("exclude_years", "exclude_matches", "odds_adjust")}
     if years:
         out["exclude_years"] = years
     if matches:
         out["exclude_matches"] = matches
+    if adj:
+        out["odds_adjust"] = dict(sorted(adj.items()))
     return out
 
 
@@ -1834,10 +1873,11 @@ def adjustment_panel(cfg: dict, sel: pd.DataFrame) -> None:
     """Riquadro degli adjustment: anni e partite tolti dall'analisi, con ripristino."""
     years = sorted(int(y) for y in ss.get("bt_excl_years") or [])
     matches = [str(m) for m in ss.get("bt_excl_matches") or []]
-    label = "Adjustment: togli anni o partite dall'analisi"
-    if years or matches:
+    adj = dict(ss.get("bt_odds_adj") or {})
+    label = "Adjustment: togli anni o partite, correggi le quote"
+    if years or matches or adj:
         label = (f"Adjustment attivo · anni esclusi: {', '.join(map(str, years)) or 'nessuno'} · "
-                 f"partite escluse: {len(matches)}")
+                 f"partite escluse: {len(matches)} · quote corrette: {len(adj)}")
     with st.expander(label, icon=":material/tune:", expanded=False):
         all_years = sorted(int(y) for y in sel["date"].dt.year.dropna().unique())
         a, b = st.columns([2, 1])
@@ -1849,9 +1889,19 @@ def adjustment_panel(cfg: dict, sel: pd.DataFrame) -> None:
         if sorted(new_years) != years:
             ss["bt_excl_years"] = sorted(new_years)
             st.rerun()
-        if b.button("Ripristina tutto", icon=":material/restart_alt:", disabled=not (years or matches), width="stretch"):
-            ss["bt_excl_years"], ss["bt_excl_matches"] = [], []
+        if b.button("Ripristina tutto", icon=":material/restart_alt:", disabled=not (years or matches or adj), width="stretch"):
+            ss["bt_excl_years"], ss["bt_excl_matches"], ss["bt_odds_adj"] = [], [], {}
             st.rerun()
+        if adj:
+            names = sel.assign(_k=bt.trade_key(sel)).drop_duplicates("_k").set_index("_k")
+            fmt_a = lambda k: (f"{names.at[k, 'date']:%d/%m/%Y} · {names.at[k, 'event']} · "
+                               f"{names.at[k, 'player'] if 'player' in names.columns else names.at[k, 'selection']} → {adj[k]:.2f}"
+                               if k in names.index else f"{k} → {adj[k]:.2f}")
+            keep_a = st.multiselect("Quote corrette a mano (togli la spunta per tornare alla quota stimata)", list(adj),
+                                    default=list(adj), format_func=fmt_a, key=f"adj_odds_{len(adj)}")
+            if len(keep_a) != len(adj):
+                ss["bt_odds_adj"] = {k: adj[k] for k in keep_a}
+                st.rerun()
         if matches:
             names = sel.drop_duplicates("match_id").set_index("match_id")
             fmt = lambda m: (f"{names.at[m, 'date']:%d/%m/%Y} · {names.at[m, 'event']}" if m in names.index else m)

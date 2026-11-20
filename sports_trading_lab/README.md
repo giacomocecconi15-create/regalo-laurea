@@ -38,7 +38,7 @@ Uso manuale:
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python src/update_data.py        # scarica / aggiorna il database
-.venv/bin/python -m pytest tests -q        # 96 test
+.venv/bin/python -m pytest tests -q        # 97 test
 .venv/bin/python -m streamlit run app.py   # dashboard
 ```
 
@@ -210,7 +210,8 @@ svantaggio all'intervallo.
 
 **Quando entri.** Tennis: pre-partita, dopo il primo break fatto o subito, dopo il primo set vinto o perso, quando il
 giocatore va **sotto pressione** (tiene due turni di servizio consecutivi dello stesso set affrontando palle break o
-arrivando ai vantaggi in entrambi; si entra alla fine del secondo, solo match punto per punto). Calcio 1X2:
+arrivando ai vantaggi in entrambi; si entra alla fine del secondo, solo match punto per punto) oppure quando **mette
+sotto pressione** l'avversario (lo stesso momento visto dall'altro lato: spinge ma non riesce a breakkare). Calcio 1X2:
 pre-partita, all'intervallo in vantaggio, sul pari o in svantaggio. Over/Under: pre-partita o all'intervallo con 0, 1,
 2 gol. Il primo set vale per tutti i match completati (un ritiro a metà primo set lascia il dato vuoto); il primo break
 esiste solo per i match registrati punto per punto (circa uno su cinque, soprattutto nei tornei maggiori). La squadra
@@ -354,7 +355,10 @@ numeri per poterli rimettere. Nella vista *Operazioni* si clicca una riga e si a
 risultato dal punto di vista del giocatore, statistiche ufficiali dei due giocatori (ace, doppi falli, prime, punti vinti,
 palle break salvate, quote) e, per i match registrati punto per punto, la sequenza game per game con il punteggio dopo ogni
 punto, palle break, vantaggi, eventi (primo break, controbreak, sotto pressione) e probabilità e quota stimate dopo ogni
-game, con il grafico. Dalla scheda *Escludi questa partita* la toglie dall'analisi. Il riquadro **Adjustment** sopra i
+game, con il grafico. Dalla scheda *Escludi questa partita* la toglie dall'analisi, e *Correggi la quota di ingresso*
+sostituisce la quota stimata (o pre-partita) di quella operazione con quella che indichi, per esempio la quota che c'era
+davvero: la correzione vale in tutta l'analisi (profitto, uscite, quota live mediana del Riepilogo) e la tabella
+Operazioni mostra quota stimata e quota corretta. Il riquadro **Adjustment** sopra i
 risultati mostra le esclusioni e permette di ripristinarle; le esclusioni vengono salvate con la strategia ma lo scanner
 delle partite di oggi le ignora. Togliere a posteriori gli anni o le partite peggiori gonfia il risultato: va fatto solo
 con un motivo (dati incompleti, stagione anomala, regole diverse).

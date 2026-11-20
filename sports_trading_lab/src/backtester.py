@@ -86,6 +86,7 @@ FILTERS = {
         ("ip_break1", "Primo break del primo set", "In partita", "cat"),
         ("ip_cbreak", "Controbreak nel primo set", "In partita", "cat"),
         ("ip_press", "Sotto pressione (due turni di servizio tenuti con palle break o ai vantaggi)", "In partita", "cat"),
+        ("ip_pressing", "Mette sotto pressione l'avversario senza breakkarlo", "In partita", "cat"),
         ("rank_adv", "Vantaggio di ranking (avversario - giocatore)", "Confronto diretto", "num"),
         ("form_adv", "Vantaggio di form (punti %)", "Confronto diretto", "slider", -100, 100, 5),
         ("h2h_wins", "Precedenti vinti (dal 2019)", "Confronto diretto", "slider", 0, 15, 1),
@@ -135,7 +136,7 @@ FILTER_LABELS = {sp: {f[0]: (f[1] if f[2] in ("Torneo", "Competizione", "Calenda
 
 
 # condizioni note solo a partita iniziata: con questi filtri l'ingresso avviene dopo l'evento, a quota live stimata
-INPLAY = {"tennis": {"ip_set1", "ip_set1_tb", "ip_break1", "ip_cbreak", "ip_press"}, "football": {"ip_ht_sel", "ip_ht", "ip_ht_goals"}}
+INPLAY = {"tennis": {"ip_set1", "ip_set1_tb", "ip_break1", "ip_cbreak", "ip_press", "ip_pressing"}, "football": {"ip_ht_sel", "ip_ht", "ip_ht_goals"}}
 LIVE_MARGIN = 3.0          # margine di default sulle quote in partita (%)
 # Taratura delle probabilita' in partita sugli eventi punto per punto (Match Charting Project). Al logit della
 # probabilita' del modello a punti indipendenti dopo il game dell'evento si somma, dal punto di vista di chi fa
@@ -152,8 +153,9 @@ NBREAK_HISTORY = 0.191
 PRESS_CAL = (-0.121, -0.258)
 ENTRY_LABEL = {"set1": "dopo il primo set", "break1": "dopo il primo break (o a fine primo set se non c'e' break)",
                "cbreak": "dopo il controbreak nel primo set", "press": "quando il giocatore va sotto pressione",
+               "pressing": "quando il giocatore mette sotto pressione l'avversario",
                "ht": "all'intervallo"}
-POINT_EVENTS = {"break1", "cbreak", "press"}      # ingressi che esistono solo nei match registrati punto per punto
+POINT_EVENTS = {"break1", "cbreak", "press", "pressing"}      # ingressi che esistono solo nei match registrati punto per punto
 
 
 DRAW_PEAK, DRAW_WIDTH, ELO_HOME, ELO_SCALE = 0.29, 250.0, 55.0, 0.75   # tarati sullo storico (minima log-loss)
@@ -316,6 +318,9 @@ def tennis_selections(matches: pd.DataFrame, price: str = "avg") -> pd.DataFrame
                                  np.where(cbreaker == m[f"{b}_name"].map(_norm_name), 1 - _get(m, "cb_prob"), np.nan)),
             # sotto pressione: due turni di servizio consecutivi tenuti con palle break o ai vantaggi
             **_pressure(m, a, pa, pb, complete),
+            # chi mette sotto pressione: l'avversario e' andato sotto pressione (stesso momento, dal lato di chi spinge)
+            **{k.replace("ip_press", "ip_pressing").replace("_press_", "_pressing_"): v
+               for k, v in _pressure(m, b, pa, pb, complete).items()},
             "_breaks": np.where(complete, _get(m, "breaks"), None),
             "_pp": has_events,
             "score": m["score"].map(lambda sc: sc if won or not isinstance(sc, str) else _flip_score(sc)) if "score" in m.columns else None,
@@ -623,6 +628,8 @@ def entry_point(cfg: dict) -> str | None:
         return "ht"
     if "ip_press" in active:
         return "press"
+    if "ip_pressing" in active:
+        return "pressing"
     if active & {"ip_set1", "ip_set1_tb"}:
         return "set1"
     return "cbreak" if "ip_cbreak" in active else "break1"
@@ -637,8 +644,9 @@ def entry_time(sel: pd.DataFrame, point: str | None) -> np.ndarray:
         return np.full(n, 45.0)
     if point == "set1":
         return np.full(n, 199.0)
-    if point == "press":
-        return sel["_press_t"].to_numpy(dtype=float) if "_press_t" in sel.columns else np.full(n, np.nan)
+    if point in ("press", "pressing"):
+        col = "_press_t" if point == "press" else "_pressing_t"
+        return sel[col].to_numpy(dtype=float) if col in sel.columns else np.full(n, np.nan)
     col = "_cb_game" if point == "cbreak" else "_fb_game"
     g = sel[col].to_numpy(dtype=float) if col in sel.columns else np.full(n, np.nan)
     return np.where(np.isfinite(g), 100 + g, 199.0 if point == "break1" else np.nan)
@@ -672,14 +680,18 @@ def live_prob(sel: pd.DataFrame, point: str) -> np.ndarray:
         return cashout.football_checkpoint_prob(sel)
     n = len(sel)
     bo = sel["best_of"].to_numpy(dtype=float) if "best_of" in sel.columns else np.full(n, 3.0)
-    if point == "press":
-        pp = sel["_press_prob"].to_numpy(dtype=float) if "_press_prob" in sel.columns else np.full(n, np.nan)
-        x0 = _logit(fair_prob(sel))
+    if point in ("press", "pressing"):
+        # la stima e' sempre quella del giocatore sotto pressione; per chi lo mette sotto pressione e' il complemento
+        mine = point == "press"
+        pcol, flag = ("_press_prob", "ip_press") if mine else ("_pressing_prob", "ip_pressing")
+        pp = sel[pcol].to_numpy(dtype=float) if pcol in sel.columns else np.full(n, np.nan)
+        x0 = _logit(fair_prob(sel)) * (1 if mine else -1)          # forza pre-partita del giocatore sotto pressione
         z = _logit(pp) + PRESS_CAL[0] + PRESS_CAL[1] * x0
         ok = np.isfinite(pp) & np.isfinite(x0)
-        if "ip_press" in sel.columns:
-            ok &= sel["ip_press"].to_numpy() == "Sì"
-        return np.where(ok, 1 / (1 + np.exp(-z)), np.nan)
+        if flag in sel.columns:
+            ok &= sel[flag].to_numpy() == "Sì"
+        p_pressed = 1 / (1 + np.exp(-z))
+        return np.where(ok, p_pressed if mine else 1 - p_pressed, np.nan)
     if point == "cbreak":
         st_ = sel["ip_cbreak"].to_numpy() if "ip_cbreak" in sel.columns else np.full(n, None)
         sign = np.where(st_ == "Fatto", 1.0, np.where(st_ == "Subito", -1.0, np.nan))
@@ -700,7 +712,28 @@ def live_odds(p: np.ndarray, side: str, margin_pct: float) -> np.ndarray:
     piu' alta per chi banca)."""
     m = margin_pct / 100
     fair = 1 / np.clip(p, 1e-4, 1)
-    return np.maximum(fair * (1 - m), 1.01) if side == "back" else np.maximum(fair * (1 + m), 1.01)
+    q = fair * (1 - m) if side == "back" else fair * (1 + m)
+    return np.clip(q, 1.01, 1000.0)            # limiti della scala di quote dell'exchange
+
+
+def trade_key(df: pd.DataFrame) -> pd.Series:
+    """Chiave di un'operazione: partita + giocatore (tennis) o partita + esito (calcio)."""
+    who = df["player"] if "player" in df.columns else df["selection"]
+    return df["match_id"].astype(str) + "|" + who.astype(str)
+
+
+def apply_odds_adjust(picked: pd.DataFrame, adjust: dict | None) -> pd.DataFrame:
+    """Quote di ingresso corrette a mano partita per partita (adjustment): sostituiscono la quota stimata o pre-partita
+    e valgono per tutta l'analisi (profitto, uscite, quota live mediana). `model_odds` conserva quella originale."""
+    picked = picked.assign(model_odds=picked["odds"], odds_adj=False)
+    if not adjust or picked.empty:
+        return picked
+    new = trade_key(picked).map({str(k): float(v) for k, v in adjust.items() if v and float(v) > 1})
+    m = new.notna().to_numpy()
+    if m.any():
+        picked.loc[m, "odds"] = new[m].to_numpy()
+        picked.loc[m, "odds_adj"] = True
+    return picked
 
 
 def backtest_selections(sel: pd.DataFrame, cfg: dict, bankroll: float = 100.0, games: pd.DataFrame | None = None) -> BacktestResult:
@@ -742,6 +775,7 @@ def backtest_selections(sel: pd.DataFrame, cfg: dict, bankroll: float = 100.0, g
         # quota live: stimata dal modello, oppure quella inserita a mano (uguale per tutte le operazioni)
         odds = np.full(len(picked), override) if override else est
         picked = picked.assign(odds=odds, close_odds=np.nan, p_close=np.nan)
+    picked = apply_odds_adjust(picked, cfg.get("odds_adjust"))
     trades = settle(picked, side, float(cfg.get("commission") or 0.0),
                     cfg.get("lay_mode", "liability"), float(cfg.get("stake") or 1.0))
     if co_cfg["mode"] == "tpsl" and co_cfg["method"] == "scalping":
@@ -923,6 +957,7 @@ def conditional_stats(base: pd.DataFrame, sport: str, side: str = "back", margin
     groups = {"tennis": [("ip_set1", "set1", "Primo set"), ("ip_break1", "break1", "Primo break del primo set"),
                          ("ip_cbreak", "cbreak", "Controbreak nel primo set"),
                          ("ip_press", "press", "Sotto pressione (due turni di servizio tenuti con palle break o ai vantaggi)"),
+                         ("ip_pressing", "pressing", "Mette sotto pressione l'avversario (senza breakkarlo)"),
                          ("ip_set1_tb", "set1", "Primo set al tie-break")],
               "football": [("ip_ht_sel", "ht", "Squadra scelta all'intervallo"), ("ip_ht", "ht", "Risultato all'intervallo"),
                            ("ip_ht_goals", "ht", "Gol nel primo tempo")]}[sport]

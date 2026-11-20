@@ -1756,3 +1756,26 @@ def test_separate_take_profit_and_stop_loss_events_on_real_matches(con):
     assert abs(check["gap"]) <= 2 * check["se"] + 0.5                                  # uscita a quota stimata ~ tenere
     excl = bt.run_backtest({**base, "exclude_years": [2020], "exclude_matches": [t["match_id"].iloc[0]]}, con).trades
     assert not (excl["date"].dt.year == 2020).any() and t["match_id"].iloc[0] not in set(excl["match_id"])
+
+
+def test_pressing_side_and_per_trade_odds_adjustment():
+    g = _games(["1111", "0000", "0000", "11100011", "1111", "11100011"])
+    ev = sc.build_events(g).reset_index(drop=True)
+    m = tennis_frame().iloc[[0]].assign(match_id="m1", winner_name="A B", loser_name="C D", score="6-4 6-2", status="Completed")
+    for col in sc.EVENT_COLUMNS[1:]:
+        m[col] = ev[col].iloc[0]
+    m["_ev_match"] = "m1"
+    s = bt.tennis_selections(m, "avg")
+    x = s.set_index("player")
+    # C D va sotto pressione nel game 6: A B e' chi lo mette sotto pressione, nello stesso momento
+    assert x.loc["A B", "ip_pressing"] == "Sì" and x.loc["C D", "ip_pressing"] == "No" and x.loc["A B", "_pressing_t"] == 106
+    assert bt.entry_point({"sport": "tennis", "filters": {"ip_pressing": {"in": ["Sì"]}}}) == "pressing"
+    press = bt.live_prob(s[s["player"] == "C D"], "press")[0]
+    pressing = bt.live_prob(s[s["player"] == "A B"], "pressing")[0]
+    assert pressing == pytest.approx(1 - press)                       # stessa stima vista dai due lati
+    # correzione della quota di una sola operazione: vale per profitto, uscite e quota live mediana
+    sel = make_sel([2.0, 3.0], [True, True])
+    base = bt.backtest_selections(sel, {})
+    adj = bt.backtest_selections(sel, {"odds_adjust": {"m001|home": 2.5}}).trades
+    assert adj["odds"].tolist() == [2.0, 2.5] and adj["model_odds"].tolist() == [2.0, 3.0] and adj["odds_adj"].tolist() == [False, True]
+    assert adj["pnl"].sum() == pytest.approx(base.trades["pnl"].sum() - 0.5)
