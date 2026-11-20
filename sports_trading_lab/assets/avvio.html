@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sports Trading Lab</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { height: 100%; margin: 0; background: #080b11; color: #eef1f6;
+               font-family: Inter, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px;
+         padding: 0 24px; text-align: center; }
+  img { width: 72px; height: 72px; }
+  h1 { font-size: 22px; margin: 0; font-weight: 600; }
+  p { margin: 0; color: #8791a6; font-size: 14px; max-width: 460px; line-height: 1.5; }
+  .bar { width: 220px; height: 4px; border-radius: 2px; background: #161d2a; overflow: hidden; }
+  .bar span { display: block; width: 40%; height: 100%; background: #3987e5; animation: go 1.4s ease-in-out infinite; }
+  @keyframes go { from { transform: translateX(-100%); } to { transform: translateX(260%); } }
+  a { color: #3987e5; }
+</style>
+</head>
+<body>
+<main>
+  <img src="icon.png" alt="">
+  <h1>Sports Trading Lab</h1>
+  <div class="bar"><span></span></div>
+  <p id="msg">Avvio in corso… La prima volta dopo un aggiornamento può servire qualche minuto: la pagina si apre da sola.</p>
+</main>
+<script>
+  // controlla ogni secondo se il server risponde (carica la sua icona), poi apre l'app in questa stessa finestra
+  const url = "http://localhost:8501";
+  const started = Date.now();
+  function check() {
+    const img = new Image();
+    img.onload = () => location.replace(url);
+    img.onerror = () => {
+      if (Date.now() - started > 90000) {
+        document.getElementById("msg").innerHTML =
+          "Sta impiegando più del solito, ma è ancora in avvio. Se non si apre entro qualche minuto, " +
+          "<a href='" + url + "'>prova ad aprirla da qui</a>.";
+      }
+      setTimeout(check, 1000);
+    };
+    img.src = url + "/favicon.png?t=" + Date.now();
+  }
+  check();
+</script>
+</body>
+</html>

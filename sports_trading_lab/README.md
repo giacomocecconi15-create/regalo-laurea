@@ -16,10 +16,22 @@ dashboard su `http://localhost:8501`. Serve Python 3.10+.
 **Mac Intel con macOS 11 o precedente:** serve Python **3.12** (non più recente) e si installa da
 `requirements-macos11.txt`; `start_app.sh` lo fa da solo.
 
-**App da doppio clic su Mac.** Dopo la prima installazione, esegui una volta `./crea_app_mac.sh`: crea
-*Sports Trading Lab.app* sulla Scrivania. Il doppio clic avvia la piattaforma e la apre in una finestra dedicata
-(con Chrome, Edge o Brave; altrimenti nel browser predefinito). Se è già aperta chiede se riaprire la finestra o
-spegnerla. L'app punta alla cartella del progetto: se la sposti, riesegui lo script.
+**App per Mac.** Dopo la prima installazione, esegui una volta `./crea_app_mac.sh`: crea *Sports Trading Lab* in
+*Applicazioni* (cartella Applicazioni dell'utente, visibile anche in Launchpad e Spotlight) con un collegamento sulla
+Scrivania. Si comporta come un'app normale:
+- al clic apre subito la sua finestra con "Avvio in corso…" e avvia il motore in background: l'app risponde sempre
+  (niente rotella) e la pagina passa da sola alla piattaforma appena è pronta, anche al primo avvio dopo un
+  aggiornamento, che può richiedere qualche minuto;
+- resta nel Dock con la sua icona finché è accesa (per tenerla sempre lì: tasto destro sull'icona > Opzioni >
+  Mantieni nel Dock);
+- un altro clic sull'icona riporta in primo piano la finestra già aperta invece di aprirne un'altra; se la finestra era
+  stata chiusa, la riapre;
+- Cmd+Q, oppure tasto destro sull'icona nel Dock > Esci, spegne il motore e chiude la finestra.
+
+La finestra usa Chrome, Edge o Brave con un profilo separato (non tocca le tue finestre normali), altrimenti Safari. Al
+primo utilizzo macOS può chiedere il permesso di controllare "System Events": serve solo a riportare in primo piano la
+finestra. L'app punta alla cartella del progetto: se la sposti, riesegui lo script. Se l'avvio non riesce, l'app mostra
+le ultime righe di `data/app.log`.
 
 Uso manuale:
 
