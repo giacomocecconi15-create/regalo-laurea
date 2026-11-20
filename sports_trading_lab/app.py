@@ -249,6 +249,7 @@ def apply_pending() -> None:
     ss["bt_excl_years"] = sorted(int(y) for y in cfg.get("exclude_years") or [])
     ss["bt_excl_matches"] = [str(m) for m in cfg.get("exclude_matches") or []]
     ss["bt_odds_adj"] = {str(k): float(v) for k, v in (cfg.get("odds_adjust") or {}).items()}
+    ss["bt_exit_adj"] = {str(k): float(v) for k, v in (cfg.get("exit_adjust") or {}).items()}
     ss[f"bt_entry_{sport}_{market}"] = entry_from_filters(sport, market, cfg.get("filters") or {})
     if c.get("legacy_manual"):
         ss["_legacy_note"] = ("Questa strategia era salvata con il vecchio cash out a frequenze, che non esiste più: il cash out è "
@@ -1388,7 +1389,7 @@ def match_games(match_id: str, version: float) -> pd.DataFrame:
         return con.execute("SELECT * FROM tennis_service_games WHERE db_match_id = ? ORDER BY set_no, game_no", [match_id]).df()
 
 
-def tennis_detail(trade: dict, rec: dict, mid: str) -> None:
+def tennis_detail(trade: dict, rec: dict, mid: str, cfg: dict | None = None, key: str | None = None) -> None:
     me, opp = str(trade.get("player", "")), str(trade.get("opponent", ""))
     won = bool(trade.get("won"))
     if rec:
@@ -1420,12 +1421,12 @@ def tennis_detail(trade: dict, rec: dict, mid: str) -> None:
         st.info("Punto per punto non disponibile: il Match Charting Project registra circa un match su cinque, soprattutto nei "
                 "tornei maggiori. Qui sopra restano risultato e statistiche ufficiali.", icon=":material/info:")
         return
-    key = bt._norm_name(me)
+    me_key = bt._norm_name(me)
     fb, cb = trade.get("_fb_game"), trade.get("_cb_game")
     press_t = trade.get("_press_t")
     rows = []
     for r in games.itertuples():
-        mine = bt._norm_name(r.server) == key
+        mine = bt._norm_name(r.server) == me_key
         held = bool(r.held)
         p_srv = float(r.v_hold if held else r.v_break)
         p_me = p_srv if mine else 1 - p_srv
@@ -1446,12 +1447,25 @@ def tennis_detail(trade: dict, rec: dict, mid: str) -> None:
     gd = pd.DataFrame(rows)
     x = [f"S{s} G{g}" for s, g in zip(gd["set"], gd["game"])]
     fig = go.Figure(go.Scatter(x=x, y=gd["prob_me"], mode="lines+markers", line=dict(color=BLUE, width=2),
-                               marker=dict(size=7, color=np.where(gd["esito"] == "break fatto", GOOD,
+                               marker=dict(size=9, color=np.where(gd["esito"] == "break fatto", GOOD,
                                                                   np.where(gd["esito"] == "break subito", BAD, MUTED))),
-                               hovertemplate="%{x}<br>probabilità %{y:.1f}%<extra></extra>"))
-    base_layout(fig, 300, f"Probabilità di vittoria di {me} dopo ogni game (modello a punti)")
+                               hovertemplate="%{x}<br>probabilità %{y:.1f}%<br>quota %{customdata:.2f}<extra></extra>",
+                               customdata=gd["quota_me"]))
+    base_layout(fig, 320, f"Probabilità di vittoria di {me} dopo ogni game (modello a punti)")
     fig.update_yaxes(range=[0, 100], ticksuffix="%")
-    show(fig)
+    picks = (ss.get("bt_pick_pts") or {}).get(key) if key else None
+    # solo le scelte gia' applicate: il grafico non deve cambiare tra il primo e il secondo clic (perderebbe la selezione)
+    marks = [(picks[0], "ingresso", GOOD), (picks[1], "uscita", ORANGE)] if picks else []
+    for i, lab, col in marks:
+        if 0 <= i < len(x):
+            fig.add_vline(x=i, line=dict(color=col, width=2, dash="dot"))
+            fig.add_annotation(x=x[i], y=98, text=lab, showarrow=False, font=dict(color=col, size=11), yanchor="top")
+    if key and cfg is not None and "|" not in str(trade.get("match_id", "")):
+        ev = st.plotly_chart(fig, width="stretch", theme=None, config={"displayModeBar": False}, on_select="rerun",
+                             selection_mode="points", key=f"ppchart_{key}")
+        pick_on_chart(ev, gd, x, trade, cfg, key)
+    else:
+        show(fig)
     st.dataframe(gd, hide_index=True, width="stretch", height=380, column_config={
         "prob_me": st.column_config.NumberColumn(f"prob. {me.split()[-1]} %", format="%.1f"),
         "quota_me": st.column_config.NumberColumn(f"quota stimata {me.split()[-1]}", format="%.2f"),
@@ -1459,6 +1473,45 @@ def tennis_detail(trade: dict, rec: dict, mid: str) -> None:
     st.caption("Punti dal punto di vista di chi serve (V = vantaggio). Pallino verde = break fatto, rosso = break subito. La "
                "probabilità e la quota dopo ogni game vengono dal modello a punti indipendenti (non dalle quote reali, che il "
                "database non ha in partita). I tie-break e i game registrati male non sono nel Match Charting Project.")
+
+
+def pick_on_chart(ev, gd: pd.DataFrame, x: list, trade: dict, cfg: dict, key: str) -> None:
+    """Primo clic su un punto del grafico = ingresso, secondo clic (su un game successivo) = uscita. Le quote vengono dal
+    modello in quei momenti (con il margine live); entrambe diventano adjustment di quella operazione."""
+    pts = list(getattr(getattr(ev, "selection", None), "points", None) or [])
+    st.caption(":material/ads_click: Clicca un punto del grafico per l'**ingresso**, poi un game successivo per l'**uscita**: "
+               "quote e profitto di questa operazione si aggiornano in tutta l'analisi.")
+    if not pts:
+        pend = ss.get("_pick")
+        if pend and pend.get("key") == key:
+            st.info(f"Ingresso scelto: **{x[pend['idx']]}** a quota {pend['q']:.2f}. Ora clicca il game di uscita.", icon=":material/login:")
+        return
+    pend = ss.get("_pick") if (ss.get("_pick") or {}).get("key") == key else None
+    idxs = [int(q.get("point_index", q.get("pointIndex", -1))) for q in pts]
+    fresh = [i for i in idxs if 0 <= i < len(gd) and not (pend and i == pend["idx"])]      # il punto appena cliccato
+    idx = fresh[-1] if fresh else -1
+    if idx < 0 or ss.get("_pick_last") == (key, idx):
+        pend = ss.get("_pick")
+        if pend and pend.get("key") == key:
+            st.info(f"Ingresso scelto: **{x[pend['idx']]}** a quota {pend['q']:.2f}. Ora clicca il game di uscita.", icon=":material/login:")
+        return
+    ss["_pick_last"] = (key, idx)
+    m = float(cfg.get("live_margin", bt.LIVE_MARGIN)) / 100
+    lay = trade.get("side") == "lay"
+    p = min(max(float(gd["prob_me"].iloc[idx]) / 100, 0.001), 0.999)
+    pend = ss.get("_pick")
+    if not pend or pend.get("key") != key or idx <= pend["idx"]:
+        q_in = min(max((1 / p) * ((1 + m) if lay else (1 - m)), 1.01), 1000.0)      # entrare costa il margine
+        ss["_pick"] = {"key": key, "idx": idx, "q": round(q_in, 2)}
+        st.info(f"Ingresso scelto: **{x[idx]}** a quota {q_in:.2f}. Ora clicca il game di uscita.", icon=":material/login:")
+        return
+    q_out = min(max(1 / (p * ((1 + m) if lay else (1 - m))), 1.01), 1000.0)        # anche uscire costa il margine
+    ss["bt_odds_adj"] = {**(ss.get("bt_odds_adj") or {}), key: pend["q"]}
+    ss["bt_exit_adj"] = {**(ss.get("bt_exit_adj") or {}), key: round(q_out, 2)}
+    ss["bt_pick_pts"] = {**(ss.get("bt_pick_pts") or {}), key: (pend["idx"], idx)}
+    ss.pop("_pick", None)
+    ss["_dlg_reopen"] = key
+    st.rerun()
 
 
 def football_detail(trade: dict, rec: dict) -> None:
@@ -1487,8 +1540,41 @@ def football_detail(trade: dict, rec: dict) -> None:
     st.caption("Nel calcio il database ha risultato, statistiche e quote pre-partita: non esiste un minuto per minuto.")
 
 
+def _set_adjust(store: str, key: str, value: float | None) -> None:
+    d = dict(ss.get(store) or {})
+    if value is None:
+        d.pop(key, None)
+    else:
+        d[key] = round(float(value), 2)
+    ss[store] = d
+    if store in ("bt_odds_adj", "bt_exit_adj") and value is None:
+        ss["bt_pick_pts"] = {k: v for k, v in (ss.get("bt_pick_pts") or {}).items() if k != key}
+    ss["_dlg_reopen"] = key
+    st.rerun()
+
+
 @st.dialog("Scheda partita", width="large")
-def match_dialog(trade: dict, cfg: dict) -> None:
+def match_dialog(cfg: dict) -> None:
+    keys = list(ss.get("_dlg_keys") or [])
+    key = ss.get("_dlg_key")
+    trades = ss["_bt_res"].trades if ss.get("_bt_res") is not None else pd.DataFrame()
+    pos = keys.index(key) if key in keys else -1
+    n1, n2, n3 = st.columns([1, 2, 1])
+    if n1.button("Precedente", icon=":material/chevron_left:", disabled=pos <= 0, width="stretch", key="dlg_prev"):
+        ss["_dlg_key"] = keys[pos - 1]
+        ss.pop("_pick", None)
+        st.rerun(scope="fragment")
+    n2.markdown(f"<div style='text-align:center;padding-top:6px'>Operazione <b>{pos + 1}</b> di {len(keys)}</div>" if pos >= 0
+                else "<div style='text-align:center'>Operazione non più nell'analisi</div>", unsafe_allow_html=True)
+    if n3.button("Successiva", icon=":material/chevron_right:", disabled=pos < 0 or pos >= len(keys) - 1, width="stretch", key="dlg_next"):
+        ss["_dlg_key"] = keys[pos + 1]
+        ss.pop("_pick", None)
+        st.rerun(scope="fragment")
+    found = trades[bt.trade_key(trades) == key] if len(trades) and key else pd.DataFrame()
+    if found.empty:
+        st.info("Questa operazione non è più nell'analisi (esclusa o fuori dai filtri).")
+        return
+    trade = found.iloc[0].to_dict()
     sport = cfg["sport"]
     mid = str(trade.get("match_id", "")).split("|")[0]
     rec = match_record(sport, mid, db_version())
@@ -1502,44 +1588,53 @@ def match_dialog(trade: dict, cfg: dict) -> None:
     exit_txt = trade.get("exit_point") or "fine partita"
     reason = co.REASONS.get(trade.get("cashout") or "", "")
     pnl, hold = float(trade.get("pnl") or 0.0), trade.get("pnl_hold")
+    xo = trade.get("exit_odds")
     kpis([("Risultato", str(trade.get("score") or "n/d"), f"dal punto di vista di {who}", None),
           ("Ingresso", f"{float(trade.get('odds') or 0):.2f}", f"{side} {who}" + (f" · pre-partita {float(trade['pre_odds']):.2f}"
                                                                              if trade.get("pre_odds") == trade.get("pre_odds") and trade.get("pre_odds") else ""), None),
-          ("Uscita", reason or "fine partita", exit_txt if reason else "posizione tenuta", None),
+          ("Uscita", reason or "fine partita", (exit_txt + (f" a {float(xo):.2f}" if xo is not None and xo == xo else "")) if reason
+           else "posizione tenuta", None),
           ("Profitto", f"{pnl:+.2f} u", (f"tenendo: {float(hold):+.2f} u" if hold == hold and hold is not None else "stake 1 u"), sign_tone(pnl))])
     if sport == "tennis":
-        tennis_detail(trade, rec, mid)
+        tennis_detail(trade, rec, mid, cfg, key)
     else:
         football_detail(trade, rec)
     st.divider()
-    key = f"{mid}|{trade.get('player') if trade.get('player') is not None else trade.get('selection')}"
-    adj = dict(ss.get("bt_odds_adj") or {})
+    adj, ex = dict(ss.get("bt_odds_adj") or {}), dict(ss.get("bt_exit_adj") or {})
     model = trade.get("model_odds")
     model = float(model) if model is not None and model == model else float(trade.get("odds") or 0)
     if "|" not in str(trade.get("match_id", "")):           # non per lo scalping (operazioni game per game)
-        st.markdown("**Correggi la quota di ingresso** (adjustment)")
-        q1, q2, q3 = st.columns([1, 1, 2])
-        newq = q1.number_input("Quota corretta", min_value=1.01, max_value=1000.0, value=float(min(max(adj.get(key, model), 1.01), 1000.0)), step=0.01,
-                               format="%.2f", key=f"adjq_{key}",
-                               help="Per esempio la quota che c'era davvero in quel momento. Sostituisce quella stimata in tutta "
-                                    "l'analisi: profitto, uscite, quota live mediana.")
-        if q2.button("Applica", icon=":material/edit:", width="stretch"):
-            adj[key] = round(float(newq), 2)
-            ss["bt_odds_adj"] = adj
-            st.rerun()
+        st.markdown("**Correggi le quote di questa operazione** (adjustment: valgono in tutta l'analisi)")
+        a1, a2, b1, b2 = st.columns([1, 1, 1, 1])
+        newq = a1.number_input("Quota di ingresso", min_value=1.01, max_value=1000.0, value=float(min(max(adj.get(key, model), 1.01), 1000.0)),
+                               step=0.01, format="%.2f", key=f"adjq_{key}",
+                               help="Per esempio la quota che c'era davvero in quel momento. Sostituisce quella stimata.")
+        if a2.button("Applica ingresso", icon=":material/login:", width="stretch", key=f"adjq_ok_{key}"):
+            _set_adjust("bt_odds_adj", key, newq)
+        if key in adj and a2.button("Torna alla stimata", icon=":material/undo:", width="stretch", key=f"adjq_undo_{key}"):
+            _set_adjust("bt_odds_adj", key, None)
+        default_out = ex.get(key) or (float(xo) if xo is not None and xo == xo else float(trade.get("odds") or 2.0))
+        newx = b1.number_input("Quota di chiusura", min_value=1.01, max_value=1000.0, value=float(min(max(default_out, 1.01), 1000.0)),
+                               step=0.01, format="%.2f", key=f"adjx_{key}",
+                               help="Quota a cui chiudi la posizione: il profitto diventa quello della chiusura "
+                                    "(punta: ingresso/chiusura − 1; banca: (1 − ingresso/chiusura)/(ingresso − 1)).")
+        if b2.button("Applica chiusura", icon=":material/logout:", width="stretch", key=f"adjx_ok_{key}"):
+            _set_adjust("bt_exit_adj", key, newx)
+        if key in ex and b2.button("Togli chiusura", icon=":material/undo:", width="stretch", key=f"adjx_undo_{key}"):
+            _set_adjust("bt_exit_adj", key, None)
+        notes = []
         if key in adj:
-            if q2.button("Torna alla stimata", icon=":material/undo:", width="stretch"):
-                adj.pop(key, None)
-                ss["bt_odds_adj"] = adj
-                st.rerun()
-            q3.caption(f"Quota stimata dal modello: **{model:.2f}**, corretta a mano: **{adj[key]:.2f}**.")
-        else:
-            live_entry = trade.get("pre_odds") == trade.get("pre_odds") and bool(trade.get("pre_odds"))
-            q3.caption(f"Quota attuale: **{model:.2f}** (" + ("stimata dal modello al momento dell'ingresso" if live_entry
-                                                             else "pre-partita") + ").")
+            notes.append(f"ingresso stimato **{model:.2f}**, corretto **{adj[key]:.2f}**")
+        if key in ex:
+            notes.append(f"chiusura manuale a **{ex[key]:.2f}** (al posto dell'uscita della strategia)")
+        if notes:
+            st.caption(" · ".join(notes))
     c1, c2 = st.columns([1, 2])
-    if c1.button("Escludi questa partita", icon=":material/block:", type="primary", width="stretch"):
+    if c1.button("Escludi questa partita", icon=":material/block:", type="primary", width="stretch", key=f"excl_{key}"):
         ss["bt_excl_matches"] = sorted(set(ss.get("bt_excl_matches") or []) | {mid})
+        nxt = keys[pos + 1] if pos + 1 < len(keys) else (keys[pos - 1] if pos > 0 else None)
+        if nxt:
+            ss["_dlg_reopen"] = nxt                     # dopo l'esclusione la scheda passa alla partita successiva
         st.rerun()
     c2.caption("Adjustment: la partita viene tolta dal backtest in tutte le viste e dalla strategia salvata. Puoi rimetterla dal "
                "riquadro *Adjustment* sopra i risultati.")
@@ -1552,7 +1647,8 @@ def tab_trades(cfg: dict, trades: pd.DataFrame) -> None:
         st.caption(f"Mostrate le ultime {num_it(MAX_TABLE_ROWS)} operazioni su {num_it(len(table))}; l'esportazione le contiene tutte.")
     st.caption(":material/touch_app: Clicca una riga per aprire la scheda della partita: risultato, statistiche e, quando registrato, "
                "il punto per punto game per game con la quota stimata. Dalla scheda puoi escludere la partita (adjustment).")
-    n_ex = len(ss.get("bt_excl_matches") or []) * 1000 + len(ss.get("bt_odds_adj") or {})
+    n_ex = (len(ss.get("bt_excl_matches") or []) * 1_000_000 + len(ss.get("bt_odds_adj") or {}) * 1000
+            + len(ss.get("bt_exit_adj") or {}))
     event = st.dataframe(shown, hide_index=True, width="stretch", height=460, on_select="rerun", selection_mode="single-row",
                          key=f"trades_tbl_{n_ex}_{len(trades)}", column_config={
         "odds": st.column_config.NumberColumn("quota", format="%.2f"), "close_odds": st.column_config.NumberColumn("chiusura", format="%.2f"),
@@ -1568,16 +1664,22 @@ def tab_trades(cfg: dict, trades: pd.DataFrame) -> None:
         "form10": st.column_config.NumberColumn(format="%.0f"), "form_surf": st.column_config.NumberColumn(format="%.0f"),
         "home_ppg5": st.column_config.NumberColumn(format="%.1f"), "away_ppg5": st.column_config.NumberColumn(format="%.1f"),
     })
+    keys = bt.trade_key(trades.loc[shown.index]).tolist()
+    ss["_dlg_keys"] = keys
     rows = list(getattr(getattr(event, "selection", None), "rows", None) or [])
-    if rows:
-        idx = shown.index[rows[0]]
-        trade = trades.loc[idx].to_dict()
-        token = (n_ex, int(idx), ss.get("_bt_key"))
+    reopen = ss.pop("_dlg_reopen", None)
+    if reopen in keys:                              # dopo una correzione la scheda si riapre sulla stessa partita
+        ss["_dlg_key"] = reopen
+        match_dialog(cfg)
+    elif rows:
+        token = (n_ex, keys[rows[0]], ss.get("_bt_key"))
         if ss.get("_dlg_token") != token:
             ss["_dlg_token"] = token
-            match_dialog(trade, cfg)
+            ss["_dlg_key"] = keys[rows[0]]
+            match_dialog(cfg)
         elif st.button("Riapri la scheda della partita selezionata", icon=":material/open_in_new:"):
-            match_dialog(trade, cfg)
+            ss["_dlg_key"] = keys[rows[0]]
+            match_dialog(cfg)
     st.download_button("Esporta tutte le operazioni (CSV)", table.to_csv(index=False).encode("utf-8"),
                        file_name=f"operazioni_{cfg['sport']}_{date.today():%Y%m%d}.csv", mime="text/csv", icon=":material/download:")
 
@@ -1859,7 +1961,10 @@ def with_adjustments(cfg: dict) -> dict:
     years = sorted(int(y) for y in ss.get("bt_excl_years") or [])
     matches = [str(m) for m in ss.get("bt_excl_matches") or []]
     adj = {str(k): round(float(v), 2) for k, v in (ss.get("bt_odds_adj") or {}).items()}
-    out = {k: v for k, v in cfg.items() if k not in ("exclude_years", "exclude_matches", "odds_adjust")}
+    exits = {str(k): round(float(v), 2) for k, v in (ss.get("bt_exit_adj") or {}).items()}
+    out = {k: v for k, v in cfg.items() if k not in ("exclude_years", "exclude_matches", "odds_adjust", "exit_adjust")}
+    if exits:
+        out["exit_adjust"] = dict(sorted(exits.items()))
     if years:
         out["exclude_years"] = years
     if matches:
@@ -1874,10 +1979,11 @@ def adjustment_panel(cfg: dict, sel: pd.DataFrame) -> None:
     years = sorted(int(y) for y in ss.get("bt_excl_years") or [])
     matches = [str(m) for m in ss.get("bt_excl_matches") or []]
     adj = dict(ss.get("bt_odds_adj") or {})
+    exits = dict(ss.get("bt_exit_adj") or {})
     label = "Adjustment: togli anni o partite, correggi le quote"
-    if years or matches or adj:
+    if years or matches or adj or exits:
         label = (f"Adjustment attivo · anni esclusi: {', '.join(map(str, years)) or 'nessuno'} · "
-                 f"partite escluse: {len(matches)} · quote corrette: {len(adj)}")
+                 f"partite escluse: {len(matches)} · quote corrette: {len(adj)} · chiusure manuali: {len(exits)}")
     with st.expander(label, icon=":material/tune:", expanded=False):
         all_years = sorted(int(y) for y in sel["date"].dt.year.dropna().unique())
         a, b = st.columns([2, 1])
@@ -1889,9 +1995,16 @@ def adjustment_panel(cfg: dict, sel: pd.DataFrame) -> None:
         if sorted(new_years) != years:
             ss["bt_excl_years"] = sorted(new_years)
             st.rerun()
-        if b.button("Ripristina tutto", icon=":material/restart_alt:", disabled=not (years or matches or adj), width="stretch"):
-            ss["bt_excl_years"], ss["bt_excl_matches"], ss["bt_odds_adj"] = [], [], {}
+        if b.button("Ripristina tutto", icon=":material/restart_alt:", disabled=not (years or matches or adj or exits), width="stretch"):
+            ss["bt_excl_years"], ss["bt_excl_matches"], ss["bt_odds_adj"], ss["bt_exit_adj"], ss["bt_pick_pts"] = [], [], {}, {}, {}
             st.rerun()
+        if exits:
+            keep_x = st.multiselect("Chiusure manuali (togli la spunta per tornare all'uscita della strategia)", list(exits),
+                                    default=list(exits), format_func=lambda k: f"{k.split('|', 1)[-1]} · {k.split('|')[0]} → {exits[k]:.2f}",
+                                    key=f"adj_exits_{len(exits)}")
+            if len(keep_x) != len(exits):
+                ss["bt_exit_adj"] = {k: exits[k] for k in keep_x}
+                st.rerun()
         if adj:
             names = sel.assign(_k=bt.trade_key(sel)).drop_duplicates("_k").set_index("_k")
             fmt_a = lambda k: (f"{names.at[k, 'date']:%d/%m/%Y} · {names.at[k, 'event']} · "

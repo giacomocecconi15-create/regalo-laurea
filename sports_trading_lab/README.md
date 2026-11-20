@@ -38,7 +38,7 @@ Uso manuale:
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python src/update_data.py        # scarica / aggiorna il database
-.venv/bin/python -m pytest tests -q        # 97 test
+.venv/bin/python -m pytest tests -q        # 98 test
 .venv/bin/python -m streamlit run app.py   # dashboard
 ```
 
@@ -355,7 +355,12 @@ numeri per poterli rimettere. Nella vista *Operazioni* si clicca una riga e si a
 risultato dal punto di vista del giocatore, statistiche ufficiali dei due giocatori (ace, doppi falli, prime, punti vinti,
 palle break salvate, quote) e, per i match registrati punto per punto, la sequenza game per game con il punteggio dopo ogni
 punto, palle break, vantaggi, eventi (primo break, controbreak, sotto pressione) e probabilità e quota stimate dopo ogni
-game, con il grafico. Dalla scheda *Escludi questa partita* la toglie dall'analisi, e *Correggi la quota di ingresso*
+game, con il grafico. Nella scheda *Precedente* / *Successiva* scorrono le operazioni senza chiuderla. Sul grafico della probabilità il **primo
+clic** su un game sceglie l'**ingresso** e il **secondo clic** su un game successivo l'**uscita**: le quote di quei
+momenti (stima del modello, con il margine live) diventano la quota di ingresso e la quota di chiusura dell'operazione, e
+il profitto si ricalcola. Si possono anche scrivere a mano la *quota di ingresso* e la *quota di chiusura*; la chiusura
+manuale prende il posto dell'uscita della strategia (punta: ingresso/chiusura − 1; banca: (1 − ingresso/chiusura) /
+(ingresso − 1)). Dalla scheda *Escludi questa partita* la toglie dall'analisi, e *Correggi la quota di ingresso*
 sostituisce la quota stimata (o pre-partita) di quella operazione con quella che indichi, per esempio la quota che c'era
 davvero: la correzione vale in tutta l'analisi (profitto, uscite, quota live mediana del Riepilogo) e la tabella
 Operazioni mostra quota stimata e quota corretta. Il riquadro **Adjustment** sopra i

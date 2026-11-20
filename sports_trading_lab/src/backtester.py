@@ -736,6 +736,32 @@ def apply_odds_adjust(picked: pd.DataFrame, adjust: dict | None) -> pd.DataFrame
     return picked
 
 
+def apply_exit_adjust(trades: pd.DataFrame, adjust: dict | None, commission: float = 0.0) -> pd.DataFrame:
+    """Uscite corrette a mano partita per partita: la posizione si chiude alla quota indicata e il profitto diventa
+    quello della chiusura (punta: ingresso/uscita - 1; banca: (1 - ingresso/uscita)/(ingresso - 1), per unita' di rischio)."""
+    if not adjust or trades.empty:
+        return trades
+    t = trades.copy()
+    if "pnl_hold" not in t.columns:
+        t["pnl_hold"] = t["pnl"]
+    for col, default in (("cashout", ""), ("exit_point", ""), ("exit_odds", np.nan)):
+        if col not in t.columns:
+            t[col] = default
+    new = trade_key(t).map({str(k): float(v) for k, v in adjust.items() if v and float(v) > 1})
+    m = new.notna().to_numpy()
+    if not m.any():
+        return t
+    q = new[m].to_numpy(dtype=float)
+    side = t["side"].to_numpy()[m] if "side" in t.columns else np.full(m.sum(), "back")
+    t.loc[m, "pnl"] = cashout.exit_return(t["odds"].to_numpy(dtype=float)[m], q, side, commission) * t["risk"].to_numpy(dtype=float)[m]
+    t.loc[m, "cashout"] = "man"
+    t.loc[m, "exit_point"] = "uscita manuale"
+    t.loc[m, "exit_odds"] = q
+    t["trade_won"] = t["pnl"] > 0
+    t["equity"] = np.cumsum(t["pnl"].to_numpy())
+    return t
+
+
 def backtest_selections(sel: pd.DataFrame, cfg: dict, bankroll: float = 100.0, games: pd.DataFrame | None = None) -> BacktestResult:
     """Backtest su un dataframe di selezioni gia' caricato (utile per riusare la cache).
     - Con filtri in partita i range di quota restano sulle quote pre-partita, ma l'operazione entra dopo
@@ -790,6 +816,7 @@ def backtest_selections(sel: pd.DataFrame, cfg: dict, bankroll: float = 100.0, g
         return BacktestResult(cfg, trades, compute_metrics(trades, bankroll), monthly_returns(trades), None)
     if cashout.is_active(cfg):
         trades = cashout.apply(trades, cfg)
+    trades = apply_exit_adjust(trades, cfg.get("exit_adjust"), float(cfg.get("commission") or 0.0))
     if point is not None and len(trades):
         pre_p = 1 / trades["pre_odds"]
         live = {"entry": point, "label": ENTRY_LABEL[point], "avg_pre_odds": float(trades["pre_odds"].mean()),

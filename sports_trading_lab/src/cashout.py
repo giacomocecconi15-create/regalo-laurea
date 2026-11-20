@@ -77,7 +77,7 @@ DEFAULTS = {"mode": "off", "method": "odds", "tp_event": "off", "sl_event": "off
             "tp": 30.0, "sl": 50.0, "margin_pct": 5.0,
             # solo scalping
             "who": "both", "skip_games": 2, "decided_pct": 5.0, "stop_at_bp": False, "spread_pct": 0.5}
-REASONS = {"": "Tenuta fino alla fine", "tp": "Take Profit", "sl": "Stop Loss"}
+REASONS = {"": "Tenuta fino alla fine", "tp": "Take Profit", "sl": "Stop Loss", "man": "Uscita manuale"}
 _RANK = {"team": ["lead", "draw", "trail"], "draw": ["level", "notlevel"], "over": ["g2", "g1", "g0"], "under": ["g0", "g1", "g2"]}
 
 
@@ -845,5 +845,5 @@ def summary(trades: pd.DataFrame) -> pd.DataFrame:
     out.insert(4, "roi_uscita_pct", out["profitto"] / out.pop("rischio") * 100)
     out["differenza"] = out["profitto"] - out["profitto_tenendo"]
     out = out.rename_axis(["esito", "momento"]).reset_index()
-    order = {v: i for i, v in enumerate(["Take Profit", "Stop Loss", "Tenuta fino alla fine"])}
+    order = {v: i for i, v in enumerate(["Take Profit", "Stop Loss", "Uscita manuale", "Tenuta fino alla fine"])}
     return out.sort_values(["esito", "momento"], key=lambda c: c.map(order) if c.name == "esito" else c).reset_index(drop=True)[cols]

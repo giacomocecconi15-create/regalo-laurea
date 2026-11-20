@@ -1780,3 +1780,15 @@ def test_pressing_side_and_per_trade_odds_adjustment():
     adj = bt.backtest_selections(sel, {"odds_adjust": {"m001|home": 2.5}}).trades
     assert adj["odds"].tolist() == [2.0, 2.5] and adj["model_odds"].tolist() == [2.0, 3.0] and adj["odds_adj"].tolist() == [False, True]
     assert adj["pnl"].sum() == pytest.approx(base.trades["pnl"].sum() - 0.5)
+
+
+def test_manual_exit_odds_override_strategy_exit():
+    sel = make_sel([2.0, 3.0, 2.5], [False, True, True])
+    t = bt.backtest_selections(sel, {"exit_adjust": {"m000|home": 1.6}, "odds_adjust": {"m001|home": 2.5}}).trades
+    # chiusura manuale: punta a 2.0, chiude bancando a 1.6 -> +25% anche se la selezione poi perde
+    assert t["pnl"].tolist() == pytest.approx([0.25, 1.5, 1.5]) and t["cashout"].tolist() == ["man", "", ""]
+    assert t["pnl_hold"].tolist() == pytest.approx([-1.0, 1.5, 1.5]) and t["exit_odds"].iloc[0] == 1.6
+    lay = bt.apply_exit_adjust(bt.settle(sel, "lay"), {"m002|home": 3.0})
+    assert lay["pnl"].iloc[2] == pytest.approx((1 - 2.5 / 3.0) / 1.5)               # banca a 2.5, poi chiude puntando a 3.0
+    s = co.summary(t).set_index("esito")
+    assert s.loc["Uscita manuale", "operazioni"] == 1
