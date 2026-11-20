@@ -1735,7 +1735,7 @@ def test_pressure_entry_back_and_lay_use_the_same_estimate(con):
     assert len(back) == len(lay) > 1000
     assert np.allclose(back["live_prob"], lay["live_prob"])                            # stessa probabilita' stimata
     fair = 1 / back["live_prob"].to_numpy()
-    assert np.allclose(back["odds"], np.maximum(fair * 0.97, 1.01)) and np.allclose(lay["odds"], np.maximum(fair * 1.03, 1.01))
+    assert np.allclose(back["odds"], np.clip(fair * 0.97, 1.01, 1000)) and np.allclose(lay["odds"], np.clip(fair * 1.03, 1.01, 1000))
     assert abs(back["live_prob"].mean() - back["won"].mean()) < 0.015                  # nessun errore di stima a favore di un lato
     # senza margine il valore atteso secondo la stima e' zero per entrambi i lati
     zb = bt.backtest_selections(sel, {**cfg, "side": "back", "live_margin": 0.0}).trades
