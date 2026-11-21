@@ -2028,6 +2028,25 @@ def adjustment_panel(cfg: dict, sel: pd.DataFrame) -> None:
                        "*Escludi questa partita*.")
 
 
+def export_button(slot, cfg: dict, res: bt.BacktestResult, bank: float) -> None:
+    """Esporta Excel: prepara il file solo al clic (con molte operazioni richiede qualche decina di secondi), poi lo scarica."""
+    from src import export as ex
+    ready = ss.get("_xlsx") if ss.get("_xlsx_key") == ss.get("_bt_key") else None
+    if ready is None:
+        if slot.button("Esporta Excel", icon=":material/table_view:", width="stretch",
+                       help="File .xlsx con riepilogo completo (filtri, risultati, robustezza, uscite), tutte le operazioni "
+                            "con le loro quote e il punto per punto game per game: pronto anche per un agente AI."):
+            with st.spinner(f"Preparo l'Excel di {num_it(len(res.trades))} operazioni..."):
+                games = service_games(db_version()) if cfg.get("sport") == "tennis" else None
+                ss["_xlsx"] = ex.build_workbook(cfg, res, describe(cfg), games, bank)
+                ss["_xlsx_key"] = ss.get("_bt_key")
+            st.rerun()
+    else:
+        slot.download_button("Scarica Excel", ready, file_name=f"backtest_{cfg['sport']}_{date.today():%Y%m%d}.xlsx",
+                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                             icon=":material/download:", type="primary", width="stretch")
+
+
 def page_backtester() -> None:
     header("Backtester")
     if need_db():
@@ -2048,7 +2067,9 @@ def page_backtester() -> None:
     if ss.get("_legacy_note"):
         st.info(ss.pop("_legacy_note"), icon=":material/info:")
     adjustment_panel(cfg, selections(*args, db_version()))
-    st.caption(describe(cfg))
+    d1, d2 = st.columns([5, 1])
+    d1.caption(describe(cfg))
+    export_button(d2, cfg, res, bank)
     if res.metrics["trades"] == 0:
         if scal:
             st.warning("Nessun game di servizio disponibile: lo scalping usa i match registrati punto per punto (circa uno su "

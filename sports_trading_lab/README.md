@@ -38,7 +38,7 @@ Uso manuale:
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python src/update_data.py        # scarica / aggiorna il database
-.venv/bin/python -m pytest tests -q        # 98 test
+.venv/bin/python -m pytest tests -q        # 99 test
 .venv/bin/python -m streamlit run app.py   # dashboard
 ```
 
@@ -346,6 +346,24 @@ l'app lo segnala.
 **Quota di ingresso.** Con ingresso pre-partita ogni operazione entra alla propria quota pre-partita (il Riepilogo lo
 indica, con la quota mediana del campione). Con ingresso in partita la quota stimata si può sostituire con una quota fissa
 scelta a mano (riquadro *Quota live di ingresso*); se si discosta di oltre il 10% dalla stima compare un avviso.
+
+### Esporta Excel
+
+Nel Backtester, accanto alla descrizione della strategia, **Esporta Excel** prepara un file `.xlsx` del backtest corrente
+(qualche secondo, fino a circa un minuto con decine di migliaia di operazioni) e **Scarica Excel** lo salva. Fogli:
+
+- **Riepilogo**: impostazioni, filtri, ingresso, uscita, adjustment, tutti i risultati (ROI, profitto netto, win rate,
+  drawdown, CLV, t-stat), robustezza (intervallo di confidenza del ROI, studio/verifica, controlli), risultati per anno e
+  per fascia di quota, ingresso in partita, uscite per esito e momento, controllo del modello, configurazione completa in
+  JSON;
+- **Operazioni**: una riga per operazione con tutte le colonne del backtest (quote pre-partita, avversario, live stimata,
+  corretta, di uscita, di chiusura, eventi in partita, risultato, profitto) e la colonna `game_per_game`;
+- **Punto per punto**: una riga per game delle partite registrate punto per punto (chi serve, punteggio prima del game,
+  sequenza dei punti, esito, palle break, vantaggi, probabilità e quota stimate dopo il game);
+- **Legenda**: il significato di colonne e convenzioni.
+
+Operazioni e Punto per punto sono collegati dalla colonna `chiave` (partita|giocatore): un agente AI esterno può leggere
+le partite una a una senza ricostruire nulla.
 
 ### Adjustment: togliere anni o partite
 

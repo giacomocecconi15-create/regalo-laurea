@@ -1792,3 +1792,20 @@ def test_manual_exit_odds_override_strategy_exit():
     assert lay["pnl"].iloc[2] == pytest.approx((1 - 2.5 / 3.0) / 1.5)               # banca a 2.5, poi chiude puntando a 3.0
     s = co.summary(t).set_index("esito")
     assert s.loc["Uscita manuale", "operazioni"] == 1
+
+
+def test_excel_export_has_summary_trades_and_points():
+    import io
+    from src import export as ex
+    g = _games(["1111", "0000", "0000", "11100011", "1111", "11100011"]).assign(srv_games=0, ret_games=0)
+    sel = make_sel([2.0, 3.0], [True, False]).assign(player=["A B", "X"], match_id=["m1", "m2"])
+    res = bt.backtest_selections(sel, {"sport": "tennis", "exclude_years": [2019]})
+    b = ex.build_workbook({"sport": "tennis", "exclude_years": [2019]}, res, "prova", g)
+    x = pd.read_excel(io.BytesIO(b), sheet_name=None)
+    assert set(x) == {"Riepilogo", "Operazioni", "Punto per punto", "Legenda"}
+    ops, pp = x["Operazioni"], x["Punto per punto"]
+    assert len(ops) == 2 and ops["chiave"].tolist() == ["m1|A B", "m2|X"] and "game_per_game" in ops.columns
+    assert len(pp) == 6 and set(pp["chiave"]) == {"m1|A B"} and pp["sequenza"].iloc[0] == "SSSS"
+    assert pp["esito"].tolist()[:3] == ["tenuto", "break fatto", "break subito"]
+    summary = pd.read_excel(io.BytesIO(b), sheet_name="Riepilogo", header=None)[0].astype(str).tolist()
+    assert "ROI / yield %" in summary and "ROBUSTEZZA" in summary and "anni esclusi" in summary
